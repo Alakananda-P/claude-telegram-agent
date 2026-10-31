@@ -25,7 +25,8 @@ test('obsolete budget environment values are ignored rather than imposing a cap'
 
 test('config preserves requested model, effort and actual auto mode', () => {
   const c = loadConfig(env);
-  assert.equal(c.model, 'claude-sonnet-5-5');
+  assert.equal(c.model, 'claude-opus-5-5');
+  assert.equal(c.fast, true);
   assert.equal(c.effort, 'high');
   assert.equal(c.permissionMode, 'auto');
   assert.throws(() => loadConfig({ ...env, CLAUDE_PERMISSION_MODE: 'bypassPermissions' }), /auto/);

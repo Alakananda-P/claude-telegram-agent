@@ -8,6 +8,7 @@ export interface Message {
   text?: string; caption?: string;
   document?: { file_id: string; file_name?: string; file_size?: number };
 }
+export interface Callback { id: string; from: { id: number }; data?: string; message?: Message }
 
 export function authorized(message: Message, owner: number): boolean {
   return message.from?.id === owner && message.chat.type === 'private' && message.chat.id === owner;

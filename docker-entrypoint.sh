@@ -7,7 +7,7 @@ if [ "${DATA_DIR:-/data}" != /data ]; then
   echo 'Container DATA_DIR must be /data.' >&2
   exit 1
 fi
-for target in /data /data/home /data/claude /data/bot /data/workspaces /data/venv; do
+for target in /data /data/home /data/claude /data/bot /data/workspaces /data/venv /data/memory; do
   if [ -L "$target" ]; then
     echo 'Refusing symlink at a runtime data directory.' >&2
     exit 1

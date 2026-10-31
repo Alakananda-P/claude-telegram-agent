@@ -25,3 +25,18 @@ test('polling persists offset before work and ignores already processed updates'
   }, abort.signal);
   assert.equal(handled, 1);
 });
+
+test('polling dispatches callbacks only after durably recording the update offset', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'tg-agent-callback-'));
+  const store = await StateStore.open(path.join(dir, 'state.json'));
+  const abort = new AbortController();
+  const client = { async call<T>(_method: string, payload: Record<string, unknown>): Promise<T> {
+    assert.ok((payload.allowed_updates as string[]).includes('callback_query'));
+    return [{ update_id: 1, callback_query: { id: 'cb', from: { id: 123 }, data: 'menu' } }] as T;
+  } };
+  await poll(client, store, async () => assert.fail('Not a message'), abort.signal, async callback => {
+    assert.equal(callback.id, 'cb');
+    assert.equal(JSON.parse(await readFile(store.file, 'utf8')).offset, 2);
+    abort.abort();
+  });
+});

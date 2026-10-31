@@ -1,8 +1,9 @@
 import path from 'node:path';
+import { MODELS, EFFORTS, type Effort } from './settings.js';
 
 export interface Config {
   token: string; owner: number; apiKey: string; dataDir: string;
-  model: string; effort: 'high'; permissionMode: 'auto';
+  model: string; effort: Effort; fast: boolean; permissionMode: 'auto';
   maxTurns: number; timeoutMs: number;
 }
 
@@ -23,13 +24,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const owner = Number(ownerText);
   if (!/^\d+$/.test(ownerText) || !Number.isSafeInteger(owner) || owner <= 0) throw new Error('Invalid TELEGRAM_OWNER_ID.');
   if ((env.CLAUDE_PERMISSION_MODE ?? 'auto') !== 'auto') throw new Error('CLAUDE_PERMISSION_MODE must be auto; bypass is not enabled.');
-  if ((env.CLAUDE_EFFORT ?? 'high') !== 'high') throw new Error('CLAUDE_EFFORT must be high.');
-  const model = env.CLAUDE_MODEL ?? 'claude-sonnet-5-5';
-  if (model !== 'claude-sonnet-5-5') throw new Error('CLAUDE_MODEL must be claude-sonnet-5-5; review code before changing models.');
+  const effort = (env.CLAUDE_EFFORT ?? 'high') as Effort;
+  if (!EFFORTS.includes(effort)) throw new Error('CLAUDE_EFFORT must be low, medium, high, xhigh or max.');
+  const model = env.CLAUDE_MODEL ?? MODELS.opus;
+  if (!Object.values(MODELS).includes(model as typeof MODELS.opus)) throw new Error('CLAUDE_MODEL must be claude-fable-5-1, claude-opus-5-5 or claude-sonnet-5-5.');
+  if (!['true', 'false'].includes(env.CLAUDE_FAST_MODE ?? 'true')) throw new Error('CLAUDE_FAST_MODE must be true or false.');
   const maxTurns = positive('MAX_TURNS', 50);
   if (!Number.isInteger(maxTurns)) throw new Error('MAX_TURNS must be an integer.');
   return { token, owner, apiKey: required('ANTHROPIC_API_KEY'), model,
-    effort: 'high', permissionMode: 'auto', maxTurns,
+    effort, fast: (env.CLAUDE_FAST_MODE ?? 'true') === 'true', permissionMode: 'auto', maxTurns,
     timeoutMs: positive('JOB_TIMEOUT_MINUTES', 20) * 60_000,
     dataDir: path.resolve(env.DATA_DIR ?? './data') };
 }

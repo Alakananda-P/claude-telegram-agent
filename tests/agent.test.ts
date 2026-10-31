@@ -5,7 +5,7 @@ import { ClaudeRunner, type AgentEvent, type QueryFactory } from '../src/agent.j
 import { loadConfig } from '../src/config.js';
 
 const config = loadConfig({ TELEGRAM_BOT_TOKEN: '123456:abcdefghijklmnopqrstuvw', TELEGRAM_OWNER_ID: '123', ANTHROPIC_API_KEY: 'test-only-not-real' });
-const init = { type: 'system', subtype: 'init', model: 'claude-sonnet-5-5', permissionMode: 'auto', effort: 'high',
+const init = { type: 'system', subtype: 'init', model: 'claude-opus-5-5', permissionMode: 'auto', effort: 'high', fast_mode_state: 'on',
   session_id: 'session-1', uuid: 'uuid-1', apiKeySource: 'env', claude_code_version: '2.1.314', cwd: '/work',
   tools: ['Bash', 'Read', 'Edit', 'Write'], mcp_servers: [], slash_commands: [], output_style: 'default', skills: [], plugins: [] };
 const result = { type: 'result', subtype: 'success', is_error: false, duration_ms: 100, duration_api_ms: 90,
@@ -26,7 +26,9 @@ test('runner passes exact requested settings, resume, limits and a filtered chil
   let options!: Options;
   const runner = new ClaudeRunner(config, factory([init, result], o => { options = o; }));
   const output = await runner.run({ prompt: 'Write code', cwd: '/work', session: 'old-session' }, e => { events.push(e); }, new AbortController());
-  assert.equal(options.model, 'claude-sonnet-5-5');
+  assert.equal(options.model, 'claude-opus-5-5');
+  assert.deepEqual(options.settings, { fastMode: true });
+  assert.equal(options.includePartialMessages, true);
   assert.equal(options.effort, 'high');
   assert.equal(options.permissionMode, 'auto');
   assert.equal(options.resume, 'old-session');
@@ -52,8 +54,23 @@ test('runner rejects model or permission fallback and incomplete streams', async
 });
 
 test('runner reports SDK failures without exposing raw error text', async () => {
+  const seen: AgentEvent[] = [];
   const failure = { ...result, subtype: 'error_during_execution', is_error: true, errors: ['secret-value'], result: undefined };
-  await assert.rejects(new ClaudeRunner(config, factory([init, failure])).run({ prompt: 'x', cwd: '/work' }, () => {}, new AbortController()), /error_during_execution/);
+  await assert.rejects(new ClaudeRunner(config, factory([init, failure])).run({ prompt: 'x', cwd: '/work' }, e => { seen.push(e); }, new AbortController()), /error_during_execution/);
+  assert.ok(seen.some(e => e.type === 'usage' && e.cost === 0.1));
+});
+
+test('streaming records actual output counts without forwarding hidden reasoning', async () => {
+  const seen: AgentEvent[] = [];
+  const frame = (event: unknown) => ({ type: 'stream_event', session_id: 'session-1', parent_tool_use_id: null, uuid: 'frame', event });
+  const messages = [init,
+    frame({ type: 'message_start', message: { id: 'msg-real', model: 'claude-opus-5-5', usage: { input_tokens: 100, output_tokens: 1, speed: 'fast' } } }),
+    frame({ type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'PRIVATE REASONING' } }),
+    frame({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 123 } }),
+    { ...result, fast_mode_state: 'on' }];
+  await new ClaudeRunner(config, factory(messages)).run({ prompt: 'x', cwd: '/work' }, e => { seen.push(e); }, new AbortController());
+  assert.ok(seen.some(e => e.type === 'step' && e.complete && e.usage.output_tokens === 123 && e.usage.speed === 'fast'));
+  assert.ok(!JSON.stringify(seen).includes('PRIVATE REASONING'));
 });
 
 test('unresolved prompts deny instead of disabling auto safeguards', async () => {

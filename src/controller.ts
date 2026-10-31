@@ -4,16 +4,37 @@ import { mkdir, lstat, readdir, readFile, writeFile } from 'node:fs/promises';
 import type { Config } from './config.js';
 import { AgentError, type Runner } from './agent.js';
 import { StateStore } from './state.js';
-import { authorized, projectName, redact, safeFile, secretPath, type Message } from './safety.js';
+import { authorized, projectName, redact, safeFile, secretPath, type Message, type Callback } from './safety.js';
+import { MODELS, EFFORTS, effectiveSettings, settingsLabel, modelLabel, type AgentSettings, type Effort } from './settings.js';
+import { UsageLedger } from './usage.js';
+import { SharedMemory } from './memory.js';
+import { button, BACK, HOME, type Buttons } from './ui.js';
+import { ChatArchive } from './chats.js';
 
 export interface Messenger {
   send(chat: number, text: string): Promise<void>;
   sendFile(chat: number, name: string, bytes: Uint8Array): Promise<void>;
   download(fileId: string): Promise<Buffer>;
+  temporary(chat: number, text: string): Promise<number>;
+  edit(chat: number, id: number, text: string): Promise<void>;
+  remove(chat: number, id: number): Promise<void>;
+  typing(chat: number): Promise<void>;
+  panel?(chat: number, text: string, buttons: Buttons, editId?: number): Promise<void>;
+  acknowledge?(id: string): Promise<void>;
+  clear?(chat: number, includeLegacy?: boolean): Promise<boolean>;
 }
 
-const HELP = `Private Claude Code assistant
+const HELP = `Your Claude assistant
 Send a task in plain text, or upload a document with instructions in its caption.
+/menu — buttons for all controls
+/model fable|opus|sonnet — choose model
+/efforts low|medium|high|xhigh|max — reasoning effort
+/fast on|off — Opus Fast mode preference
+/token count — lifetime tokens by model (also /tokens)
+/cost — lifetime estimated Claude cost by model
+/session — saved chats; /session ID to resume
+/new chat — fresh chat, keep files and shared memory
+/memory — shared memory; on, off, remember TEXT, clear
 /status — current job, model and execution limits
 /stop — cancel the running task (does not undo edits)
 /new — fresh conversation, keep project files
@@ -22,7 +43,6 @@ Send a task in plain text, or upload a document with instructions in its caption
 /files — list files in current project
 /get PATH — download a project file (up to 49 MB)
 /help — this guide
-Model: Sonnet 5.5 · Effort: high · Permissions: auto
 Auto uses safety checks and can deny actions. No unrestricted permission bypass.
 Uploads: documents up to 20 MB. No voice/photo transcription in this version.`;
 
@@ -30,8 +50,83 @@ export class Controller {
   private running?: { abort: AbortController; done: Promise<void> };
   private shuttingDown = false;
   private persistenceFailed = false;
+  private panelId?: number;
+  private memory: SharedMemory;
+  private chats: ChatArchive;
 
-  constructor(private config: Config, private store: StateStore, private messenger: Messenger, private runner: Runner) {}
+  constructor(private config: Config, private store: StateStore, private messenger: Messenger, private runner: Runner, private ledger?: UsageLedger) {
+    this.memory = new SharedMemory(config.dataDir, [config.token, config.apiKey]);
+    this.chats = new ChatArchive(path.join(config.dataDir, 'bot', 'chats'), [config.token, config.apiKey]);
+  }
+
+  private get settings(): AgentSettings { return this.store.data.settings ?? { model: this.config.model, effort: this.config.effort, fast: this.config.fast }; }
+
+  private async panel(text: string, buttons: Buttons = BACK): Promise<void> {
+    if (!this.messenger.panel) return this.say(text);
+    try { await this.messenger.panel(this.config.owner, text, buttons, this.panelId); }
+    catch { await this.say(text); }
+  }
+
+  async menu(): Promise<void> {
+    await this.panel(`Claude · Your workspace\n\n${settingsLabel(this.settings)}\nProject: ${this.store.data.project}\nMemory: ${this.store.data.memoryEnabled !== false ? 'ON · shared across chats' : 'OFF'}\n${this.running ? 'Working on your task…' : 'Ready for your next task.'}\n\nSend a message or choose a control below.`, HOME);
+  }
+
+  async callback(callback: Callback): Promise<void> {
+    if (!callback.message || !authorized({ ...callback.message, from: callback.from }, this.config.owner)) return;
+    await this.messenger.acknowledge?.(callback.id).catch(() => {});
+    const data = callback.data ?? '';
+    if (!/^(menu|help|status|stop|new chat|model(?: (?:fable|opus|sonnet))?|efforts(?: (?:low|medium|high|xhigh|max))?|fast(?: (?:on|off))?|token count|cost|memory(?: (?:on|off|confirm-clear|clear))?|session(?: [a-zA-Z0-9_-]+)?|sessionpage \d+|history [a-zA-Z0-9_-]+ \d+|projects|project [a-zA-Z0-9_-]+|files)$/.test(data)) return;
+    this.panelId = callback.message.message_id;
+    try {
+      if (data === 'memory confirm-clear') {
+        await this.panel('Clear shared memory? Saved conversations and files will stay.', [[button('Clear memory', 'memory clear')], ...BACK]);
+      } else await this.handle({ ...callback.message, from: callback.from, text: '/' + data, document: undefined, caption: undefined });
+    } finally { this.panelId = undefined; }
+  }
+
+  async cleanIndicators(): Promise<void> {
+    const remaining: number[] = [];
+    for (const id of this.store.data.indicatorIds ?? []) {
+      try { await this.messenger.remove(this.config.owner, id); }
+      catch { remaining.push(id); }
+    }
+    this.store.data.indicatorIds = remaining.slice(-10);
+    await this.store.save();
+  }
+
+  private chatKey(): string { return this.store.data.sessions[this.store.data.project] ?? 'draft-' + this.store.data.project; }
+
+  private async clearScreen(): Promise<void> {
+    const cleared = await this.messenger.clear?.(this.config.owner);
+    this.panelId = undefined;
+    if (cleared === false) await this.say('Some older messages could not be removed by Telegram. The selected chat will appear below.');
+  }
+
+  private async history(id: string, page?: number): Promise<void> {
+    if (!this.store.data.conversations?.some(s => s.id === id)) return this.panel('Saved chat not found.');
+    if (this.store.data.sessions[this.store.data.project] !== id) return this.panel('Resume this saved chat before viewing its messages.', [[button('Resume chat', 'session ' + id)], ...BACK]);
+    const turns = await this.chats.read(id);
+    const pages = Math.max(1, Math.ceil(turns.length / 6));
+    const current = Math.min(pages - 1, Math.max(0, page ?? pages - 1));
+    const previews = turns.slice(current * 6, current * 6 + 6).map(turn => {
+      const text = turn.text.replace(/\s+/g, ' ').trim();
+      return `${turn.role === 'user' ? 'You' : 'Claude'}\n${text.slice(0, 360)}${text.length > 360 ? '…' : ''}`;
+    });
+    const nav = [];
+    if (current > 0) nav.push(button('‹ Older', `history ${id} ${current - 1}`));
+    if (current < pages - 1) nav.push(button('Newer ›', `history ${id} ${current + 1}`));
+    return this.panel(`Chat overview · Page ${current + 1}/${pages}\n${this.store.data.project} · ${id.slice(0, 8)}\n\n${previews.join('\n\n') || 'No recoverable messages for this session.'}\n\nSaved message previews. Send a message to continue this chat.`, [
+      ...(nav.length ? [nav] : []), [button('💬 Sessions', 'session'), button('➕ New chat', 'new chat')], ...BACK]);
+  }
+
+  private async session(id: string, project: string): Promise<void> {
+    this.store.data.sessions[project] = id;
+    const list = this.store.data.conversations ??= [];
+    const record = list.find(s => s.id === id);
+    if (record) record.updatedAt = new Date().toISOString();
+    else list.push({ id, project, updatedAt: new Date().toISOString() });
+    await this.store.save();
+  }
 
   async idle(): Promise<void> { await this.running?.done; }
 
@@ -57,19 +152,65 @@ export class Controller {
     return root;
   }
 
+  private async controls(command: string, page = 0): Promise<void> {
+    const s = this.settings;
+    if (command === 'model') return this.panel(`Model\n\nCurrent: ${settingsLabel(s)}\nChoose the model for your next task.`, [
+      [button((s.model === MODELS.fable ? '✓ ' : '') + 'Fable 5.1', 'model fable')],
+      [button((s.model === MODELS.opus ? '✓ ' : '') + 'Opus 5.5', 'model opus'), button((s.model === MODELS.sonnet ? '✓ ' : '') + 'Sonnet 5.5', 'model sonnet')], ...BACK]);
+    if (command === 'efforts' || command === 'effort') return this.panel(`Reasoning effort\n\nCurrent: ${s.effort}\nHigher effort can take longer and use more tokens.`, [
+      EFFORTS.slice(0, 3).map(v => button((s.effort === v ? '✓ ' : '') + v, 'efforts ' + v)),
+      EFFORTS.slice(3).map(v => button((s.effort === v ? '✓ ' : '') + v, 'efforts ' + v)), ...BACK]);
+    if (command === 'fast') return this.panel(`Speed\n\n${settingsLabel(s)}\nFast preference: ${s.fast ? 'ON' : 'OFF'}\nFast mode applies to Opus; Fable and Sonnet use standard speed. Provider capacity can temporarily put Fast mode in cooldown.`, [
+      [button('⚡ Fast ON', 'fast on'), button('Standard', 'fast off')], ...BACK]);
+    if (command === 'memory') {
+      const content = await this.memory.read();
+      return this.panel(`Shared memory · ${this.store.data.memoryEnabled !== false ? 'ON' : 'OFF'}\n\n${content.slice(0, 2400) || 'Nothing saved yet. Tell me what to remember, or use /memory remember TEXT.'}${content.length > 2400 ? '\n…Ask me to show or tidy the rest.' : ''}\n\nShared across every project and new chat. Turning it off does not erase old conversation history.`, [
+        [button('Memory ON', 'memory on'), button('Memory OFF', 'memory off')], [button('Clear saved memory', 'memory confirm-clear')], ...BACK]);
+    }
+    const list = [...(this.store.data.conversations ?? [])].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    const active = this.store.data.sessions[this.store.data.project];
+    const pages = Math.max(1, Math.ceil(list.length / 8));
+    const current = Math.min(pages - 1, Math.max(0, page));
+    const slice = list.slice(current * 8, current * 8 + 8);
+    const descriptions = slice.map(x => `${x.id === active ? '✓ ' : ''}${x.project} · ${x.id}\n${x.updatedAt.slice(0, 16).replace('T', ' ')} UTC`);
+    const nav = [];
+    if (current > 0) nav.push(button('‹ Previous', 'sessionpage ' + (current - 1)));
+    if (current < pages - 1) nav.push(button('Next ›', 'sessionpage ' + (current + 1)));
+    return this.panel(`Saved conversations · Page ${current + 1}/${pages}\n\n${descriptions.join('\n\n') || 'No saved chats yet.'}\n\nTap to resume. /session ID also works.`, [
+      ...slice.map(x => [button(`${x.id === active ? '✓ ' : ''}${x.project} · ${x.id.slice(0, 8)}`, 'session ' + x.id)]),
+      ...(nav.length ? [nav] : []),
+      [button('➕ New chat', 'new chat')], ...BACK]);
+  }
+
   async handle(message: Message): Promise<void> {
     if (!authorized(message, this.config.owner) || this.shuttingDown) return;
+    if (message.message_id !== undefined) {
+      const ids = this.store.data.visibleMessageIds ??= [];
+      if (!ids.includes(message.message_id)) { ids.push(message.message_id); await this.store.save(); }
+    }
     const text = message.text?.trim() ?? '';
     const match = /^\/(\w+)(?:@\w+)?(?:\s+([\s\S]*))?$/.exec(text);
     const command = match?.[1]?.toLowerCase();
     const argument = match?.[2]?.trim() ?? '';
-    if (command === 'start' || command === 'help') return this.say(HELP);
+    if (command === 'start' || command === 'menu') return this.menu();
+    if (command === 'help') return this.panel(HELP);
+    if (command === 'sessionpage') return this.controls('session', Math.max(0, Math.floor(Number(argument) || 0)));
+    if (command === 'history') {
+      const [id, page] = argument.split(' ');
+      return this.history(id, Number(page) || 0);
+    }
+    if (command === 'token' || command === 'tokens' || command === 'cost') {
+      return this.panel(this.ledger?.report(command === 'cost' ? 'cost' : 'tokens') ?? 'Usage records are not available yet.');
+    }
     if (command === 'status') {
       const d = this.store.data;
-      return this.say(`Project: ${d.project}\nModel: ${this.config.model}\nEffort: high · Permissions: auto\n` +
-        `State: ${this.running ? 'running' : 'idle'}${d.active ? ' · job ' + d.active.id : ''}\n` +
+      return this.panel(`Project: ${d.project}\n${settingsLabel(this.settings)} · Permissions: auto\n` +
+        `State: ${this.running ? 'running' : 'idle'}\nMemory: ${d.memoryEnabled !== false ? 'ON' : 'OFF'}\nLast reported speed: ${d.lastSpeed ?? 'not observed yet'}\n` +
         `Last job: ${d.lastJob?.status ?? 'none'}\nSpending cap: none (no bot-enforced billing limit).\n` +
         `Execution limits: ${this.config.maxTurns} turns; ${this.config.timeoutMs / 60_000} minutes per task.`);
+    }
+    if (['model', 'efforts', 'effort', 'fast', 'session', 'memory'].includes(command ?? '') && !argument) {
+      return this.controls(command!);
     }
     if (command === 'stop') {
       if (!this.running) return this.say('No task is running.');
@@ -80,21 +221,59 @@ export class Controller {
     if (this.persistenceFailed) return this.say('State storage failed. Restart only after checking the persistent disk; new tasks are disabled.');
     try {
       const root = await this.workspace();
+      if (['model', 'efforts', 'effort', 'fast'].includes(command ?? '')) {
+        const next = { ...this.settings };
+        if (command === 'model') {
+          const model = MODELS[argument.toLowerCase() as keyof typeof MODELS] ?? argument;
+          if (!Object.values(MODELS).includes(model as typeof MODELS.opus)) return this.panel('Choose fable, opus or sonnet.');
+          next.model = model;
+        } else if (command === 'fast') {
+          if (!['on', 'off'].includes(argument.toLowerCase())) return this.panel('Use /fast on or /fast off.');
+          next.fast = argument.toLowerCase() === 'on';
+        } else {
+          if (!EFFORTS.includes(argument.toLowerCase() as Effort)) return this.panel('Choose low, medium, high, xhigh or max.');
+          next.effort = argument.toLowerCase() as Effort;
+        }
+        this.store.data.settings = next;
+        await this.store.save();
+        return this.controls(command!);
+      }
+      if (command === 'memory') {
+        if (argument === 'on' || argument === 'off') {
+          this.store.data.memoryEnabled = argument === 'on';
+          await this.store.save();
+        } else if (argument === 'clear') await this.memory.clear();
+        else if (argument.startsWith('remember ')) await this.memory.remember(argument.slice(9));
+        else return this.panel('Use /memory on, /memory off, /memory remember TEXT, or /memory clear.');
+        return this.controls('memory');
+      }
+      if (command === 'session') {
+        const found = this.store.data.conversations?.filter(s => s.id === argument || s.id.startsWith(argument));
+        if (!found || found.length !== 1) return this.panel('Session not found or ID is ambiguous. Choose one from /session.');
+        await this.workspace(found[0].project);
+        this.store.data.project = found[0].project;
+        await this.session(found[0].id, found[0].project);
+        await this.clearScreen();
+        return this.history(found[0].id);
+      }
       if (command === 'new') {
         delete this.store.data.sessions[this.store.data.project];
         await this.store.save();
-        return this.say('Fresh conversation started. Existing project files are unchanged.');
+        await this.chats.resetDraft(this.store.data.project);
+        await this.clearScreen();
+        return this.panel('New chat ready. Your previous chat is in Sessions. Files and shared memory are kept.', HOME);
       }
       if (command === 'project') {
         const name = projectName(argument);
         await this.workspace(name);
         this.store.data.project = name;
         await this.store.save();
-        return this.say(`Active project: ${name}. Its saved conversation will resume.`);
+        return this.panel(`Active project: ${name}. Its saved conversation will resume.`, HOME);
       }
       if (command === 'projects') {
         const entries = await readdir(path.dirname(root), { withFileTypes: true });
-        return this.say(entries.filter(e => e.isDirectory() && !e.isSymbolicLink()).map(e => e.name).slice(0, 100).join('\n'));
+        const names = entries.filter(e => e.isDirectory() && !e.isSymbolicLink()).map(e => e.name).slice(0, 20);
+        return this.panel('Projects\n\nChoose a project below. To create one, send /project NAME.', [...names.map(name => [button((name === this.store.data.project ? '✓ ' : '') + name, 'project ' + name)]), ...BACK]);
       }
       if (command === 'files') return this.say((await this.listFiles(root)).join('\n') || 'No files yet.');
       if (command === 'get') {
@@ -115,8 +294,9 @@ export class Controller {
         const bytes = await this.messenger.download(message.document.file_id);
         await writeFile(path.join(uploads, name), bytes, { flag: 'wx', mode: 0o600 });
         const relative = `uploads/${name}`;
-        await this.say(`Uploaded: ${relative}`);
-        if (message.caption?.trim()) await this.launch(`${message.caption.trim()}\n\nAttached file in this project: ${relative}`, root);
+        await this.chats.append(this.chatKey(), { role: 'user', text: `📎 ${base}`, file: { id: message.document.file_id, name: base } });
+        await this.say(`📎 ${base} received.`);
+        if (message.caption?.trim()) await this.launch(`${message.caption.trim()}\n\nAttached file in this project: ${relative}`, root, message.caption.trim());
         return;
       }
       const prompt = command === 'run' ? argument : text;
@@ -127,7 +307,8 @@ export class Controller {
     }
   }
 
-  private async launch(prompt: string, cwd: string): Promise<void> {
+  private async launch(prompt: string, cwd: string, displayPrompt = prompt): Promise<void> {
+    await this.chats.append(this.chatKey(), { role: 'user', text: displayPrompt });
     const project = this.store.data.project;
     const job = { id: randomUUID().slice(0, 8), project, startedAt: new Date().toISOString() };
     this.store.data.active = job;
@@ -145,40 +326,78 @@ export class Controller {
 
   private async execute(prompt: string, cwd: string, project: string, job: NonNullable<StateStore['data']['active']>, abort: AbortController): Promise<void> {
     let status: 'completed' | 'failed' | 'cancelled' = 'failed';
-    let progress = 'Starting Claude Code';
+    let archiveKey = this.chatKey();
+    let progress = 'Thinking…';
     let timedOut = false;
     const timeout = setTimeout(() => { timedOut = true; abort.abort(); }, this.config.timeoutMs);
-    let sendingProgress = false;
+    let indicator: number | undefined;
+    let lastProgress = progress;
+    let lastEdit = Date.now();
+    let uiWork: Promise<void> | undefined;
     const heartbeat = setInterval(() => {
-      if (!sendingProgress && !abort.signal.aborted) {
-        sendingProgress = true;
-        void this.say(`Job ${job.id}: ${progress}`).finally(() => { sendingProgress = false; });
+      if (!uiWork && !abort.signal.aborted) {
+        uiWork = (async () => {
+          await this.messenger.typing(this.config.owner).catch(() => {});
+          if (indicator !== undefined && progress !== lastProgress && Date.now() - lastEdit >= 8000) {
+            await this.messenger.edit(this.config.owner, indicator, progress).catch(() => {});
+            lastProgress = progress; lastEdit = Date.now();
+          }
+        })().finally(() => { uiWork = undefined; });
       }
-    }, 30_000);
+    }, 4000);
+    const finishIndicator = async () => {
+      clearInterval(heartbeat);
+      await uiWork;
+      if (indicator === undefined) return;
+      try {
+        await this.messenger.remove(this.config.owner, indicator);
+        this.store.data.indicatorIds = this.store.data.indicatorIds?.filter(id => id !== indicator);
+      } catch { /* Kept in state for cleanup on restart. */ }
+      indicator = undefined;
+    };
     try {
-      await this.say(`Started job ${job.id} in ${project}. Use /stop to cancel.`);
-      const result = await this.runner.run({ prompt, cwd, session: this.store.data.sessions[project] }, async event => {
+      indicator = await this.messenger.temporary(this.config.owner, progress).catch(() => undefined);
+      if (indicator !== undefined) {
+        (this.store.data.indicatorIds ??= []).push(indicator);
+        await this.store.save();
+      }
+      abort.signal.throwIfAborted();
+      const selected = effectiveSettings(this.settings);
+      const result = await this.runner.run({ prompt, cwd, session: this.store.data.sessions[project], settings: selected, memoryEnabled: this.store.data.memoryEnabled !== false }, async event => {
         if (event.type === 'session') {
-          this.store.data.sessions[project] = event.id;
-          await this.store.save();
-        } else progress = event.text;
+          await this.chats.bind(archiveKey, event.id);
+          archiveKey = event.id;
+          await this.session(event.id, project);
+        } else if (event.type === 'usage' || event.type === 'step') {
+          try {
+            if (event.type === 'usage') await this.ledger?.recordResult(event.session, event.id, event.models, event.cost);
+            else await this.ledger?.recordStep(event.session, event.id, event.model, event.usage, event.complete);
+          } catch { this.persistenceFailed = true; abort.abort(); throw new AgentError('Usage storage failed. Work stopped to protect your records.'); }
+        } else if (event.type === 'speed') this.store.data.lastSpeed = event.state;
+        else progress = event.text;
       }, abort);
       abort.signal.throwIfAborted();
-      this.store.data.sessions[project] = result.session;
-      status = 'completed';
+      await this.session(result.session, project);
+      await this.chats.bind(archiveKey, result.session);
+      await this.chats.append(result.session, { role: 'assistant', text: result.text });
       // Store a redacted result in the project so a Telegram outage is recoverable.
       const outputName = `result-${job.id}.txt`;
       await writeFile(path.join(cwd, outputName), redact(result.text, [this.config.token, this.config.apiKey]), { flag: 'wx', mode: 0o600 });
+      status = 'completed';
       const preview = result.text.length > 12000 ? result.text.slice(0, 12000) + `\n\nFull result: /get ${outputName}` : result.text;
+      await finishIndicator();
       await this.say(preview);
-      await this.say(`Job ${job.id} completed. Saved: ${outputName}\nSession cumulative estimate: $${result.cumulativeCost.toFixed(4)} (may include previous turns; excludes some helper calls).`);
+      console.log(`Claude task completed: ${selected.model}; effort=${selected.effort}; requestedFast=${selected.fast}; reportedSpeed=${this.store.data.lastSpeed ?? 'unknown'}.`);
     } catch (error) {
       status = abort.signal.aborted ? 'cancelled' : 'failed';
-      await this.say(timedOut ? `Job ${job.id} reached its time limit and was stopped.`
-        : abort.signal.aborted ? `Job ${job.id} stopped.`
-        : error instanceof AgentError ? error.message : `Job ${job.id} failed. Check API credentials/access, limits and storage. Raw error details were withheld to protect secrets.`);
+      await finishIndicator();
+      await this.say(timedOut ? 'This task reached its time limit and was stopped.'
+        : this.persistenceFailed ? 'Usage storage failed. New tasks are paused until storage is restored.'
+        : abort.signal.aborted ? 'Task stopped.'
+        : error instanceof AgentError ? error.message : 'The task could not finish. Check API access and storage, or try a smaller task.');
     } finally {
       clearTimeout(timeout); clearInterval(heartbeat);
+      await finishIndicator();
       this.store.data.lastJob = { ...job, status, finishedAt: new Date().toISOString() };
       this.store.data.active = null;
       try { await this.store.save(); }

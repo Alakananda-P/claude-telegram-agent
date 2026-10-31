@@ -24,9 +24,11 @@ services:
       - key: DATA_DIR
         value: /data
       - key: CLAUDE_MODEL
-        value: claude-sonnet-5-5
+        value: claude-opus-5-5
       - key: CLAUDE_EFFORT
         value: high
+      - key: CLAUDE_FAST_MODE
+        value: "true"
       - key: CLAUDE_PERMISSION_MODE
         value: auto
       - key: MAX_TURNS

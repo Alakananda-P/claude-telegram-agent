@@ -1,5 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { validSettings, type AgentSettings } from './settings.js';
 
 export interface JobRecord {
   id: string; project: string; startedAt: string;
@@ -9,6 +10,14 @@ export interface JobRecord {
 export interface State {
   version: 1; offset: number; project: string; sessions: Record<string, string>;
   active: JobRecord | null; lastJob: JobRecord | null;
+  settings?: AgentSettings;
+  indicatorIds?: number[];
+  lastSpeed?: string;
+  memoryEnabled?: boolean;
+  conversations?: { id: string; project: string; updatedAt: string }[];
+  visibleMessageIds?: number[];
+  chatUiResetDone?: boolean;
+  upgradeCheck?: { attempted: boolean; passed: boolean; actualSpeed?: string };
 }
 
 export class StateStore {
@@ -24,6 +33,11 @@ export class StateStore {
         || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,47}$/.test(data.project)
         || !data.sessions || typeof data.sessions !== 'object' || Array.isArray(data.sessions)
         || !Object.values(data.sessions).every(v => typeof v === 'string')
+        || (data.settings !== undefined && !validSettings(data.settings))
+        || (data.memoryEnabled !== undefined && typeof data.memoryEnabled !== 'boolean')
+        || (data.conversations !== undefined && (!Array.isArray(data.conversations) || !data.conversations.every(s => s && typeof s.id === 'string' && typeof s.project === 'string' && typeof s.updatedAt === 'string')))
+        || (data.indicatorIds !== undefined && (!Array.isArray(data.indicatorIds) || !data.indicatorIds.every(Number.isSafeInteger)))
+        || (data.visibleMessageIds !== undefined && (!Array.isArray(data.visibleMessageIds) || !data.visibleMessageIds.every(Number.isSafeInteger)))
         || (data.active !== null && (!data.active || typeof data.active.id !== 'string'))) {
         throw new Error('Invalid state');
       }
@@ -38,6 +52,11 @@ export class StateStore {
     }
     // Project names are dictionary keys, never Object.prototype lookups.
     data.sessions = Object.assign(Object.create(null), data.sessions);
+    data.memoryEnabled ??= true;
+    data.conversations ??= [];
+    for (const [project, id] of Object.entries(data.sessions)) {
+      if (!data.conversations.some(s => s.id === id)) data.conversations.push({ id, project, updatedAt: new Date().toISOString() });
+    }
     if (data.active) {
       data.lastJob = { ...data.active, status: 'interrupted', finishedAt: new Date().toISOString() };
       data.active = null;

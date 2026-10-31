@@ -4,8 +4,13 @@ Send tasks to your own Telegram bot and run Claude Code on a persistent Render
 worker. The worker keeps working when your laptop is off. This hosts the agent
 software, not Claude model weights.
 
-Configured defaults: **Claude Sonnet 5.5 (`claude-sonnet-5-5`), high effort,
-`auto` permissions**. No model substitution or `bypassPermissions` is enabled.
+Configured defaults: **Claude Opus 5.5 (`claude-opus-5-5`), Fast mode, high effort,
+  `auto` permissions**. Model, effort and Fast preference can be changed with Telegram
+buttons and persist across restarts. The menu includes **Fable 5.1, Opus 5.5
+and Sonnet 5.5**, the latest models in those families as of 2026-10-31.
+Fast preference defaults ON; it currently applies only to Opus 5.5 in this list.
+No unrequested model substitution or
+`bypassPermissions` is enabled.
 The official Agent SDK bundles the Claude Code engine (pinned SDK 0.3.314 /
 Claude Code 2.1.314). No separate Claude Code subscription is required for this
 API-key setup.
@@ -18,8 +23,19 @@ API-key setup.
   user ID may issue work. Groups and other senders are ignored.
 - Saves a separate conversation for each named project. Files and transcripts
   survive redeploys when the `/data` disk is attached.
-- Supports one task at a time, periodic activity updates, cancellation,
+- Supports one task at a time, a single disappearing activity indicator, cancellation,
   uploads, downloads, and redacted result files for recovery after delivery errors.
+- Telegram control panel: model, effort, speed, shared memory, saved sessions,
+  tokens, cost, projects and task controls. Send `/menu` or tap the Menu button.
+- Long-term memory is on by default and shared across all projects/chats. `/memory`
+  shows or changes it. `/memory remember TEXT` stores a note without an API call;
+  the agent can also maintain concise durable preferences and project facts.
+- `/new chat` clears the visible conversation and starts fresh while preserving
+  project files, old sessions, memory and accounting. Selecting a saved session
+  clears the visible chat and shows message previews in pages of six turns.
+- Usage is recorded per model in a durable journal. Completed and failed SDK
+  results, streamed request usage, and recoverable historical cost snapshots
+  are accounted for without repeatedly adding cumulative session totals.
 
 This first version does not include a web chat, voice transcription, photo-message
 handling (send images as documents), scheduled jobs, interactive terminal UI,
@@ -40,9 +56,9 @@ exposed through Telegram.
    prefix. You can obtain it with a trusted ID helper bot, or inspect the `from.id`
    of your own private message using Telegram's `getUpdates` API from a private
    local client. Do not put tokens in browser URLs or paste them in chat.
-3. A funded **Anthropic API key**, with access to Sonnet 5.5 and auto-mode helper
+3. A funded **Anthropic API key**, with access to Opus 5.5 Fast mode and auto-mode helper
    models. This build uses the direct Anthropic API, not an unverified API proxy.
-4. A private GitHub/GitLab repository containing **this folder's contents**.
+4. A GitHub/GitLab repository containing **this folder's contents**.
    Do not publish the parent workspace or its shared `.env` file.
 5. A Render account with billing enabled and approval for a paid worker and disk.
 
@@ -56,7 +72,7 @@ A Render API key is not needed for dashboard deployment.
 
 ## Deploy to Render
 
-1. Push only this project folder to your chosen private Git repository.
+1. Push only this project folder to your chosen Git repository.
 2. In Render choose **New → Blueprint**, connect that repository, and select
    `render.yaml`. The proposed resources are one Singapore `1c-2g` worker
    (1 CPU / 2 GB RAM) and a 10 GB persistent disk. This is a starting size for
@@ -86,9 +102,19 @@ interrupting running tasks unexpectedly; deploy manually while idle.
 | Command | Action |
 | --- | --- |
 | Plain text or `/run TASK` | Start work in the current project |
+| `/menu` | Telegram control panel with buttons |
+| `/model fable`, `/model opus`, `/model sonnet` | Change model while idle |
+| `/efforts low\|medium\|high\|xhigh\|max` | Change reasoning effort while idle |
+| `/fast on` or `/fast off` | Save Fast preference; applies to Opus |
+| `/token count` or `/tokens` | Lifetime input/output/cache tokens per model |
+| `/cost` | Lifetime estimated Claude cost, with per-model breakdown |
+| `/session` or `/session ID` | List/resume saved chats with paginated previews |
+| `/memory` | Read memory and open its controls |
+| `/memory on\|off\|clear` | Enable, disable, or clear shared memory |
+| `/memory remember TEXT` | Save a durable note without model inference |
 | `/status` | Current task, settings and execution limits |
 | `/stop` | Cancel the current SDK run; does not undo existing effects |
-| `/new` | Clear this project's conversation ID, preserve its files |
+| `/new` or `/new chat` | Clear screen and start fresh; preserve files, memory, usage and old chats |
 | `/project NAME` | Create/switch project when idle |
 | `/projects` | List project folders |
 | `/files` | Bounded file listing (three nested levels, no secret folders) |
@@ -109,7 +135,7 @@ It can block dangerous or ambiguous actions. Requests not approved automatically
 are denied; the bot never escalates to bypass mode. Clarifications can be answered
 in the next message. There are no approve/deny buttons in this version.
 Claude's safety classifier may use a different Anthropic-selected model even
-though the main agent remains Sonnet 5.5.
+though the main agent uses your selected Fable, Opus or Sonnet model.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -122,10 +148,51 @@ The old `MAX_BUDGET_USD` and `DAILY_BUDGET_USD` variables are ignored if left in
 existing environment. Legacy reservation fields are removed from saved state
 without losing conversations, job history or Telegram update offsets.
 
-Session cost estimates are informational only; they do not stop work. Provider
+Cost estimates are informational only; they do not stop work. Provider
 billing, credits and account limits remain outside this bot's control. API usage
 and Render hosting still incur their normal charges. The turn limit, timeout,
 single-job rule and `/stop` remain in place as execution controls, not billing caps.
+
+## Chat UI, memory and accounting details
+
+The Telegram API cannot create separate native private-chat tabs for a bot.
+Session switching deletes tracked visible messages and renders a compact saved
+overview with Older/Newer buttons. Telegram normally only permits deleting
+messages less than 48 hours old; older messages may remain. Pre-upgrade history
+is recovered from main Claude transcripts where available; those archives are
+not a full Telegram export. Hidden reasoning, tool results and sidechains are
+excluded from previews. Page summaries are extractive message previews and do
+not make additional model calls. Exact saved text remains on the persistent disk.
+
+`/data/memory/MEMORY.md` is shared across projects. Only useful durable facts and
+preferences should be stored; credentials and raw bill contents should not be.
+Memory is read into each new request. Turning it off prevents deliberate shared
+memory access but cannot erase facts already present in an older conversation.
+Use `/new chat` as well when you need a fresh context. Memory maintenance through
+the agent is best-effort; explicit `/memory remember TEXT` is deterministic.
+
+`/data/bot/usage.jsonl` records content-free usage. Result `modelUsage` snapshots
+include query-pipeline subagents/compaction but omit some internal helper calls.
+Stream deltas preserve known usage when a task is interrupted. Historical
+`cost-state` snapshots restore older totals; where only assistant placeholders
+survive, missing output tokens are not invented and the report is marked partial.
+Cost is an SDK/list-price estimate, not an Anthropic invoice; other applications,
+hosting and unreported requests are excluded. The official Claude Console is
+the billing authority. Neither `/new chat` nor session switching resets usage.
+
+Fast mode is requested through the SDK's `settings.fastMode`. `/status` shows the
+latest provider-reported state; quota/capacity can cause cooldown or standard
+speed. No fallback to a different model is accepted. Fast pricing is higher.
+
+For an explicitly requested one-time migration reset, set
+`RESET_CHAT_ON_UPGRADE=true` before deployment. The worker first imports saved
+chats, then clears this bot's private Telegram conversation and starts a new
+chat. An on-disk marker prevents repeated clearing on later restarts. Leave this
+unset for normal installations.
+
+`VERIFY_AGENT_ON_UPGRADE=true` opts into a one-time short, billable model
+acceptance check. Its usage is counted in the ledger. A persisted attempt marker
+prevents automatic retries; status logs contain only settings and success flags.
 
 The agent receives a filtered subprocess environment without the Telegram token;
 message output redacts known secrets. However, **this is a single-user trust
