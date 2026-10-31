@@ -15,6 +15,7 @@ import { TitleAccountingError, type TitleGenerator } from './titles.js';
 import { Automation, clockInfo, type Task, type Batch } from './automation.js';
 import { artifactSnapshot, changedArtifacts } from './artifacts.js';
 import { Backups } from './backup.js';
+import { KeyPool } from './key-pool.js';
 
 export interface Messenger {
   send(chat: number, text: string): Promise<void>;
@@ -61,7 +62,8 @@ Photos and documents: up to 20 MB each. Send instructions after uploading, or us
 /clock — current India time; specify other timezones in your task
 /trash — restore deleted chats within 48 hours
 /backup — encrypted export and restore controls
-/health — Telegram, Claude, queue, storage and API recovery`;
+/health — Telegram, Claude, queue, storage and API recovery
+/keys — API key status, automatic checks and saved history`;
 
 export class Controller {
   private running?: { abort: AbortController; done: Promise<void> };
@@ -79,7 +81,7 @@ export class Controller {
   private cleaningUi?: Promise<void>;
   private restorePending?: { path: string; project: string; expires: number };
 
-  constructor(private config: Config, private store: StateStore, private messenger: Messenger, private runner: Runner, private ledger?: UsageLedger, private titles?: TitleGenerator) {
+  constructor(private config: Config, private store: StateStore, private messenger: Messenger, private runner: Runner, private ledger?: UsageLedger, private titles?: TitleGenerator, private keys = new KeyPool(config, store)) {
     this.memory = new SharedMemory(config.dataDir, configSecrets(config));
     this.chats = new ChatArchive(path.join(config.dataDir, 'bot', 'chats'), configSecrets(config));
     this.sessions = new SessionCatalog(store, this.chats, configSecrets(config), path.join(config.dataDir, 'claude', 'projects'));
@@ -115,7 +117,7 @@ export class Controller {
     if (!callback.message || !authorized({ ...callback.message, from: callback.from }, this.config.owner)) return;
     await this.messenger.acknowledge?.(callback.id).catch(() => {});
     const data = callback.data ?? '';
-    if (!/^(menu|help|status|stop|rename|new chat|model(?: (?:fable|opus|sonnet))?|efforts(?: (?:low|medium|high|xhigh|max))?|fast(?: (?:on|off))?|token count|cost|memory(?: (?:on|off|confirm-clear|clear))?|session(?: [a-zA-Z0-9_-]+)?|sessionpage \d+|history [a-zA-Z0-9_-]+ \d+|projects|project [a-zA-Z0-9_-]+|files|batch|process(?: [a-zA-Z0-9_-]+)?|discard [a-zA-Z0-9_-]+|queue(?: (?:pause|resume))?|task(?:cancel|first|retry|confirm) [a-zA-Z0-9_-]+|schedules|schedule(?:pause|resume|delete) [a-zA-Z0-9_-]+|trash|(?:delete|trashmove|restore|purge|purgeconfirm) [a-zA-Z0-9_-]+|backup(?: (?:export|files|daily|off))?|restorebackup confirm|health(?: retry)?|clock)$/.test(data)) return;
+    if (!/^(menu|help|status|stop|rename|new chat|model(?: (?:fable|opus|sonnet))?|efforts(?: (?:low|medium|high|xhigh|max))?|fast(?: (?:on|off))?|token count|cost|memory(?: (?:on|off|confirm-clear|clear))?|session(?: [a-zA-Z0-9_-]+)?|sessionpage \d+|history [a-zA-Z0-9_-]+ \d+|projects|project [a-zA-Z0-9_-]+|files|batch|process(?: [a-zA-Z0-9_-]+)?|discard [a-zA-Z0-9_-]+|queue(?: (?:pause|resume))?|task(?:cancel|first|retry|confirm) [a-zA-Z0-9_-]+|schedules|schedule(?:pause|resume|delete) [a-zA-Z0-9_-]+|trash|(?:delete|trashmove|restore|purge|purgeconfirm) [a-zA-Z0-9_-]+|backup(?: (?:export|files|daily|off))?|restorebackup confirm|health(?: retry)?|keys|keyhistory [a-f0-9]{16} \d+|clock)$/.test(data)) return;
     this.panelId = callback.message.message_id;
     try {
       if (data === 'memory confirm-clear') {
@@ -598,6 +600,11 @@ export class Controller {
     await this.say('Encrypted backup sent. Keep the private BACKUP_ENCRYPTION_KEY from your environment to restore it on another server. Restore by uploading this .ctab file. Secrets and lifetime usage are not imported or reset.');
   }
   private async extraCommand(command: string | undefined, argument: string): Promise<boolean> {
+    if (command === 'keys' || command === 'keyhistory') {
+      const [id, page] = argument.split(' ');
+      const view = this.keys.panel(command === 'keyhistory' ? id : undefined, /^\d+$/.test(page ?? '') ? Number(page) : 0);
+      await this.panel(view.text, view.buttons); return true;
+    }
     const d = this.store.data;
     if (command === 'clock') { const clock = clockInfo(); await this.panel(clock.local + '\n' + clock.timezone + '\nUTC: ' + clock.utc); }
     else if (command === 'batch') {
@@ -650,9 +657,9 @@ export class Controller {
       const result = await this.backups.restore(await readFile(file)); this.restorePending = undefined;
       await this.panel(`Restore complete · ${result.chats} chats, ${result.schedules} paused schedules, ${result.files} files added. Existing data and lifetime usage preserved.`);
     } else if (command === 'health') {
-      if (argument === 'retry') { d.disabledKeyIds = []; await this.store.save(); }
+      if (argument === 'retry') await this.keys.requestChecks();
       const disk = await statfs(this.config.dataDir); const keys = 1 + (this.config.backupKeys?.length ?? 0);
-      await this.panel(`Health\n\nTelegram last successful poll: ${d.health?.telegramAt ?? 'not recorded'}\nClaude last success: ${d.health?.claudeAt ?? 'not recorded'}\nClaude error: ${d.health?.apiError ?? 'none recorded'}\nConfigured keys: ${keys}; disabled: ${d.disabledKeyIds?.length ?? 0}\nCurrent task: ${d.active?.id ?? 'idle'}\nQueue: ${d.tasks!.filter(t => t.status === 'queued').length} waiting · ${d.queuePaused ? 'paused' : 'on'}\nSchedules: ${d.schedules!.filter(s => s.enabled).length} enabled\nFree disk: ${(Number(disk.bavail) * Number(disk.bsize) / 1073741824).toFixed(2)} GiB\nLast backup delivered: ${d.health?.lastBackupAt ?? 'none'}\n\nLast success is historical, not a live credit-balance check. No external outage monitor is configured.`, [[button('Re-enable fixed API keys', 'health retry'), button('Queue', 'queue')], ...BACK]);
+      await this.panel(`Health\n\nTelegram last successful poll: ${d.health?.telegramAt ?? 'not recorded'}\nClaude last success: ${d.health?.claudeAt ?? 'not recorded'}\nClaude error: ${d.health?.apiError ?? 'none recorded'}\nConfigured keys: ${keys}; disabled: ${d.disabledKeyIds?.length ?? 0}\nCurrent task: ${d.active?.id ?? 'idle'}\nQueue: ${d.tasks!.filter(t => t.status === 'queued').length} waiting · ${d.queuePaused ? 'paused' : 'on'}\nSchedules: ${d.schedules!.filter(s => s.enabled).length} enabled\nFree disk: ${(Number(disk.bavail) * Number(disk.bsize) / 1073741824).toFixed(2)} GiB\nLast backup delivered: ${d.health?.lastBackupAt ?? 'none'}\n\nLast success is historical, not a live credit-balance check. No external outage monitor is configured.`, [[button('Check API keys', 'health retry'), button('Key status', 'keys'), button('Queue', 'queue')], ...BACK]);
     } else return false;
     return true;
   }

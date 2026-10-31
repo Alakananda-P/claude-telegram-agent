@@ -78,10 +78,24 @@ API-key setup.
 - Session deletion asks for confirmation, then moves the chat to Trash for 48 hours. Restore cancels
   expiry. Permanent deletion removes its archive and SDK transcript, with tombstones preventing
   import or backup restoration from resurrecting it. Memory, files and lifetime usage stay.
-- Private backup credentials can recover authentication/credit failures before any output or tool
-  action. Rate limits retry the same key once; account holds do not trigger key rotation. Ambiguous
-  failures are never automatically replayed. Cross-key continuation uses bounded saved text in a
-  fresh SDK session. Model selection is never changed as a recovery strategy.
+- A private key pool immediately tries the next eligible key on authentication, credit or server
+  failures before any output/tool action, with no bot-added backoff between keys. The provider/SDK
+  must first report the failure; this cannot remove network or SDK retry time. Each key is attempted
+  once per failover chain. The working key remains preferred for later tasks and the title helper.
+  Rate limits stay on the same account; account holds and verification restrictions block rotation,
+  including on later tasks. Ambiguous failures and work with effects are never automatically replayed.
+  Cross-key continuation uses bounded saved text in a fresh SDK session, preserving saved chats,
+  files and memory. Model selection is never changed as a recovery strategy.
+- `/keys` and **Key status** show non-secret labels, task/check counters, last success/failure/check,
+  next check and paginated status-transition history. Hash identities and history persist on `/data`;
+  raw keys and provider error text never enter the status store. Replacing a key creates a new identity.
+  Healthy keys receive a one-output-token Sonnet check every six hours when idle; credit/auth/limit
+  failures every 30 minutes, network/server failures every two minutes. Checks are serialized,
+  abort when a task begins, survive restarts by their saved deadlines, and re-enable only on success.
+  Successful check tokens and estimated cost enter the lifetime usage ledger. These checks establish
+  basic API access, not a balance or access to every model/Fast tier. `/health retry` requests checks
+  without blindly enabling keys or clearing history. Recovery does not replay failed tasks or unpause
+  the queue automatically; use Queue to review/retry. The monitor runs in the existing Render worker.
 - Encrypted backups export chats, shared memory and schedules to the private Telegram chat.
   Optional project files are bounded to 12 MB; encrypted exports are limited to 19 MB so the
   20 MB incoming Telegram limit permits restore. Restore merges missing data and pauses restored

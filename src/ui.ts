@@ -10,5 +10,6 @@ export const HOME: Buttons = [
   [button('📷 Photo batch', 'batch'), button('📋 Task queue', 'queue')],
   [button('⏰ Schedules', 'schedules'), button('🗑 Trash', 'trash')],
   [button('💾 Backups', 'backup'), button('🩺 Health', 'health')],
+  [button('🔑 Key status', 'keys')],
   [button('⏹ Stop task', 'stop'), button('❔ Help', 'help')],
 ];

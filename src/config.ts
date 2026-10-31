@@ -6,6 +6,7 @@ export interface Config {
   model: string; effort: Effort; fast: boolean; permissionMode: 'auto';
   maxTurns: number; timeoutMs: number;
   backupKeys?: string[]; backupEncryptionKey?: string;
+  keyLabels?: string[];
 }
 
 export function configSecrets(c: Config): string[] { return [c.token, c.apiKey, ...(c.backupKeys ?? []), ...(c.backupEncryptionKey ? [c.backupEncryptionKey] : [])]; }
@@ -38,8 +39,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   try { backupKeys = JSON.parse(env.ANTHROPIC_BACKUP_KEYS ?? '[]'); if (!Array.isArray(backupKeys) || backupKeys.length > 5 || backupKeys.some(k => typeof k !== 'string' || !k.startsWith('sk-ant-'))) throw new Error(); }
   catch { throw new Error('Set ANTHROPIC_BACKUP_KEYS to a private JSON array of up to five API keys.'); }
   const backupEncryptionKey = env.BACKUP_ENCRYPTION_KEY;
+  let keyLabels: string[] | undefined;
+  if (env.ANTHROPIC_KEY_LABELS) {
+    try { keyLabels = JSON.parse(env.ANTHROPIC_KEY_LABELS); if (!Array.isArray(keyLabels) || keyLabels.length !== new Set([required('ANTHROPIC_API_KEY'), ...backupKeys]).size || keyLabels.some(x => typeof x !== 'string' || !/^[A-Za-z0-9 _-]{1,32}$/.test(x)) || new Set(keyLabels).size !== keyLabels.length) throw new Error(); }
+    catch { throw new Error('Set ANTHROPIC_KEY_LABELS to unique non-secret labels for each unique configured key.'); }
+  }
   if (backupEncryptionKey && !/^[a-f0-9]{64}$/i.test(backupEncryptionKey)) throw new Error('Set BACKUP_ENCRYPTION_KEY to 32 random bytes encoded as hex.');
-  return { token, owner, apiKey: required('ANTHROPIC_API_KEY'), model, backupKeys, backupEncryptionKey,
+  return { token, owner, apiKey: required('ANTHROPIC_API_KEY'), model, backupKeys, backupEncryptionKey, keyLabels,
     effort, fast: (env.CLAUDE_FAST_MODE ?? 'true') === 'true', permissionMode: 'auto', maxTurns,
     timeoutMs: positive('JOB_TIMEOUT_MINUTES', 20) * 60_000,
     dataDir: path.resolve(env.DATA_DIR ?? './data') };

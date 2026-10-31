@@ -48,6 +48,18 @@ test('unauthorized messages do not produce replies, uploads or jobs', async () =
   assert.deepEqual(replies, []); assert.deepEqual(calls, []);
 });
 
+test('key status menu and history callbacks are owner-only and never create model jobs', async () => {
+  const { bot, panels, calls, store } = await setup();
+  await bot.menu(); assert.ok(panels.at(-1)!.buttons.flat().some(b => b.callback_data === 'keys'));
+  await bot.handle(message('/keys')); assert.match(panels.at(-1)!.text, /API key status/);
+  const id = Object.keys(store.data.keyRecords!)[0];
+  await bot.callback({ id: 'keyclick', from: { id: 123 }, message: { ...message(''), message_id: 55 }, data: `keyhistory ${id} 0` });
+  assert.match(panels.at(-1)!.text, /History 1\/1/); assert.equal(panels.at(-1)!.editId, 55);
+  const count = panels.length;
+  await bot.callback({ id: 'intruder', from: { id: 666 }, message: { ...message(''), message_id: 55 }, data: 'keys' });
+  assert.equal(panels.length, count); assert.equal(calls.length, 0);
+});
+
 test('largest direct photo is acknowledged and captionless upload attaches to the next task', async () => {
   const { bot, downloads, calls, indicators, panels, store } = await setup();
   await bot.handle(photo('bill')); assert.deepEqual(downloads, ['bill-large']); assert.equal(calls.length, 0);

@@ -13,9 +13,11 @@ export class TitleAccountingError extends Error {}
 /** A separate small Haiku request, with no tools, memory, or user-chat resume.
  * SDK-reported costs enter the same ledger, including failed results. */
 export class HaikuTitles implements TitleGenerator {
-  constructor(private config: Config, private ledger: UsageLedger, private makeQuery: QueryFactory = query) {}
+  constructor(private config: Config, private ledger: UsageLedger, private makeQuery: QueryFactory = query, private currentConfig?: () => Config | undefined) {}
   async generate(turns: ChatTurn[], signal: AbortSignal): Promise<string | null> {
     if (signal.aborted) return null;
+    const config = this.currentConfig ? this.currentConfig() : this.config;
+    if (!config) return null;
     const abort = new AbortController();
     const stop = () => abort.abort();
     signal.addEventListener('abort', stop, { once: true });
@@ -33,7 +35,7 @@ export class HaikuTitles implements TitleGenerator {
         tools: [], mcpServers: {}, strictMcpConfig: true, settingSources: [], skills: [],
         permissionMode: 'default', canUseTool: async () => ({ behavior: 'deny', message: 'Title generation has no tools.' }),
         persistSession: false, maxTurns: 1, includePartialMessages: true,
-        env: { ...agentEnvironment(this.config), CLAUDE_CODE_MAX_OUTPUT_TOKENS: '256' }, abortController: abort, stderr: () => {},
+        env: { ...agentEnvironment(config), CLAUDE_CODE_MAX_OUTPUT_TOKENS: '256' }, abortController: abort, stderr: () => {},
       } });
       for await (const event of stream) {
         try {

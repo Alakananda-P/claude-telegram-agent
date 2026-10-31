@@ -102,6 +102,17 @@ export class UsageLedger {
     await this.append({ kind: 'result', session, id, at, models: cleanModels(models), cost: n(cost) });
   }
 
+  /** Serialized direct API checks have final usage but no SDK cumulative result. */
+  async recordProbe(id: string, model: string, usage: Record<string, unknown>): Promise<void> {
+    const sessionId = 'key-health-checks', resultId = 'key-health:' + id;
+    if (this.seen.has('result:' + resultId)) return;
+    await this.recordStep(sessionId, id, model, usage, true);
+    const session = this.sessions.get(sessionId)!;
+    const models = cleanModels(session.models); let cost = session.cost;
+    for (const step of session.pending.values()) { add(models[step.model] ??= empty(), step.counts); cost += step.counts.costUSD; }
+    await this.recordResult(sessionId, resultId, models, cost);
+  }
+
   async recordStep(session: string, id: string, model: string, usage: Record<string, unknown>, complete: boolean, at = new Date().toISOString()): Promise<void> {
     // Only final stream deltas have reliable output counts. Transcript assistant
     // rows carry placeholders, so historical output is left explicitly partial.

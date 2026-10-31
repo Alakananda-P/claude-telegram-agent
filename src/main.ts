@@ -13,6 +13,7 @@ import { HaikuTitles } from './titles.js';
 import { ResilientRunner } from './recovery.js';
 import { acceptance } from './acceptance.js';
 import { Automation } from './automation.js';
+import { KeyPool, messageProbe } from './key-pool.js';
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -37,13 +38,17 @@ async function main(): Promise<void> {
   await telegram.call('getMe');
   const webhook = await telegram.call<{ url?: string }>('getWebhookInfo');
   if (webhook.url) throw new Error('This bot already has a webhook. Remove it explicitly or use a dedicated bot before starting polling.');
-  const controller = new Controller(config, store, telegram, new ResilientRunner(config, store), ledger, new HaikuTitles(config, ledger));
+  const keys = new KeyPool(config, store, messageProbe(ledger));
+  await keys.initialize();
+  console.log(`API key pool ready: configured=${keys.list().length}; automaticChecks=true.`);
+  const controller = new Controller(config, store, telegram, new ResilientRunner(config, store, undefined, undefined, keys), ledger, new HaikuTitles(config, ledger, undefined, () => keys.selectedConfig()), keys);
   const shutdown = new AbortController();
   let stopping = false;
   const stop = () => {
     if (stopping) return;
     stopping = true;
     shutdown.abort();
+    void keys.stop().catch(() => {});
     const forcedExit = setTimeout(() => process.exit(1), 25_000);
     forcedExit.unref();
     void controller.stop().catch(() => {}).finally(() => clearTimeout(forcedExit));
@@ -113,6 +118,7 @@ async function main(): Promise<void> {
       { command: 'trash', description: 'Restore deleted chats within 48 hours' },
       { command: 'backup', description: 'Encrypted export and restore' },
       { command: 'health', description: 'API, Telegram, disk and queue health' },
+      { command: 'keys', description: 'API key status and recovery history' },
     ], scope: { type: 'chat', chat_id: config.owner } }).catch(() => {});
     await telegram.call('setChatMenuButton', { chat_id: config.owner, menu_button: { type: 'commands' } }).catch(() => {});
     await controller.cleanIndicators();
@@ -128,12 +134,14 @@ async function main(): Promise<void> {
     if (store.data.lastJob?.status === 'interrupted') await telegram.send(config.owner, 'The previous task was interrupted by a restart. Review its files before retrying.').catch(() => {});
     console.log('Private Telegram worker started.');
     controller.start();
+    keys.start();
     await poll(telegram, store, message => controller.handle(message), shutdown.signal, callback => controller.callback(callback), async failures => {
       if (failures >= 3) await telegram.send(config.owner, 'Telegram connection recovered. Queued work and stored files are preserved. Check /health for the latest status.').catch(() => {});
     });
   } finally {
     stop();
     await controller.stop();
+    await keys.stop();
   }
 }
 
