@@ -1,0 +1,35 @@
+# yaml-language-server: $schema=https://render.com/schema/render.yaml.json
+# This creates PAID resources. Review Render's checkout estimate before deploying.
+services:
+  - type: worker
+    name: private-claude-telegram-agent
+    runtime: docker
+    region: singapore
+    plan: 1c-2g
+    numInstances: 1
+    autoDeployTrigger: "off"
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    disk:
+      name: agent-data
+      mountPath: /data
+      sizeGB: 10
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_OWNER_ID
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: DATA_DIR
+        value: /data
+      - key: CLAUDE_MODEL
+        value: claude-sonnet-5-5
+      - key: CLAUDE_EFFORT
+        value: high
+      - key: CLAUDE_PERMISSION_MODE
+        value: auto
+      - key: MAX_TURNS
+        value: "50"
+      - key: JOB_TIMEOUT_MINUTES
+        value: "20"

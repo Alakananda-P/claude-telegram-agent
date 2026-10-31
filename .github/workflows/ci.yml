@@ -1,0 +1,26 @@
+name: Verify Telegram agent
+"on": [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm test
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm audit --omit=dev --audit-level=high
+      - run: docker build -t claude-telegram-agent:test .
+      - name: Secret-free container startup check
+        run: |
+          docker run --rm \
+            -e TELEGRAM_BOT_TOKEN=123456:abcdefghijklmnopqrstuvw \
+            -e TELEGRAM_OWNER_ID=123 \
+            -e ANTHROPIC_API_KEY=test-only-not-a-key \
+            claude-telegram-agent:test node dist/main.js --check
