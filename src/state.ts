@@ -7,6 +7,10 @@ export interface JobRecord {
   status?: 'completed' | 'failed' | 'cancelled' | 'interrupted';
   finishedAt?: string;
 }
+export interface Conversation {
+  id: string; project: string; updatedAt: string;
+  title?: string; titleSource?: 'fallback' | 'auto' | 'model' | 'manual'; titleAttempted?: boolean;
+}
 export interface State {
   version: 1; offset: number; project: string; sessions: Record<string, string>;
   active: JobRecord | null; lastJob: JobRecord | null;
@@ -14,7 +18,7 @@ export interface State {
   indicatorIds?: number[];
   lastSpeed?: string;
   memoryEnabled?: boolean;
-  conversations?: { id: string; project: string; updatedAt: string }[];
+  conversations?: Conversation[];
   visibleMessageIds?: number[];
   chatUiResetDone?: boolean;
   upgradeCheck?: { attempted: boolean; passed: boolean; actualSpeed?: string };
@@ -35,7 +39,10 @@ export class StateStore {
         || !Object.values(data.sessions).every(v => typeof v === 'string')
         || (data.settings !== undefined && !validSettings(data.settings))
         || (data.memoryEnabled !== undefined && typeof data.memoryEnabled !== 'boolean')
-        || (data.conversations !== undefined && (!Array.isArray(data.conversations) || !data.conversations.every(s => s && typeof s.id === 'string' && typeof s.project === 'string' && typeof s.updatedAt === 'string')))
+        || (data.conversations !== undefined && (!Array.isArray(data.conversations) || !data.conversations.every(s => s && typeof s.id === 'string' && typeof s.project === 'string' && typeof s.updatedAt === 'string'
+          && (s.title === undefined || (typeof s.title === 'string' && s.title.length <= 96))
+          && (s.titleSource === undefined || ['fallback', 'auto', 'model', 'manual'].includes(s.titleSource))
+          && (s.titleAttempted === undefined || typeof s.titleAttempted === 'boolean'))))
         || (data.indicatorIds !== undefined && (!Array.isArray(data.indicatorIds) || !data.indicatorIds.every(Number.isSafeInteger)))
         || (data.visibleMessageIds !== undefined && (!Array.isArray(data.visibleMessageIds) || !data.visibleMessageIds.every(Number.isSafeInteger)))
         || (data.active !== null && (!data.active || typeof data.active.id !== 'string'))) {

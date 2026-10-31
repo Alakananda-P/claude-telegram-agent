@@ -9,6 +9,7 @@ import { poll } from './polling.js';
 import { UsageLedger } from './usage.js';
 import { settingsLabel } from './settings.js';
 import { ChatArchive } from './chats.js';
+import { HaikuTitles } from './titles.js';
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -33,7 +34,7 @@ async function main(): Promise<void> {
   await telegram.call('getMe');
   const webhook = await telegram.call<{ url?: string }>('getWebhookInfo');
   if (webhook.url) throw new Error('This bot already has a webhook. Remove it explicitly or use a dedicated bot before starting polling.');
-  const controller = new Controller(config, store, telegram, new ClaudeRunner(config), ledger);
+  const controller = new Controller(config, store, telegram, new ClaudeRunner(config), ledger, new HaikuTitles(config, ledger));
   const shutdown = new AbortController();
   let stopping = false;
   const stop = () => {
@@ -47,6 +48,7 @@ async function main(): Promise<void> {
   process.once('SIGTERM', stop);
   process.once('SIGINT', stop);
   try {
+    await controller.prepareSessions(shutdown.signal);
     if (process.env.VERIFY_AGENT_ON_UPGRADE === 'true' && !store.data.upgradeCheck?.attempted) {
       // Explicit rollout acceptance check; one short request, once per data disk.
       // Count its usage in the same ledger and never poll Telegram twice.
@@ -80,6 +82,7 @@ async function main(): Promise<void> {
       { command: 'efforts', description: 'Choose reasoning effort' },
       { command: 'fast', description: 'Opus Fast mode on or off' },
       { command: 'session', description: 'Saved chats and resume' },
+      { command: 'rename', description: 'Rename the current chat' },
       { command: 'memory', description: 'Shared long-term memory' },
       { command: 'token', description: 'Lifetime tokens by model' },
       { command: 'cost', description: 'Lifetime estimated Claude cost' },

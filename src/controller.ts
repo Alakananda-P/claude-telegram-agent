@@ -10,6 +10,8 @@ import { UsageLedger } from './usage.js';
 import { SharedMemory } from './memory.js';
 import { button, BACK, HOME, type Buttons } from './ui.js';
 import { ChatArchive } from './chats.js';
+import { SessionCatalog, sessionTitle } from './sessions.js';
+import { TitleAccountingError, type TitleGenerator } from './titles.js';
 
 export interface Messenger {
   send(chat: number, text: string): Promise<void>;
@@ -33,6 +35,7 @@ Send a task in plain text, or upload a document with instructions in its caption
 /token count — lifetime tokens by model (also /tokens)
 /cost — lifetime estimated Claude cost by model
 /session — saved chats; /session ID to resume
+/rename TITLE — rename the current chat
 /new chat — fresh chat, keep files and shared memory
 /memory — shared memory; on, off, remember TEXT, clear
 /status — current job, model and execution limits
@@ -53,10 +56,22 @@ export class Controller {
   private panelId?: number;
   private memory: SharedMemory;
   private chats: ChatArchive;
+  readonly sessions: SessionCatalog;
 
-  constructor(private config: Config, private store: StateStore, private messenger: Messenger, private runner: Runner, private ledger?: UsageLedger) {
+  constructor(private config: Config, private store: StateStore, private messenger: Messenger, private runner: Runner, private ledger?: UsageLedger, private titles?: TitleGenerator) {
     this.memory = new SharedMemory(config.dataDir, [config.token, config.apiKey]);
     this.chats = new ChatArchive(path.join(config.dataDir, 'bot', 'chats'), [config.token, config.apiKey]);
+    this.sessions = new SessionCatalog(store, this.chats, [config.token, config.apiKey]);
+  }
+
+  async prepareSessions(signal: AbortSignal): Promise<void> {
+    await this.sessions.backfill();
+    let named = 0;
+    if (this.titles) for (const record of this.store.data.conversations ?? []) {
+      if (signal.aborted) break;
+      if (await this.sessions.autoName(record.id, turns => this.titles!.generate(turns, signal))) named++;
+    }
+    console.log(`Session catalog ready: chats=${this.sessions.context().total}; generatedNames=${named}; tools=list,read,rename,search,memory.`);
   }
 
   private get settings(): AgentSettings { return this.store.data.settings ?? { model: this.config.model, effort: this.config.effort, fast: this.config.fast }; }
@@ -75,7 +90,7 @@ export class Controller {
     if (!callback.message || !authorized({ ...callback.message, from: callback.from }, this.config.owner)) return;
     await this.messenger.acknowledge?.(callback.id).catch(() => {});
     const data = callback.data ?? '';
-    if (!/^(menu|help|status|stop|new chat|model(?: (?:fable|opus|sonnet))?|efforts(?: (?:low|medium|high|xhigh|max))?|fast(?: (?:on|off))?|token count|cost|memory(?: (?:on|off|confirm-clear|clear))?|session(?: [a-zA-Z0-9_-]+)?|sessionpage \d+|history [a-zA-Z0-9_-]+ \d+|projects|project [a-zA-Z0-9_-]+|files)$/.test(data)) return;
+    if (!/^(menu|help|status|stop|rename|new chat|model(?: (?:fable|opus|sonnet))?|efforts(?: (?:low|medium|high|xhigh|max))?|fast(?: (?:on|off))?|token count|cost|memory(?: (?:on|off|confirm-clear|clear))?|session(?: [a-zA-Z0-9_-]+)?|sessionpage \d+|history [a-zA-Z0-9_-]+ \d+|projects|project [a-zA-Z0-9_-]+|files)$/.test(data)) return;
     this.panelId = callback.message.message_id;
     try {
       if (data === 'memory confirm-clear') {
@@ -115,8 +130,9 @@ export class Controller {
     const nav = [];
     if (current > 0) nav.push(button('‹ Older', `history ${id} ${current - 1}`));
     if (current < pages - 1) nav.push(button('Newer ›', `history ${id} ${current + 1}`));
-    return this.panel(`Chat overview · Page ${current + 1}/${pages}\n${this.store.data.project} · ${id.slice(0, 8)}\n\n${previews.join('\n\n') || 'No recoverable messages for this session.'}\n\nSaved message previews. Send a message to continue this chat.`, [
-      ...(nav.length ? [nav] : []), [button('💬 Sessions', 'session'), button('➕ New chat', 'new chat')], ...BACK]);
+    const record = this.store.data.conversations!.find(s => s.id === id)!;
+    return this.panel(`${sessionTitle(record)}\nChat overview · Page ${current + 1}/${pages}\n${this.store.data.project} · ${id.slice(0, 8)}\n\n${previews.join('\n\n') || 'No recoverable messages for this session.'}\n\nSaved message previews. Send a message to continue this chat.`, [
+      ...(nav.length ? [nav] : []), [button('💬 Sessions', 'session'), button('➕ New chat', 'new chat')], [button('✏️ Rename chat', 'rename')], ...BACK]);
   }
 
   private async session(id: string, project: string): Promise<void> {
@@ -125,6 +141,7 @@ export class Controller {
     const record = list.find(s => s.id === id);
     if (record) record.updatedAt = new Date().toISOString();
     else list.push({ id, project, updatedAt: new Date().toISOString() });
+    await this.sessions.ensureName(id);
     await this.store.save();
   }
 
@@ -172,12 +189,12 @@ export class Controller {
     const pages = Math.max(1, Math.ceil(list.length / 8));
     const current = Math.min(pages - 1, Math.max(0, page));
     const slice = list.slice(current * 8, current * 8 + 8);
-    const descriptions = slice.map(x => `${x.id === active ? '✓ ' : ''}${x.project} · ${x.id}\n${x.updatedAt.slice(0, 16).replace('T', ' ')} UTC`);
+    const descriptions = slice.map(x => `${x.id === active ? '✓ ' : ''}${sessionTitle(x)}\n${x.project} · ${x.id.slice(0, 8)} · ${x.updatedAt.slice(0, 16).replace('T', ' ')} UTC`);
     const nav = [];
     if (current > 0) nav.push(button('‹ Previous', 'sessionpage ' + (current - 1)));
     if (current < pages - 1) nav.push(button('Next ›', 'sessionpage ' + (current + 1)));
-    return this.panel(`Saved conversations · Page ${current + 1}/${pages}\n\n${descriptions.join('\n\n') || 'No saved chats yet.'}\n\nTap to resume. /session ID also works.`, [
-      ...slice.map(x => [button(`${x.id === active ? '✓ ' : ''}${x.project} · ${x.id.slice(0, 8)}`, 'session ' + x.id)]),
+    return this.panel(`Saved conversations · ${list.length} chats · Page ${current + 1}/${pages}\n\n${descriptions.join('\n\n') || 'No saved chats yet.'}\n\nTap to resume. /session ID also works. Ask Claude to find a past chat or change its name.`, [
+      ...slice.map(x => [button(`${x.id === active ? '✓ ' : ''}${sessionTitle(x)}`, 'session ' + x.id)]),
       ...(nav.length ? [nav] : []),
       [button('➕ New chat', 'new chat')], ...BACK]);
   }
@@ -194,6 +211,7 @@ export class Controller {
     const argument = match?.[2]?.trim() ?? '';
     if (command === 'start' || command === 'menu') return this.menu();
     if (command === 'help') return this.panel(HELP);
+    if (command === 'rename' && !argument) return this.panel('Send /rename followed by the new title, or ask Claude to rename this chat.');
     if (command === 'sessionpage') return this.controls('session', Math.max(0, Math.floor(Number(argument) || 0)));
     if (command === 'history') {
       const [id, page] = argument.split(' ');
@@ -221,6 +239,12 @@ export class Controller {
     if (this.persistenceFailed) return this.say('State storage failed. Restart only after checking the persistent disk; new tasks are disabled.');
     try {
       const root = await this.workspace();
+      if (command === 'rename') {
+        const id = this.store.data.sessions[this.store.data.project];
+        if (!id) return this.panel('Send your first task to start this chat, then rename it.');
+        await this.sessions.rename(id, argument, 'manual');
+        return this.controls('session');
+      }
       if (['model', 'efforts', 'effort', 'fast'].includes(command ?? '')) {
         const next = { ...this.settings };
         if (command === 'model') {
@@ -363,7 +387,7 @@ export class Controller {
       }
       abort.signal.throwIfAborted();
       const selected = effectiveSettings(this.settings);
-      const result = await this.runner.run({ prompt, cwd, session: this.store.data.sessions[project], settings: selected, memoryEnabled: this.store.data.memoryEnabled !== false }, async event => {
+      const result = await this.runner.run({ prompt, cwd, session: this.store.data.sessions[project], settings: selected, memoryEnabled: this.store.data.memoryEnabled !== false, sessions: this.sessions }, async event => {
         if (event.type === 'session') {
           await this.chats.bind(archiveKey, event.id);
           archiveKey = event.id;
@@ -387,8 +411,10 @@ export class Controller {
       const preview = result.text.length > 12000 ? result.text.slice(0, 12000) + `\n\nFull result: /get ${outputName}` : result.text;
       await finishIndicator();
       await this.say(preview);
+      if (this.titles && !abort.signal.aborted) await this.sessions.autoName(result.session, turns => this.titles!.generate(turns, abort.signal));
       console.log(`Claude task completed: ${selected.model}; effort=${selected.effort}; requestedFast=${selected.fast}; reportedSpeed=${this.store.data.lastSpeed ?? 'unknown'}.`);
     } catch (error) {
+      if (error instanceof TitleAccountingError) this.persistenceFailed = true;
       status = abort.signal.aborted ? 'cancelled' : 'failed';
       await finishIndicator();
       await this.say(timedOut ? 'This task reached its time limit and was stopped.'

@@ -3,6 +3,13 @@ import assert from 'node:assert/strict';
 import type { SDKMessage, Options } from '@anthropic-ai/claude-agent-sdk';
 import { ClaudeRunner, type AgentEvent, type QueryFactory } from '../src/agent.js';
 import { loadConfig } from '../src/config.js';
+import { mkdtemp } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { StateStore } from '../src/state.js';
+import { ChatArchive } from '../src/chats.js';
+import { SessionCatalog, SESSION_TOOL_NAMES } from '../src/sessions.js';
+import { MEMORY_TOOL_NAMES } from '../src/memory-tools.js';
 
 const config = loadConfig({ TELEGRAM_BOT_TOKEN: '123456:abcdefghijklmnopqrstuvw', TELEGRAM_OWNER_ID: '123', ANTHROPIC_API_KEY: 'test-only-not-real' });
 const init = { type: 'system', subtype: 'init', model: 'claude-opus-5-5', permissionMode: 'auto', effort: 'high', fast_mode_state: 'on',
@@ -86,4 +93,24 @@ test('runner rejects a main-agent model change after initialization', async () =
     stop_reason: 'end_turn', stop_sequence: null, usage: result.usage,
   }, session_id: 'session-1', uuid: 'uuid-3' };
   await assert.rejects(new ClaudeRunner(config, factory([init, changed, result])).run({ prompt: 'x', cwd: '/work' }, () => {}, new AbortController()), /model/i);
+});
+
+test('only registered session and enabled memory tools receive automatic approval', async () => {
+  const dataDir = await mkdtemp(path.join(tmpdir(), 'tg-agent-tools-'));
+  const store = await StateStore.open(path.join(dataDir, 'state.json'));
+  const sessions = new SessionCatalog(store, new ChatArchive(path.join(dataDir, 'chats'), []), []);
+  for (const memoryEnabled of [true, false]) {
+    let options!: Options;
+    await new ClaudeRunner({ ...config, dataDir }, factory([init, result], o => { options = o; }))
+      .run({ prompt: 'x', cwd: '/work', sessions, memoryEnabled }, () => {}, new AbortController());
+    assert.ok(options.mcpServers!.sessions);
+    assert.equal(Boolean(options.mcpServers!.memory), memoryEnabled);
+    const expected = [...SESSION_TOOL_NAMES, ...(memoryEnabled ? MEMORY_TOOL_NAMES : [])];
+    assert.deepEqual(options.allowedTools, expected);
+    const toolOptions = { signal: new AbortController().signal, toolUseID: '1', requestId: '1' };
+    for (const name of expected) assert.equal((await options.canUseTool!(name, {}, toolOptions))?.behavior, 'allow');
+    for (const name of ['Bash', 'mcp__sessions__delete_all', ...(memoryEnabled ? [] : MEMORY_TOOL_NAMES)]) {
+      assert.equal((await options.canUseTool!(name, {}, toolOptions))?.behavior, 'deny');
+    }
+  }
 });

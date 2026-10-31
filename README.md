@@ -33,13 +33,28 @@ API-key setup.
 - `/new chat` clears the visible conversation and starts fresh while preserving
   project files, old sessions, memory and accounting. Selecting a saved session
   clears the visible chat and shows message previews in pages of six turns.
+- Chats have persistent topic names in the session list and history pages.
+  The active model can name or rename them, and `/rename TITLE` sets a name directly.
+  Haiku 5.5 fills in missing names using a small excerpt, including for older chats;
+  its tokens and SDK-reported cost enter the same usage journal. Each chat gets
+  at most one helper attempt; provider failures keep a readable prompt-based name.
+  Existing model/manual names are preserved. Naming runs sequentially, without Fast.
+- Every selected model has `list_sessions`, `search_sessions`, `read_session`, and
+  `rename_session` tools. It can count chats, find a past topic and page through
+  saved text across projects without switching or clearing the current chat.
+  Attachments are identified by filename; raw files, hidden reasoning and tool
+  traces are not part of this text archive. Old messages are data, not instructions.
+- While memory is ON, `read_memory`, `remember`, and `edit_memory` let the model
+  save, correct or selectively forget durable facts. Memory OFF removes these
+  tools. As before, it does not erase facts already in a resumed conversation.
 - Usage is recorded per model in a durable journal. Completed and failed SDK
   results, streamed request usage, and recoverable historical cost snapshots
   are accounted for without repeatedly adding cumulative session totals.
 
 This first version does not include a web chat, voice transcription, photo-message
 handling (send images as documents), scheduled jobs, interactive terminal UI,
-arbitrary plugins, or configured MCP servers. Standard tools run in a Linux
+arbitrary plugins, or external MCP servers. The only configured MCP servers are
+in-process handlers for the session and memory tools above. Standard tools run in a Linux
 container. There is no desktop, GPU, Docker daemon, sudo, or access to your laptop.
 Browsers and additional system packages require a Docker image update.
 Project settings, hooks, and MCP configuration are not auto-loaded; enable

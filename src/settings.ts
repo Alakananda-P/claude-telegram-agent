@@ -11,7 +11,7 @@ export function effectiveSettings(settings: AgentSettings): AgentSettings {
   return { ...settings, fast: settings.fast && settings.model === MODELS.opus };
 }
 export function modelLabel(model: string): string {
-  return model === MODELS.fable ? 'Fable 5.1' : model === MODELS.opus ? 'Opus 5.5' : model === MODELS.sonnet ? 'Sonnet 5.5' : model;
+  return model === MODELS.fable ? 'Fable 5.1' : model === MODELS.opus ? 'Opus 5.5' : model === MODELS.sonnet ? 'Sonnet 5.5' : model === 'claude-haiku-5-5' ? 'Haiku 5.5' : model;
 }
 export function settingsLabel(settings: AgentSettings): string {
   const s = effectiveSettings(settings);

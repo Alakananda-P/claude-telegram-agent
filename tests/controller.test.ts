@@ -46,6 +46,25 @@ test('unauthorized messages do not produce replies, uploads or jobs', async () =
   assert.deepEqual(replies, []); assert.deepEqual(calls, []);
 });
 
+test('active model can list, read and name chats; manual titles appear in session buttons', async () => {
+  const runner: Runner = { async run(request, emit) {
+    await emit({ type: 'session', id: 'chat-test' });
+    assert.equal(request.sessions!.list().currentSession, 'chat-test');
+    assert.equal(request.sessions!.list().total, 1);
+    assert.equal((await request.sessions!.read('chat-test')).turns[0].text, 'Create a Tally import workbook');
+    await request.sessions!.rename('chat-test', 'Tally workbook preparation');
+    return { text: 'Done', session: 'chat-test', cumulativeCost: 0 };
+  } };
+  const { bot, panels, store } = await setup(runner);
+  await bot.handle(message('Create a Tally import workbook')); await bot.idle();
+  await bot.handle(message('/session'));
+  assert.match(panels.at(-1)!.text, /Tally workbook preparation/);
+  assert.ok(panels.at(-1)!.buttons.flat().some(b => b.text.includes('Tally workbook preparation')));
+  await bot.handle(message('/rename October bill processing'));
+  assert.equal(store.data.conversations![0].title, 'October bill processing');
+  assert.equal(store.data.conversations![0].titleSource, 'manual');
+});
+
 test('session resumes by project, /new keeps files and new projects are isolated', async () => {
   const { bot, calls, store } = await setup();
   await bot.handle(message('first')); await bot.idle();
@@ -175,7 +194,7 @@ test('temporary thinking is removed on success and failure, without job/cost ban
 });
 
 test('/new chat archives conversations; /session resumes them and shared memory stays enabled', async () => {
-  const { bot, store, calls, replies } = await setup();
+  const { bot, store, calls, replies, panels } = await setup();
   await bot.handle(message('first')); await bot.idle();
   await bot.handle(message('/new chat'));
   assert.equal(store.data.sessions.default, undefined);
@@ -184,7 +203,8 @@ test('/new chat archives conversations; /session resumes them and shared memory 
   await bot.handle(message('third')); await bot.idle();
   assert.equal(calls[2].session, 'session-1');
   await bot.handle(message('/session'));
-  assert.match(replies.at(-1)!, /session-2/);
+  assert.match(replies.at(-1)!, /second/);
+  assert.ok(panels.at(-1)!.buttons.flat().some(b => b.callback_data === 'session session-2'));
   await bot.handle(message('/memory'));
   assert.match(replies.at(-1)!, /ON/);
   await bot.handle(message('/memory off'));

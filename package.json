@@ -3,7 +3,9 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=22.18.0 <23" },
+  "engines": {
+    "node": ">=22.18.0 <23"
+  },
   "scripts": {
     "test": "node --import tsx --test tests/*.test.ts",
     "typecheck": "tsc --noEmit",
@@ -12,6 +14,14 @@
     "dev": "node --env-file=.env --import tsx src/main.ts",
     "check": "node --env-file=.env --import tsx src/main.ts --check"
   },
-  "dependencies": { "@anthropic-ai/claude-agent-sdk": "0.3.314" },
-  "devDependencies": { "@types/node": "^22.0.0", "tsx": "4.23.15", "typescript": "7.0.2" }
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.314",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "@types/node": "^22.0.0",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2"
+  }
 }
