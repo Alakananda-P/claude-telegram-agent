@@ -133,6 +133,14 @@ export class Telegram {
     form.set('document', new Blob([new Uint8Array(bytes)]), name);
     await this.call('sendDocument', form);
   }
+  async sendPhoto(chat: number, name: string, bytes: Uint8Array, caption = ''): Promise<void> {
+    if (bytes.byteLength > 9_500_000) return this.sendFile(chat, name, bytes);
+    for (const secret of [this.token, ...this.secrets].filter(Boolean)) if (Buffer.from(bytes).includes(Buffer.from(secret))) throw new Error('Image contains a configured secret.');
+    const form = new FormData(); form.set('chat_id', String(chat));
+    form.set('photo', new Blob([new Uint8Array(bytes)]), name);
+    if (caption) form.set('caption', redact(caption, [this.token, ...this.secrets]).slice(0, 1000));
+    await this.call('sendPhoto', form);
+  }
 
   async download(fileId: string): Promise<Buffer> {
     const file = await this.call<{ file_path?: string; file_size?: number }>('getFile', { file_id: fileId });

@@ -1,6 +1,20 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { validSettings, type AgentSettings } from './settings.js';
+import type { Task, Schedule, Upload, Batch } from './automation.js';
+import { z } from 'zod';
+
+const identifier = z.string().regex(/^[a-zA-Z0-9_-]{1,100}$/);
+const projectId = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,47}$/);
+const isoDate = z.string().datetime();
+const automationState = z.object({
+  tasks: z.array(z.object({ id: identifier, project: projectId, chatKey: identifier, kind: z.enum(['agent', 'reminder', 'backup']), status: z.enum(['queued', 'running', 'completed', 'failed', 'cancelled', 'interrupted']), prompt: z.string().min(1).max(30000), createdAt: isoDate, settings: z.custom(validSettings).optional() })).optional(),
+  schedules: z.array(z.object({ id: identifier, project: projectId, name: z.string().min(1).max(80), prompt: z.string().min(1).max(10000), kind: z.enum(['agent', 'reminder', 'backup']), enabled: z.boolean(), nextRun: isoDate, timezone: z.string(), at: z.string().optional(), cron: z.string().optional(), intervalMinutes: z.number().int().positive().optional() }).refine(s => [s.at, s.cron, s.intervalMinutes].filter(v => v !== undefined).length === 1)).optional(),
+  uploads: z.array(z.object({ id: identifier, project: projectId, chatKey: identifier, path: z.string().regex(/^uploads\/[a-zA-Z0-9._-]+$/), name: z.string(), photo: z.boolean(), receivedAt: isoDate, batchId: identifier })).optional(),
+  batches: z.array(z.object({ id: identifier, project: projectId, chatKey: identifier, uploadIds: z.array(identifier), status: z.enum(['collecting', 'queued', 'discarded']), updatedAt: isoDate })).optional(),
+  bindings: z.record(identifier, identifier).optional(), drafts: z.record(projectId, identifier).optional(), purgedSessions: z.array(identifier).optional(), resumeDisabled: z.array(identifier).optional(),
+  queuePaused: z.boolean().optional(), disabledKeyIds: z.array(z.string().regex(/^[a-f0-9]{16}$/)).optional(), sessionCredentials: z.record(identifier, z.string().regex(/^[a-f0-9]{16}$/)).optional(),
+});
 
 export interface JobRecord {
   id: string; project: string; startedAt: string;
@@ -10,6 +24,7 @@ export interface JobRecord {
 export interface Conversation {
   id: string; project: string; updatedAt: string;
   title?: string; titleSource?: 'fallback' | 'auto' | 'model' | 'manual'; titleAttempted?: boolean;
+  trashedAt?: string; purgeAt?: string;
 }
 export interface State {
   version: 1; offset: number; project: string; sessions: Record<string, string>;
@@ -22,6 +37,10 @@ export interface State {
   visibleMessageIds?: number[];
   chatUiResetDone?: boolean;
   upgradeCheck?: { attempted: boolean; passed: boolean; actualSpeed?: string; checkId?: string };
+  tasks?: Task[]; schedules?: Schedule[]; uploads?: Upload[]; batches?: Batch[]; queuePaused?: boolean;
+  bindings?: Record<string, string>; drafts?: Record<string, string>; purgedSessions?: string[];
+  resumeDisabled?: string[]; sessionCredentials?: Record<string, string>; disabledKeyIds?: string[]; activeKeyId?: string;
+  health?: { telegramAt?: string; claudeAt?: string; apiError?: string; lastAlert?: string; lastBackupAt?: string; activeCredential?: number; disabledCredentials?: number[] };
 }
 
 export class StateStore {
@@ -60,8 +79,18 @@ export class StateStore {
     // Project names are dictionary keys, never Object.prototype lookups.
     data.sessions = Object.assign(Object.create(null), data.sessions);
     data.memoryEnabled ??= true;
+    if (!automationState.safeParse(data).success) throw new Error('Cannot load bot state; invalid automation data.');
+    for (const key of ['tasks', 'schedules', 'uploads', 'batches', 'purgedSessions'] as const) {
+      if (data[key] !== undefined && !Array.isArray(data[key])) throw new Error('Cannot load bot state; invalid automation records.');
+      data[key] ??= [];
+    }
+    for (const task of data.tasks!) if (task.status === 'running') { task.status = 'interrupted'; task.finishedAt = new Date().toISOString(); }
+    data.bindings = Object.assign(Object.create(null), data.bindings ?? {});
+    data.drafts = Object.assign(Object.create(null), data.drafts ?? {});
+    data.health ??= {};
     data.conversations ??= [];
     for (const [project, id] of Object.entries(data.sessions)) {
+      if (data.purgedSessions!.includes(id)) { delete data.sessions[project]; continue; }
       if (!data.conversations.some(s => s.id === id)) data.conversations.push({ id, project, updatedAt: new Date().toISOString() });
     }
     if (data.active) {

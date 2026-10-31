@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile, rename, unlink, readdir } from 'node:fs/promises';
+import { mkdir, readFile, writeFile, rename, unlink, readdir, lstat, rm } from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { createHash } from 'node:crypto';
@@ -41,10 +41,32 @@ export class ChatArchive {
     if (from.startsWith('draft-')) await unlink(this.file(from)).catch(e => { if (e.code !== 'ENOENT') throw e; });
   }
   async resetDraft(project: string): Promise<void> { await this.writing; await unlink(this.file('draft-' + project)).catch(e => { if (e.code !== 'ENOENT') throw e; }); }
+  async purge(id: string, transcriptRoot?: string): Promise<void> {
+    if (!/^[a-zA-Z0-9_-]+$/.test(id)) throw new Error('Invalid session ID.');
+    await this.writing;
+    await unlink(this.file(id)).catch(e => { if (e.code !== 'ENOENT') throw e; });
+    if (!transcriptRoot) return;
+    const dirs = await readdir(transcriptRoot, { withFileTypes: true }).catch(e => { if (e.code === 'ENOENT') return []; throw e; });
+    const root = path.resolve(transcriptRoot);
+    for (const dir of dirs.filter(x => x.isDirectory() && !x.isSymbolicLink())) {
+      for (const name of [id + '.jsonl', id]) {
+        const target = path.resolve(root, dir.name, name);
+        if (!target.startsWith(root + path.sep)) throw new Error('Invalid transcript path.');
+        const stat = await lstat(target).catch(e => { if (e.code === 'ENOENT') return undefined; throw e; });
+        if (stat?.isSymbolicLink()) throw new Error('Refusing a transcript symlink.');
+        if (stat) await rm(target, { recursive: stat.isDirectory(), force: true });
+      }
+    }
+  }
+  async restore(id: string, turns: ChatTurn[]): Promise<void> {
+    await this.writing;
+    if ((await this.read(id)).length) return;
+    await this.write(id, turns.map(t => ({ role: t.role, text: redact(t.text, this.secrets), ...(t.file ? { file: t.file } : {}) })));
+  }
 
   /** Import only ordinary user/final assistant text from main transcripts.
    * Never replay reasoning blocks, tool results, sidechains or synthetic prompts. */
-  async importHistory(root: string): Promise<{ id: string; project: string; updatedAt: string }[]> {
+  async importHistory(root: string, excluded: string[] = []): Promise<{ id: string; project: string; updatedAt: string }[]> {
     let projects;
     try { projects = await readdir(root, { withFileTypes: true }); }
     catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') return []; throw e; }
@@ -54,6 +76,7 @@ export class ChatArchive {
       for (const file of await readdir(dir, { withFileTypes: true })) {
         if (!file.isFile() || !file.name.endsWith('.jsonl')) continue;
         const id = file.name.slice(0, -6);
+        if (excluded.includes(id)) continue;
         if (!/^[a-zA-Z0-9_-]+$/.test(id)) continue;
         const turns: ChatTurn[] = [];
         const seen = new Set<string>();

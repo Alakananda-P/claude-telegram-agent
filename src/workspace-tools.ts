@@ -1,0 +1,26 @@
+import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk';
+import { z } from 'zod';
+import { Automation, clockInfo } from './automation.js';
+import { editImage, validateBill } from './images.js';
+import { toolResult } from './sessions.js';
+
+const names = ['clock', 'list_schedules', 'create_schedule', 'edit_schedule', 'manage_schedule', 'list_tasks', 'manage_task', 'edit_image', 'validate_bill', 'deliver_file', 'request_backup'];
+export const WORKSPACE_TOOL_NAMES = names.map(n => 'mcp__workspace__' + n);
+export interface WorkspaceContext { root: string; project: string; automation: Automation; deliver: (file: string, preview?: string) => Promise<void>; backup: () => Promise<void> }
+export function workspaceServer(c: WorkspaceContext) {
+  const schedule = { name: z.string().min(1).max(80), kind: z.enum(['agent', 'reminder', 'backup']), prompt: z.string().min(1).max(10000), timezone: z.string().default('Asia/Kolkata'), at: z.string().optional(), cron: z.string().optional(), intervalMinutes: z.number().int().positive().optional() };
+  const options = { alwaysLoad: true, annotations: { openWorldHint: false } };
+  return createSdkMcpServer({ name: 'workspace', version: '1.0.0', tools: [
+    tool('clock', 'Read the actual server clock and local time. Use before scheduling. Default timezone is India.', { timezone: z.string().default('Asia/Kolkata') }, a => toolResult(async () => clockInfo(a.timezone)), options),
+    tool('list_schedules', 'List durable schedules, next run, enabled state and last result.', {}, () => toolResult(async () => ({ schedules: c.automation.store.data.schedules })), options),
+    tool('create_schedule', 'Create an owner-requested reminder, recurring agent task or encrypted backup. Choose exactly one ISO at with offset, five-field cron, or intervalMinutes. Survives restarts; missed recurring runs coalesce. Do not invent tasks the owner did not request.', schedule, a => toolResult(() => c.automation.createSchedule({ ...a, project: c.project })), options),
+    tool('edit_schedule', 'Replace a schedule with new timing/task; preserves its ID. Read schedules first.', { id: z.string(), ...schedule }, a => toolResult(() => c.automation.editSchedule(a.id, { ...a, project: c.project })), options),
+    tool('manage_schedule', 'Pause, resume or delete an owner-requested schedule. Does not undo a running task.', { id: z.string(), action: z.enum(['pause', 'resume', 'delete']) }, a => toolResult(async () => { await c.automation.changeSchedule(a.id, a.action); return { updated: true }; }), options),
+    tool('list_tasks', 'List recent durable queued, running and finished tasks.', {}, () => toolResult(async () => ({ paused: !!c.automation.store.data.queuePaused, tasks: c.automation.store.data.tasks?.slice(-50) })), options),
+    tool('manage_task', 'Cancel or prioritize a queued task; pause/resume the queue. A running task is unaffected.', { action: z.enum(['cancel', 'prioritize', 'pause', 'resume']), id: z.string().optional() }, a => toolResult(async () => { if (a.action === 'cancel') await c.automation.cancelTask(a.id ?? ''); else if (a.action === 'prioritize') await c.automation.prioritize(a.id ?? ''); else await c.automation.setPaused(a.action === 'pause'); return { updated: true }; }), options),
+    tool('edit_image', 'Create a crop/rotation/contrast/deskew copy in output; preserves original. Coordinates are pixels after EXIF orientation. Deliver a relevant crop when asking about unclear bill writing. Deskew is an estimate; inspect the result.', { file: z.string(), crop: z.object({ left: z.number().int().nonnegative(), top: z.number().int().nonnegative(), width: z.number().int().positive(), height: z.number().int().positive() }).optional(), rotate: z.number().min(-360).max(360).optional(), contrast: z.boolean().optional(), deskew: z.boolean().optional() }, a => toolResult(() => editImage(c.root, a.file, a)), options),
+    tool('validate_bill', 'Check quantity times rate, total, charges and discount. Supply unclear fields in uncertain; never guess them into a final workbook. Arithmetic validation does not establish OCR accuracy.', { rows: z.array(z.object({ label: z.string(), quantity: z.number(), rate: z.number(), amount: z.number() })).max(5000), total: z.number(), charges: z.number().default(0), discount: z.number().default(0), uncertain: z.array(z.string()).default([]) }, a => toolResult(async () => validateBill(a.rows, a.total, a.charges, a.discount, a.uncertain)), options),
+    tool('deliver_file', 'Send a completed project file or clarification image directly to the owner, with a short preview. Do not send credentials. Files up to 49 MB.', { file: z.string(), preview: z.string().max(500).optional() }, a => toolResult(async () => { await c.deliver(a.file, a.preview); return { delivered: true }; }), options),
+    tool('request_backup', 'Send an encrypted backup of chats, shared memory and schedules to the owner. No credentials are included.', {}, () => toolResult(async () => { await c.backup(); return { delivered: true }; }), options),
+  ] });
+}

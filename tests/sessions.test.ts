@@ -115,7 +115,7 @@ test('real MCP transport lists schemas, reads pages and persists a rename', asyn
     await server.instance.connect(serverTransport);
     await client.connect(clientTransport);
     const listed = await client.listTools();
-    assert.deepEqual(listed.tools.map(t => t.name).sort(), ['list_sessions', 'read_session', 'rename_session', 'search_sessions']);
+    assert.ok(['list_sessions', 'read_session', 'rename_session', 'search_sessions', 'request_delete_session', 'restore_session', 'list_trash'].every(name => listed.tools.some(t => t.name === name)));
     const read = await client.callTool({ name: 'read_session', arguments: { session_id: 'old-id' } });
     assert.match(JSON.stringify(read), /handwritten bills/);
     const renamed = await client.callTool({ name: 'rename_session', arguments: { session_id: 'old-id', title: 'October invoices' } });
@@ -124,4 +124,22 @@ test('real MCP transport lists schemas, reads pages and persists a rename', asyn
     const invalid = await client.callTool({ name: 'read_session', arguments: { session_id: 'old-id', start_turn: -1 } });
     assert.equal(invalid.isError, true);
   } finally { await client.close(); await server.instance.close(); }
+});
+
+test('trash expires after 48 hours, restore cancels expiry and purge prevents transcript reimport', async () => {
+  const { catalog, store, archive } = await setup();
+  const now = new Date('2026-10-31T12:00:00Z');
+  await catalog.trash('old-id', now);
+  assert.equal(catalog.list().total, 1);
+  assert.equal(catalog.trashList()[0].purgeAt, '2026-11-02T12:00:00.000Z');
+  await assert.rejects(catalog.read('old-id'), /Trash/);
+  assert.equal(await catalog.purgeExpired(new Date('2026-11-02T11:59:59Z')), 0);
+  await catalog.restore('old-id', now);
+  assert.equal(await catalog.purgeExpired(new Date('2026-11-03T00:00:00Z')), 0);
+  await catalog.trash('old-id', now);
+  assert.equal(await catalog.purgeExpired(new Date('2026-11-02T12:00:00Z')), 1);
+  assert.deepEqual(await archive.read('old-id'), []);
+  assert.ok(store.data.purgedSessions!.includes('old-id'));
+  assert.equal(store.data.sessions.default, 'active-id');
+  assert.equal(store.data.memoryEnabled, true);
 });

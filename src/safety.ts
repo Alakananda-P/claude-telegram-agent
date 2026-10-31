@@ -7,6 +7,8 @@ export interface Message {
   chat: { id: number; type: string };
   text?: string; caption?: string;
   document?: { file_id: string; file_name?: string; file_size?: number };
+  photo?: { file_id: string; file_unique_id?: string; width: number; height: number; file_size?: number }[];
+  media_group_id?: string;
 }
 export interface Callback { id: string; from: { id: number }; data?: string; message?: Message }
 

@@ -19,7 +19,7 @@ API-key setup.
 
 - Runs Claude Code's standard tools: shell commands, code/file editing, Git,
   dependency installation, tests and other tasks supported by the runtime.
-- Uses Telegram private text/document messages; only your numeric Telegram
+- Uses Telegram private text, photo and document messages; only your numeric Telegram
   user ID may issue work. Groups and other senders are ignored.
 - Saves a separate conversation for each named project. Files and transcripts
   survive redeploys when the `/data` disk is attached.
@@ -51,10 +51,35 @@ API-key setup.
   results, streamed request usage, and recoverable historical cost snapshots
   are accounted for without repeatedly adding cumulative session totals.
 
-This first version does not include a web chat, voice transcription, photo-message
-handling (send images as documents), scheduled jobs, interactive terminal UI,
-arbitrary plugins, or external MCP servers. The only configured MCP servers are
-in-process handlers for the session and memory tools above. Standard tools run in a Linux
+- Photos use the largest Telegram rendition, with immediate receipt/failure feedback.
+  Albums and manual batches wait for Process; captions and later instructions use saved paths.
+- Image tools preserve originals and create crop, rotation, contrast and estimated deskew copies.
+  Bill instructions require clarification for unclear writing; a deterministic tool checks quantities,
+  rates and totals. These checks cannot guarantee recognition accuracy.
+- A persistent queue serializes work. Queued work survives restart; interrupted work requires an
+  explicit retry. The owner can cancel, prioritize or pause queued tasks and review recent history.
+- A clock and durable scheduler support reminders, one-time tasks, intervals and cron with timezones.
+  The model can create/edit/manage owner-requested schedules. India time is the default;
+  missed recurring runs coalesce and reminders do not need an AI request.
+- Generated supported files are sent automatically, up to 20 per task. Model delivery tools can
+  send a relevant image crop or a particular finished file with a brief preview.
+- Session deletion asks for confirmation, then moves the chat to Trash for 48 hours. Restore cancels
+  expiry. Permanent deletion removes its archive and SDK transcript, with tombstones preventing
+  import or backup restoration from resurrecting it. Memory, files and lifetime usage stay.
+- Private backup credentials can recover authentication/credit failures before any output or tool
+  action. Rate limits retry the same key once; account holds do not trigger key rotation. Ambiguous
+  failures are never automatically replayed. Cross-key continuation uses bounded saved text in a
+  fresh SDK session. Model selection is never changed as a recovery strategy.
+- Encrypted backups export chats, shared memory and schedules to the private Telegram chat.
+  Optional project files are bounded to 12 MB; encrypted exports are limited to 19 MB so the
+  20 MB incoming Telegram limit permits restore. Restore merges missing data and pauses restored
+  schedules; it never overwrites current files, offsets or lifetime usage. Usage journals and raw SDK
+  transcripts are not in these portable exports; retain whole-disk backups for full disaster recovery.
+  Keep `BACKUP_ENCRYPTION_KEY` privately; losing it makes encrypted exports unreadable.
+
+This version does not include a web chat, voice transcription, interactive terminal UI,
+arbitrary plugins, or external MCP servers. Configured MCP servers are in-process handlers
+for sessions, memory and the bounded workspace tools above. Standard tools run in a Linux
 container. There is no desktop, GPU, Docker daemon, sudo, or access to your laptop.
 Browsers and additional system packages require a Docker image update.
 Project settings, hooks, and MCP configuration are not auto-loaded; enable
@@ -135,13 +160,30 @@ interrupting running tasks unexpectedly; deploy manually while idle.
 | `/files` | Bounded file listing (three nested levels, no secret folders) |
 | `/get relative/path` | Download a file from the active project |
 | `/help` | Usage guide |
+| `/batch`, `/process` | Collect files, then process the batch |
+| `/queue` | Task history, cancel/priority, pause/resume and explicit retry |
+| `/schedules`, `/clock` | Scheduled jobs, controls and current time |
+| `/trash` | Restore chats within 48 hours or delete permanently |
+| `/backup` | Encrypted export, optional daily 03:00 IST export and restore guide |
+| `/health` | Last Telegram/Claude success, API state, queue, schedules and disk |
 
-Upload documents up to 20 MB. A caption starts a task about the saved file;
-without a caption the file is simply saved. Names receive unique prefixes to
+Upload photos or documents up to 20 MB. A standalone caption starts a task about the saved file;
+without a caption the upload waits for instructions or Process. Albums and manual batches always
+wait for Process or a later text instruction. Names receive unique prefixes to
 avoid overwriting existing files. Archives are not automatically extracted.
 Downloads are limited to 49 MB. Hidden credential paths and symlinks are rejected
 by the transfer layer; known configured credentials are refused in outgoing files.
 Generic secret detection is not guaranteed—review artifacts before sharing them.
+
+`/stop` also pauses the queue. Scheduled work joins the same serial queue, so a paused queue
+delays reminders and scheduled jobs until resumed. Telegram recovery notifications are deduplicated
+per outage; a stopped worker cannot send its own outage alert. No external uptime monitor is included.
+The Health panel reports last successful events, not an API credit balance.
+
+Set optional `ANTHROPIC_BACKUP_KEYS` to a JSON array of up to five privately configured keys.
+Set `BACKUP_ENCRYPTION_KEY` to 32 cryptographically random bytes encoded as 64 hex characters.
+Neither backup keys nor the encryption key enter the SDK subprocess environment. After fixing a
+rejected credential, use Health → Re-enable fixed API keys; retry the failed task explicitly in Queue.
 
 ## Permissions, secrets and resource limits
 

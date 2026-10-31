@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { query, type Options, type SDKMessage } from '@anthropic-ai/claude-agent-sdk';
-import type { Config } from './config.js';
+import { configSecrets, type Config } from './config.js';
+import { workspaceServer, WORKSPACE_TOOL_NAMES, type WorkspaceContext } from './workspace-tools.js';
 import { effectiveSettings, settingsLabel, type AgentSettings } from './settings.js';
 import { SharedMemory } from './memory.js';
 import { SessionCatalog, SESSION_TOOL_NAMES, sessionServer } from './sessions.js';
@@ -9,8 +10,8 @@ import { MEMORY_TOOL_NAMES, memoryServer } from './memory-tools.js';
 export type AgentEvent = { type: 'session'; id: string } | { type: 'progress'; text: string }
   | { type: 'usage'; session: string; id: string; models: Record<string, unknown>; cost: number }
   | { type: 'step'; session: string; id: string; model: string; usage: Record<string, unknown>; complete: boolean }
-  | { type: 'speed'; state: string };
-export interface AgentRequest { prompt: string; cwd: string; session?: string; settings?: AgentSettings; memoryEnabled?: boolean; sessions?: SessionCatalog }
+  | { type: 'speed'; state: string } | { type: 'effect'; tool?: string };
+export interface AgentRequest { prompt: string; cwd: string; session?: string; settings?: AgentSettings; memoryEnabled?: boolean; sessions?: SessionCatalog; workspace?: WorkspaceContext; resumeContext?: string }
 export interface AgentResult { text: string; session: string; cumulativeCost: number }
 export interface Runner {
   run(request: AgentRequest, emit: (event: AgentEvent) => void | Promise<void>, abort: AbortController): Promise<AgentResult>;
@@ -62,7 +63,7 @@ export class ClaudeRunner implements Runner {
 
   async run(request: AgentRequest, emit: (event: AgentEvent) => void | Promise<void>, abort: AbortController): Promise<AgentResult> {
     const selected = effectiveSettings(request.settings ?? this.config);
-    const memory = new SharedMemory(this.config.dataDir, [this.config.token, this.config.apiKey]);
+    const memory = new SharedMemory(this.config.dataDir, configSecrets(this.config));
     const memoryText = request.memoryEnabled === false ? '' : await memory.read();
     const memoryPrompt = request.memoryEnabled === false
       ? '\nShared long-term memory is OFF. Do not read, write or use the shared memory file, including facts from it in old session context.'
@@ -80,7 +81,7 @@ export class ClaudeRunner implements Runner {
         + 'Preserve an existing meaningful name unless the topic substantially changes. These tools are an allowed exception to the service-state rule. '
         + 'Start-of-task session context (call list_sessions for the current/new session ID after initialization): ' + JSON.stringify(request.sessions.context())
       : '';
-    const allowed = [...(request.sessions ? SESSION_TOOL_NAMES : []), ...(request.memoryEnabled === false ? [] : MEMORY_TOOL_NAMES)];
+    const allowed = [...(request.sessions ? SESSION_TOOL_NAMES : []), ...(request.memoryEnabled === false ? [] : MEMORY_TOOL_NAMES), ...(request.workspace ? WORKSPACE_TOOL_NAMES : [])];
     const options: Options = {
       cwd: request.cwd, resume: request.session,
       model: selected.model, effort: selected.effort, thinking: { type: 'adaptive' },
@@ -96,16 +97,20 @@ export class ClaudeRunner implements Runner {
         'You have no interactive terminal. Do not wait on interactive input. ' +
         'Summarize results and tests concisely. Give relative artifact paths for /get. ' +
         'System-wide packages and browsers need image changes; use project dependencies or the persistent Python venv. ' +
-        'Do not change the bot service, state, permissions, or credentials.' + memoryPrompt + sessionPrompt },
+        'Do not change the bot service, state, permissions, or credentials. ' +
+        'Workspace tools are an allowed exception for schedules, task controls, file delivery and backups. Use clock for actual time; create schedules only for owner-requested future work. ' +
+        'For bills: preserve original images; use edit_image for crops, rotation, contrast and deskew. Never guess an unclear amount, date or item into a final workbook. Send the relevant crop with deliver_file and ask the owner. Use validate_bill for quantity times rate and totals; arithmetic agreement alone does not prove handwriting recognition. ' +
+        'Put deliverables in output/. New or changed supported files are sent automatically; use deliver_file for explicit delivery or clarification crops. ' + memoryPrompt + sessionPrompt },
       settingSources: [], skills: [], mcpServers: {
         ...(request.sessions ? { sessions: sessionServer(request.sessions) } : {}),
         ...(request.memoryEnabled === false ? {} : { memory: memoryServer(memory) }),
+        ...(request.workspace ? { workspace: workspaceServer(request.workspace) } : {}),
       }, allowedTools: allowed, strictMcpConfig: true,
       persistSession: true, maxTurns: this.config.maxTurns,
       abortController: abort,
       env: agentEnvironment(this.config),
       canUseTool: async (tool, input) => {
-        if (allowed.includes(tool)) return { behavior: 'allow', updatedInput: input };
+        if (allowed.includes(tool)) { await emit({ type: 'effect', tool }); return { behavior: 'allow', updatedInput: input }; }
         await emit({ type: 'progress', text: `Permission request not auto-approved: ${tool}. No permission bypass was used.` });
         return { behavior: 'deny', message: 'This Telegram service uses auto permissions. Do not bypass the denial. Explain the blocked action to the owner; ask clarifying questions in plain text.' };
       },
@@ -142,6 +147,8 @@ export class ClaudeRunner implements Runner {
           else if (delta.type === 'content_block_start' && delta.content_block.type === 'thinking') {
             await emit({ type: 'progress', text: 'Thinking…' });
           }
+          else if (delta.type === 'content_block_start' && delta.content_block.type === 'tool_use') await emit({ type: 'effect', tool: delta.content_block.name });
+          else if (delta.type === 'content_block_start' && delta.content_block.type === 'text') await emit({ type: 'effect' });
           // Deliberately never forward raw thinking blocks or reasoning deltas.
         }
         abort.signal.throwIfAborted();
@@ -166,6 +173,8 @@ export class ClaudeRunner implements Runner {
             throw new AgentError('Claude main-agent model changed unexpectedly; job stopped rather than accepting a fallback.');
           }
           for (const block of event.message.content) {
+            if (block.type === 'tool_use') await emit({ type: 'effect', tool: block.name });
+            else if (block.type === 'text') await emit({ type: 'effect' });
             if (block.type === 'tool_use') {
               const labels: Record<string, string> = { Bash: 'Running code…', Read: 'Reading files…', Glob: 'Finding files…', Grep: 'Searching files…', Edit: 'Updating files…', Write: 'Creating files…', WebSearch: 'Searching the web…', WebFetch: 'Reading a page…' };
               await emit({ type: 'progress', text: labels[block.name] ?? 'Working…' });

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, readdir } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { Controller } from '../src/controller.js';
@@ -11,6 +11,7 @@ import type { Message } from '../src/safety.js';
 import type { Buttons } from '../src/ui.js';
 
 const message = (text: string): Message => ({ from: { id: 123 }, chat: { id: 123, type: 'private' }, text });
+const photo = (id: string, group?: string): Message => ({ ...message(''), media_group_id: group, photo: [{ file_id: id + '-small', width: 100, height: 100 }, { file_id: id + '-large', width: 1200, height: 900 }] });
 async function setup(runner?: Runner) {
   const dataDir = await mkdtemp(path.join(tmpdir(), 'tg-agent-controller-'));
   const config = loadConfig({ TELEGRAM_BOT_TOKEN: '123456:abcdefghijklmnopqrstuvw', TELEGRAM_OWNER_ID: '123', ANTHROPIC_API_KEY: 'test-only', DATA_DIR: dataDir });
@@ -22,6 +23,7 @@ async function setup(runner?: Runner) {
   const panels: { text: string; buttons: Buttons; editId?: number }[] = [];
   const acknowledgements: string[] = [];
   const calls: AgentRequest[] = [];
+  const downloads: string[] = []; const files: string[] = [];
   const sender = { async send(_chat: number, text: string) { replies.push(text); },
     async temporary(_chat: number, text: string) { indicators.push(text); return 99; },
     async edit(_chat: number, _id: number, text: string) { indicators.push(text); },
@@ -30,13 +32,13 @@ async function setup(runner?: Runner) {
     async clear() { screens.push([...replies]); replies.length = 0; return true; },
     async panel(_chat: number, text: string, buttons: Buttons, editId?: number) { replies.push(text); panels.push({ text, buttons, editId }); },
     async acknowledge(id: string) { acknowledgements.push(id); },
-    async sendFile(_chat: number, _name: string, bytes: Uint8Array) { replies.push(Buffer.from(bytes).toString()); },
-    async download(_fileId: string) { return Buffer.from('uploaded'); } };
+    async sendFile(_chat: number, name: string, bytes: Uint8Array) { files.push(name); replies.push(Buffer.from(bytes).toString()); },
+    async download(fileId: string) { downloads.push(fileId); return Buffer.from('uploaded'); } };
   const agent: Runner = runner ?? { async run(request, emit) {
     calls.push(request); await emit({ type: 'session', id: 'session-' + calls.length });
     return { text: 'Task complete', session: 'session-' + calls.length, cumulativeCost: 0.1 };
   } };
-  return { bot: new Controller(config, store, sender, agent), store, replies, calls, config, dataDir, deleted, indicators, screens, panels, acknowledgements };
+  return { bot: new Controller(config, store, sender, agent), store, replies, calls, config, dataDir, deleted, indicators, screens, panels, acknowledgements, downloads, files, sender };
 }
 
 test('unauthorized messages do not produce replies, uploads or jobs', async () => {
@@ -44,6 +46,51 @@ test('unauthorized messages do not produce replies, uploads or jobs', async () =
   await bot.handle({ ...message('do work'), from: { id: 666 } });
   await bot.handle({ ...message('/status'), chat: { id: -1, type: 'group' } });
   assert.deepEqual(replies, []); assert.deepEqual(calls, []);
+});
+
+test('largest direct photo is acknowledged and captionless upload attaches to the next task', async () => {
+  const { bot, downloads, calls, indicators, panels, store } = await setup();
+  await bot.handle(photo('bill')); assert.deepEqual(downloads, ['bill-large']); assert.equal(calls.length, 0);
+  assert.ok(indicators.some(t => /Receiving photo/.test(t))); assert.match(panels.at(-1)!.text, /Photo received/);
+  await bot.handle(message('Make a bill table')); await bot.idle();
+  assert.match(calls[0].prompt, /Make a bill table/); assert.match(calls[0].prompt, /uploads\/.+photo.jpg/); assert.equal(store.data.batches![0].status, 'queued');
+});
+test('album waits for Process, preserves every photo and processes it once', async () => {
+  const { bot, calls, store, panels } = await setup();
+  await bot.handle({ ...photo('one', 'album-1'), caption: 'Read these bills' }); await bot.handle(photo('two', 'album-1')); await bot.handle(photo('three', 'album-1'));
+  assert.equal(calls.length, 0); assert.equal(store.data.batches!.length, 1); assert.equal(store.data.batches![0].uploadIds.length, 3);
+  const action = panels.at(-1)!.buttons[0][0].callback_data;
+  await bot.callback({ id: 'process', from: { id: 123 }, message: { ...message(''), message_id: 999 }, data: action }); await bot.idle();
+  assert.equal(calls.length, 1); assert.equal((calls[0].prompt.match(/uploads\//g) ?? []).length, 3);
+  await bot.handle(message('/process')); await bot.idle(); assert.equal(calls.length, 1);
+});
+test('download failure shows failure and creates no false upload or job', async () => {
+  const { bot, sender, store, replies, calls } = await setup(); sender.download = async () => { throw new Error('private-network-detail'); };
+  await bot.handle(photo('broken'));
+  assert.equal(store.data.uploads!.length, 0); assert.equal(calls.length, 0); assert.match(replies.at(-1)!, /Upload could not be accepted/); assert.ok(!replies.join('').includes('private-network-detail'));
+});
+test('queued tasks run serially and resume the session created by the first task', async () => {
+  let release!: () => void; let began!: () => void;
+  const ready = new Promise<void>(resolve => { began = resolve; }); const wait = new Promise<void>(resolve => { release = resolve; }); const calls: AgentRequest[] = [];
+  const { bot, store } = await setup({ async run(r, emit) { calls.push(r); if (calls.length === 1) { began(); await wait; } await emit({ type: 'session', id: 'same-chat' }); return { session: 'same-chat', text: 'Done', cumulativeCost: 0 }; } });
+  await bot.handle(message('First')); await ready; await bot.handle(message('Second')); assert.equal(calls.length, 1); assert.equal(store.data.tasks![1].status, 'queued');
+  release(); await bot.idle(); assert.equal(calls.length, 2); assert.equal(calls[1].session, 'same-chat'); assert.ok(store.data.tasks!.every(t => t.status === 'completed'));
+});
+test('completed files send automatically and scheduled reminders work without a Claude call', async () => {
+  const { bot, files, replies, store } = await setup({ async run(r, emit) { await emit({ type: 'session', id: 'artifact-chat' }); await mkdir(path.join(r.cwd, 'output')); await writeFile(path.join(r.cwd, 'output', 'bills.csv'), 'item,total\nMilk,50'); return { session: 'artifact-chat', text: 'Table ready', cumulativeCost: 0 }; } });
+  await bot.handle(message('Create table')); await bot.idle(); assert.deepEqual(files, ['bills.csv']);
+  const now = new Date('2030-01-01T00:00:00Z');
+  await bot.automation.createSchedule({ name: 'Reminder', kind: 'reminder', prompt: 'Review total', project: 'default', at: '2030-01-01T00:01:00Z' }, now);
+  await bot.tick(new Date('2030-01-01T00:01:01Z')); await bot.idle(); await bot.tick(new Date('2030-01-01T00:02:00Z')); await bot.idle();
+  assert.equal(replies.filter(t => t.includes('Reminder\n\nReview total')).length, 1); assert.equal(store.data.sessions.default, 'artifact-chat');
+});
+test('session deletion waits for owner confirmation and restore keeps shared data', async () => {
+  const { bot, store, panels } = await setup(); await bot.handle(message('Build report')); await bot.idle();
+  const id = store.data.sessions.default;
+  await bot.handle(message('/delete ' + id)); assert.equal(store.data.conversations![0].trashedAt, undefined); assert.ok(panels.at(-1)!.buttons.flat().some(b => b.callback_data === 'trashmove ' + id));
+  await bot.handle(message('/trashmove ' + id)); assert.ok(store.data.conversations![0].trashedAt); assert.equal(store.data.sessions.default, undefined);
+  await bot.handle(message('/session')); assert.match(panels.at(-1)!.text, /0 chats/);
+  await bot.handle(message('/restore ' + id)); assert.equal(store.data.conversations![0].trashedAt, undefined); assert.equal(store.data.memoryEnabled, true);
 });
 
 test('active model can list, read and name chats; manual titles appear in session buttons', async () => {
@@ -79,7 +126,7 @@ test('session resumes by project, /new keeps files and new projects are isolated
   assert.equal(store.data.sessions.default, 'session-2');
 });
 
-test('busy task rejects overlap, /status stays responsive and /stop aborts', async () => {
+test('busy task queues new work, blocks project changes, /status stays responsive and /stop pauses queue', async () => {
   let calls = 0;
   let started!: () => void;
   const ready = new Promise<void>(resolve => { started = resolve; });
@@ -102,6 +149,8 @@ test('busy task rejects overlap, /status stays responsive and /stop aborts', asy
   await bot.handle(message('/stop')); await bot.idle();
   assert.equal(store.data.lastJob?.status, 'cancelled');
   assert.equal(store.data.active, null);
+  assert.equal(store.data.queuePaused, true);
+  assert.equal(store.data.tasks!.filter(t => t.status === 'queued').length, 1);
 });
 
 test('work continues beyond the former daily cap without budget reservations', async () => {

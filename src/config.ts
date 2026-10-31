@@ -5,7 +5,10 @@ export interface Config {
   token: string; owner: number; apiKey: string; dataDir: string;
   model: string; effort: Effort; fast: boolean; permissionMode: 'auto';
   maxTurns: number; timeoutMs: number;
+  backupKeys?: string[]; backupEncryptionKey?: string;
 }
+
+export function configSecrets(c: Config): string[] { return [c.token, c.apiKey, ...(c.backupKeys ?? []), ...(c.backupEncryptionKey ? [c.backupEncryptionKey] : [])]; }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const required = (key: string) => {
@@ -31,7 +34,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   if (!['true', 'false'].includes(env.CLAUDE_FAST_MODE ?? 'true')) throw new Error('CLAUDE_FAST_MODE must be true or false.');
   const maxTurns = positive('MAX_TURNS', 50);
   if (!Number.isInteger(maxTurns)) throw new Error('MAX_TURNS must be an integer.');
-  return { token, owner, apiKey: required('ANTHROPIC_API_KEY'), model,
+  let backupKeys: string[] = [];
+  try { backupKeys = JSON.parse(env.ANTHROPIC_BACKUP_KEYS ?? '[]'); if (!Array.isArray(backupKeys) || backupKeys.length > 5 || backupKeys.some(k => typeof k !== 'string' || !k.startsWith('sk-ant-'))) throw new Error(); }
+  catch { throw new Error('Set ANTHROPIC_BACKUP_KEYS to a private JSON array of up to five API keys.'); }
+  const backupEncryptionKey = env.BACKUP_ENCRYPTION_KEY;
+  if (backupEncryptionKey && !/^[a-f0-9]{64}$/i.test(backupEncryptionKey)) throw new Error('Set BACKUP_ENCRYPTION_KEY to 32 random bytes encoded as hex.');
+  return { token, owner, apiKey: required('ANTHROPIC_API_KEY'), model, backupKeys, backupEncryptionKey,
     effort, fast: (env.CLAUDE_FAST_MODE ?? 'true') === 'true', permissionMode: 'auto', maxTurns,
     timeoutMs: positive('JOB_TIMEOUT_MINUTES', 20) * 60_000,
     dataDir: path.resolve(env.DATA_DIR ?? './data') };

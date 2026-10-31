@@ -5,7 +5,7 @@ import type { StateStore } from './state.js';
 
 interface PollClient { call<T>(method: string, payload: Record<string, unknown>, signal?: AbortSignal): Promise<T> }
 
-export async function poll(client: PollClient, store: StateStore, handle: (message: Message) => Promise<void>, signal: AbortSignal, handleCallback?: (callback: Callback) => Promise<void>): Promise<void> {
+export async function poll(client: PollClient, store: StateStore, handle: (message: Message) => Promise<void>, signal: AbortSignal, handleCallback?: (callback: Callback) => Promise<void>, onRecovery?: (failures: number) => Promise<void>): Promise<void> {
   let failures = 0;
   let connected = false;
   while (!signal.aborted) {
@@ -13,6 +13,8 @@ export async function poll(client: PollClient, store: StateStore, handle: (messa
     try {
       updates = await client.call('getUpdates', { offset: store.data.offset, timeout: 25, limit: 20, allowed_updates: ['message', 'callback_query'] }, signal);
       if (!connected || failures) console.log(`Telegram polling connected; recoveredFailures=${failures}.`);
+      (store.data.health ??= {}).telegramAt = new Date().toISOString(); await store.save();
+      if (failures) await onRecovery?.(failures);
       connected = true;
       failures = 0;
     } catch (error) {
