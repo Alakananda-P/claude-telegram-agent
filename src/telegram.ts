@@ -92,7 +92,14 @@ export class Telegram {
     for (let i = 0; i < ids.length; i += 100) {
       const batch = ids.slice(i, i + 100);
       try { await this.call('deleteMessages', { chat_id: chat, message_ids: batch }); }
-      catch { remaining.push(...batch); }
+      catch (error) {
+        if (!(error instanceof TelegramError) || error.code !== 400) { remaining.push(...batch); continue; }
+        // One old message can reject the entire batch. Still remove the newer
+        // messages that Telegram permits instead of leaving the whole view.
+        for (const id of batch) {
+          try { await this.remove(chat, id); } catch { remaining.push(id); }
+        }
+      }
     }
     this.timeline.data.visibleMessageIds = remaining;
     await this.timeline.save();

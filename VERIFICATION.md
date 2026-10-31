@@ -6,7 +6,7 @@ session persistence and previews; shared memory; request and cumulative usage
 accounting; interrupted/error results; history migration; safe file handling;
 Telegram transport and offset-before-dispatch behavior.
 
-- `npm test`: 44 passing tests, including Telegram UI transport and reset contracts.
+- `npm test`: 45 passing tests, including Telegram UI transport and reset contracts.
 - `npm run typecheck`: passed against the pinned SDK 0.3.314 types.
 - `npm run build`: passed.
 - Current direct Anthropic Models API lists the three configured model IDs.

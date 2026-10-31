@@ -66,6 +66,25 @@ test('pressing the already selected option does not create duplicate panels', as
   assert.equal(calls, 1);
 });
 
+test('an undeletable old message does not prevent newer messages from clearing', async t => {
+  const deleted: number[] = [];
+  const server = createServer(async (req, res) => {
+    let data = ''; for await (const chunk of req) data += chunk;
+    const body = JSON.parse(data);
+    if (req.url!.endsWith('deleteMessages') || body.message_id === 1) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error_code: 400, description: 'message cannot be deleted' }));
+    } else { deleted.push(body.message_id); res.end(JSON.stringify({ ok: true, result: true })); }
+  });
+  await new Promise<void>(r => server.listen(0, '127.0.0.1', r)); t.after(() => server.close());
+  const dir = await mkdtemp(path.join(tmpdir(), 'tg-old-message-'));
+  const state = await StateStore.open(path.join(dir, 'state.json')); state.data.visibleMessageIds = [1, 2, 3];
+  const tg = new Telegram('test-token', [], `http://127.0.0.1:${(server.address() as { port: number }).port}`); tg.timeline = state;
+  assert.equal(await tg.clear(123), false);
+  assert.deepEqual(deleted, [2, 3]);
+  assert.deepEqual(state.data.visibleMessageIds, [1]);
+});
+
 test('Telegram errors expose only safe status codes, never token-bearing server text', async t => {
   const server = createServer((req, res) => { res.writeHead(401); res.end(JSON.stringify({ ok: false, error_code: 401, description: 'top-secret' })); });
   await new Promise<void>(r => server.listen(0, '127.0.0.1', r));
