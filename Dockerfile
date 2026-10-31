@@ -21,5 +21,5 @@ ENV NODE_ENV=production DATA_DIR=/data HOME=/data/home \
     VIRTUAL_ENV=/data/venv \
     PATH=/data/venv/bin:/data/home/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # Root is used only for mounted-volume ownership, then entrypoint drops to node.
-ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/usr/local/bin/telegram-agent-entrypoint"]
+ENTRYPOINT ["/usr/local/bin/telegram-agent-entrypoint"]
 CMD ["node", "dist/main.js"]

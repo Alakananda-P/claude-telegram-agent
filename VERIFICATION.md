@@ -21,11 +21,16 @@ streamed usage where available. Lost/unknown usage is marked partial, not inferr
 as authoritative billing. All reports exclude unreported helper calls and costs
 from other apps or hosting.
 
-The Docker build and live startup are verified on Render during rollout; local
-Docker is unavailable. An optional one-shot acceptance check verifies an actual
-Opus Fast response, counts its cost, and records safe status metadata on disk.
-GitHub Actions status and live deployment results must be checked separately;
-this document does not assert that a future push or deploy has passed.
+The Render Docker build and live startup passed. A real one-shot request reported
+Opus 5.5 / high / `usage.speed=fast`; its usage is counted in the ledger. Historical
+accounting loaded without partial records, one old chat was recovered, and the
+owner-requested Telegram reset succeeded. No chat contents were printed in logs.
+Local Docker is unavailable. GitHub Actions status is checked separately.
+
+Rollout exposed an old-container shutdown error: root tini could not forward a
+signal to the unprivileged worker. The entrypoint now drops privileges before
+starting tini, so init and the worker share a UID. Shell syntax validation passed;
+the updated image is validated on Render during the follow-up rollout.
 
 Telegram session pages contain extractive message previews, not a native chat
 tab switch. Message removal remains subject to Telegram's 48-hour limit.

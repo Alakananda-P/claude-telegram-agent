@@ -22,9 +22,11 @@ if [ "$(id -u)" = 0 ]; then
   if [ ! -x /data/venv/bin/python ]; then
     gosu node python3 -m venv /data/venv
   fi
-  exec gosu node "$@"
+  # Run the signal-forwarding init with the same UID as the worker. Render may
+  # restrict CAP_KILL, so a root tini cannot reliably signal a gosu child.
+  exec gosu node /usr/bin/tini -g -- "$@"
 fi
 if [ ! -x /data/venv/bin/python ]; then
   python3 -m venv /data/venv
 fi
-exec "$@"
+exec /usr/bin/tini -g -- "$@"
