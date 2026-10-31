@@ -18,6 +18,32 @@ export interface Runner {
 export type QueryFactory = (request: { prompt: string; options: Options }) => AsyncIterable<SDKMessage> & { close(): void };
 
 export class AgentError extends Error {}
+export class AgentApiError extends AgentError {
+  constructor(readonly kind: string, message: string) { super(message); }
+}
+function apiFailure(error: string | undefined, detail: string): AgentApiError {
+  // Inspect only SDK-marked error frames, never ordinary model text. Never
+  // echo upstream descriptions, which may contain prompts or credentials.
+  if (error === 'authentication_failed' || error === 'cloud_credential_error') {
+    return new AgentApiError('authentication_failed', 'Claude API key was rejected. Update the Anthropic API key in Render; this is an authentication failure, not a model switch.');
+  }
+  if (error === 'billing_error' || /credit balance|insufficient credits|credit.*too low/i.test(detail)) {
+    return new AgentApiError('billing_error', 'Claude API billing or credits blocked this request. Check the Anthropic account balance and billing settings.');
+  }
+  const messages: Record<string, string> = {
+    rate_limit: 'Claude API rate limit or account spend limit reached. Check account limits before retrying.',
+    overloaded: 'Claude API is temporarily overloaded. Please retry shortly.',
+    server_error: 'Claude API had a server error. Please retry shortly.',
+    model_not_found: 'The selected Claude model is unavailable to this API key. Check model access.',
+    account_on_hold: 'The Claude account is on hold. Check the Anthropic account.',
+    verification_required: 'The Claude account requires verification in Anthropic Console.',
+    oauth_org_not_allowed: 'The Claude account is not allowed to access this organization.',
+    invalid_request: 'Claude API rejected the request configuration. Check model and account limits.',
+    max_output_tokens: 'Claude reached its response token limit. Try a smaller task.',
+  };
+  const kind = error && Object.hasOwn(messages, error) ? error : 'unknown';
+  return new AgentApiError(kind, messages[kind] ?? 'Claude API request failed. Check API access or retry; the provider did not supply a recognized error category.');
+}
 
 export function agentEnvironment(config: Config): Record<string, string | undefined> {
   const inherited: Record<string, string | undefined> = {};
@@ -90,6 +116,7 @@ export class ClaudeRunner implements Runner {
     const stream = this.makeQuery({ prompt: request.prompt, options });
     let initialized = false;
     let output: AgentResult | undefined;
+    let apiError: AgentApiError | undefined;
     const steps = new Map<string, { id: string; model: string; usage: Record<string, unknown>; session: string }>();
     try {
       for await (const event of stream) {
@@ -129,6 +156,12 @@ export class ClaudeRunner implements Runner {
         } else if (event.type === 'system' && event.subtype === 'status' && event.permissionMode && event.permissionMode !== 'auto') {
           throw new AgentError('Claude configuration changed away from auto; job stopped.');
         } else if (event.type === 'assistant' && !event.parent_tool_use_id) {
+          if (event.error || event.message.model === '<synthetic>') {
+            const detail = event.message.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
+            apiError = apiFailure(event.error, detail);
+            // Consume the final result so completed usage still reaches the ledger.
+            continue;
+          }
           if (event.message.model && event.message.model !== selected.model) {
             throw new AgentError('Claude main-agent model changed unexpectedly; job stopped rather than accepting a fallback.');
           }
@@ -139,14 +172,21 @@ export class ClaudeRunner implements Runner {
             }
           }
         } else if (event.type === 'result') {
+          if (apiError) throw apiError;
           if (event.subtype !== 'success' || event.is_error) throw new AgentError(`Claude stopped (${event.subtype}). Check account access or retry with a smaller task; work was not automatically retried.`);
           if (!initialized) throw new AgentError('Claude returned a result without verified initialization.');
           output = { text: event.result, session: event.session_id, cumulativeCost: event.total_cost_usd };
           if (event.permission_denials.length) await emit({ type: 'progress', text: `${event.permission_denials.length} tool request(s) were denied by the permission system.` });
         }
       }
+      if (apiError) throw apiError;
       if (!output) throw new AgentError('Claude ended without a final result. Send /status before retrying.');
       return output;
+    } catch (error) {
+      // Some CLI versions emit an error frame, then throw while closing their
+      // stream rather than yielding a result. Preserve the safe original cause.
+      if (apiError && !(error instanceof AgentError)) throw apiError;
+      throw error;
     } finally {
       stream.close();
     }

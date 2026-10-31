@@ -4,7 +4,14 @@ import type { Buttons } from './ui.js';
 import type { StateStore } from './state.js';
 
 export class TelegramError extends Error {
-  constructor(public code: number, public retryAfter = 0, public unchanged = false) { super(`Telegram request failed (status ${code}).`); }
+  constructor(public code: number, public retryAfter = 0, public unchanged = false, public networkCode?: string) { super(`Telegram request failed (status ${code}).`); }
+}
+
+function networkCode(error: unknown): string {
+  const e = error as { name?: string; cause?: { code?: string } };
+  const code = e?.cause?.code;
+  if (code && ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_SOCKET'].includes(code)) return code;
+  return e?.name === 'TimeoutError' ? 'TIMEOUT' : e?.name === 'AbortError' ? 'ABORTED' : 'NETWORK';
 }
 
 export class Telegram {
@@ -18,7 +25,7 @@ export class Telegram {
         method: 'POST', headers: form ? undefined : { 'Content-Type': 'application/json' },
         body: form ? payload : JSON.stringify(payload),
         signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(45_000)]) : AbortSignal.timeout(45_000),
-      }).catch(() => { throw new TelegramError(0); });
+      }).catch(error => { throw new TelegramError(0, 0, false, networkCode(error)); });
       const body = await response.json().catch(() => { throw new TelegramError(response.status); }) as {
         ok: boolean; result?: T; error_code?: number; description?: string; parameters?: { retry_after?: number };
       };

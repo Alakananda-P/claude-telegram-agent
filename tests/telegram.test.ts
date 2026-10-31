@@ -92,3 +92,13 @@ test('Telegram errors expose only safe status codes, never token-bearing server 
   const tg = new Telegram('test-token', [], `http://127.0.0.1:${(server.address() as { port: number }).port}`);
   await assert.rejects(tg.call('getMe'), e => e instanceof TelegramError && e.code === 401 && !e.message.includes('top-secret'));
 });
+
+test('transport failures expose only a fixed network category, never a token URL', async t => {
+  const server = createServer(req => req.socket.destroy());
+  await new Promise<void>(r => server.listen(0, '127.0.0.1', r));
+  t.after(() => server.close());
+  const tg = new Telegram('private-test-token', [], `http://127.0.0.1:${(server.address() as { port: number }).port}`);
+  await assert.rejects(tg.call('getMe'), e => e instanceof TelegramError && e.code === 0
+    && ['UND_ERR_SOCKET', 'ECONNRESET', 'NETWORK'].includes(e.networkCode ?? '')
+    && !JSON.stringify(e).includes('private-test-token'));
+});

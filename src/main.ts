@@ -49,10 +49,12 @@ async function main(): Promise<void> {
   process.once('SIGINT', stop);
   try {
     await controller.prepareSessions(shutdown.signal);
-    if (process.env.VERIFY_AGENT_ON_UPGRADE === 'true' && !store.data.upgradeCheck?.attempted) {
+    const checkId = process.env.VERIFY_AGENT_CHECK_ID ?? 'initial-upgrade';
+    if (process.env.VERIFY_AGENT_ON_UPGRADE === 'true'
+      && (!store.data.upgradeCheck?.attempted || (store.data.upgradeCheck.checkId ?? 'initial-upgrade') !== checkId)) {
       // Explicit rollout acceptance check; one short request, once per data disk.
       // Count its usage in the same ledger and never poll Telegram twice.
-      store.data.upgradeCheck = { attempted: true, passed: false };
+      store.data.upgradeCheck = { attempted: true, passed: false, checkId };
       await store.save();
       const probe = new AbortController();
       const timer = setTimeout(() => probe.abort(), 90_000);

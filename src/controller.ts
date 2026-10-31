@@ -2,7 +2,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { mkdir, lstat, readdir, readFile, writeFile } from 'node:fs/promises';
 import type { Config } from './config.js';
-import { AgentError, type Runner } from './agent.js';
+import { AgentError, AgentApiError, type Runner } from './agent.js';
 import { StateStore } from './state.js';
 import { authorized, projectName, redact, safeFile, secretPath, type Message, type Callback } from './safety.js';
 import { MODELS, EFFORTS, effectiveSettings, settingsLabel, modelLabel, type AgentSettings, type Effort } from './settings.js';
@@ -415,6 +415,7 @@ export class Controller {
       console.log(`Claude task completed: ${selected.model}; effort=${selected.effort}; requestedFast=${selected.fast}; reportedSpeed=${this.store.data.lastSpeed ?? 'unknown'}.`);
     } catch (error) {
       if (error instanceof TitleAccountingError) this.persistenceFailed = true;
+      if (error instanceof AgentApiError) console.warn(`Claude task API failure: ${error.kind}.`);
       status = abort.signal.aborted ? 'cancelled' : 'failed';
       await finishIndicator();
       await this.say(timedOut ? 'This task reached its time limit and was stopped.'

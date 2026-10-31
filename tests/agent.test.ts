@@ -67,6 +67,34 @@ test('runner reports SDK failures without exposing raw error text', async () => 
   assert.ok(seen.some(e => e.type === 'usage' && e.cost === 0.1));
 });
 
+test('synthetic API failures report authentication or billing instead of a false model change, and keep accounting', async () => {
+  for (const [error, text, expected] of [
+    ['authentication_failed', 'private upstream error', /API key.*rejected/i],
+    ['billing_error', 'private upstream error', /billing|credit/i],
+    ['invalid_request', 'Your credit balance is too low to access the Anthropic API.', /credit/i],
+    ['rate_limit', 'private upstream error', /rate limit/i],
+    [undefined, 'private upstream error', /API request failed/i],
+  ] as const) {
+    const seen: AgentEvent[] = [];
+    const synthetic = { type: 'assistant', error, parent_tool_use_id: null, session_id: 'session-1', uuid: 'synthetic',
+      message: { id: 'error-message', role: 'assistant', model: '<synthetic>', content: [{ type: 'text', text }], usage: result.usage } };
+    const failedResult = { ...result, subtype: 'error_during_execution', is_error: true, errors: ['private upstream error'] };
+    await assert.rejects(new ClaudeRunner(config, factory([init, synthetic, failedResult])).run({ prompt: 'x', cwd: '/work' }, e => { seen.push(e); }, new AbortController()),
+      e => e instanceof Error && expected.test(e.message) && !e.message.includes('private upstream error') && !e.message.includes('model changed'));
+    assert.ok(seen.some(e => e.type === 'usage' && e.cost === 0.1));
+  }
+});
+
+test('SDK stream errors after a synthetic error retain the safe root cause', async () => {
+  const makeQuery: QueryFactory = () => ({ async *[Symbol.asyncIterator]() {
+    yield init as SDKMessage;
+    yield { type: 'assistant', error: 'authentication_failed', parent_tool_use_id: null,
+      message: { model: '<synthetic>', content: [] }, session_id: 'session-1' } as unknown as SDKMessage;
+    throw new Error('private raw SDK error');
+  }, close() {} });
+  await assert.rejects(new ClaudeRunner(config, makeQuery).run({ prompt: 'x', cwd: '/work' }, () => {}, new AbortController()), /API key.*rejected/i);
+});
+
 test('streaming records actual output counts without forwarding hidden reasoning', async () => {
   const seen: AgentEvent[] = [];
   const frame = (event: unknown) => ({ type: 'stream_event', session_id: 'session-1', parent_tool_use_id: null, uuid: 'frame', event });

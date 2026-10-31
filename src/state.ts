@@ -21,7 +21,7 @@ export interface State {
   conversations?: Conversation[];
   visibleMessageIds?: number[];
   chatUiResetDone?: boolean;
-  upgradeCheck?: { attempted: boolean; passed: boolean; actualSpeed?: string };
+  upgradeCheck?: { attempted: boolean; passed: boolean; actualSpeed?: string; checkId?: string };
 }
 
 export class StateStore {

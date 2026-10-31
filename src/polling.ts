@@ -7,16 +7,20 @@ interface PollClient { call<T>(method: string, payload: Record<string, unknown>,
 
 export async function poll(client: PollClient, store: StateStore, handle: (message: Message) => Promise<void>, signal: AbortSignal, handleCallback?: (callback: Callback) => Promise<void>): Promise<void> {
   let failures = 0;
+  let connected = false;
   while (!signal.aborted) {
     let updates: { update_id: number; message?: Message; callback_query?: Callback }[];
     try {
       updates = await client.call('getUpdates', { offset: store.data.offset, timeout: 25, limit: 20, allowed_updates: ['message', 'callback_query'] }, signal);
+      if (!connected || failures) console.log(`Telegram polling connected; recoveredFailures=${failures}.`);
+      connected = true;
       failures = 0;
     } catch (error) {
       if (signal.aborted) return;
       if (error instanceof TelegramError && [401, 403, 409].includes(error.code)) throw error;
       const retryMs = Math.min(30_000, 1000 * 2 ** Math.min(failures++, 5));
-      console.warn('Telegram polling unavailable; retrying with backoff.');
+      const reason = error instanceof TelegramError ? `status=${error.code}; network=${error.networkCode ?? 'none'}` : 'unclassified';
+      console.warn(`Telegram polling unavailable (${reason}); retrying with backoff.`);
       await delay(retryMs, undefined, { signal }).catch(() => {});
       continue;
     }
