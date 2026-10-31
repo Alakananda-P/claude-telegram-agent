@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { Telegram, TelegramError } from '../src/telegram.js';
+import { Telegram, TelegramError, createTelegramDispatcher } from '../src/telegram.js';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -101,4 +101,41 @@ test('transport failures expose only a fixed network category, never a token URL
   await assert.rejects(tg.call('getMe'), e => e instanceof TelegramError && e.code === 0
     && ['UND_ERR_SOCKET', 'ECONNRESET', 'NETWORK'].includes(e.networkCode ?? '')
     && !JSON.stringify(e).includes('private-test-token'));
+});
+
+test('Telegram transport explicitly resolves IPv4 on a host without an IPv6 route', async t => {
+  const server = createServer((_req, res) => res.end(JSON.stringify({ ok: true, result: true })));
+  await new Promise<void>(r => server.listen(0, '127.0.0.1', r));
+  t.after(() => server.close());
+  let family: unknown;
+  const dispatcher = createTelegramDispatcher((_host, options, callback) => {
+    family = options.family;
+    if (options.family !== 4) return callback(Object.assign(new Error('No IPv6 route'), { code: 'ENETUNREACH' }), '', 0);
+    callback(null, '127.0.0.1', 4);
+  });
+  t.after(() => dispatcher.close());
+  const tg = new Telegram('test-token', [], `http://telegram-network.test:${(server.address() as { port: number }).port}`, dispatcher);
+  assert.equal(await tg.call('getMe'), true);
+  assert.equal(family, 4);
+});
+
+test('IPv4 transport preserves document upload and file download payloads', async t => {
+  const uploaded: string[] = [];
+  const server = createServer(async (req, res) => {
+    let data = ''; for await (const chunk of req) data += chunk;
+    if (req.url!.endsWith('sendDocument')) {
+      assert.match(req.headers['content-type']!, /multipart\/form-data/);
+      uploaded.push(data);
+      res.end(JSON.stringify({ ok: true, result: { message_id: 1 } }));
+    } else if (req.url!.endsWith('getFile')) {
+      res.end(JSON.stringify({ ok: true, result: { file_path: 'documents/sample.txt', file_size: 8 } }));
+    } else res.end('contents');
+  });
+  await new Promise<void>(r => server.listen(0, '127.0.0.1', r));
+  t.after(() => server.close());
+  const tg = new Telegram('test-token', [], `http://127.0.0.1:${(server.address() as { port: number }).port}`);
+  await tg.sendFile(123, 'sample.txt', Buffer.from('contents'));
+  assert.match(uploaded[0], /sample\.txt/);
+  assert.match(uploaded[0], /contents/);
+  assert.equal((await tg.download('file-id')).toString(), 'contents');
 });

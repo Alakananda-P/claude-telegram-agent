@@ -118,7 +118,7 @@ async function main(): Promise<void> {
 
 main().catch(error => {
   // Never dump SDK, fetch, or Telegram error objects containing request secrets.
-  if (error instanceof TelegramError) console.error(error.message);
+  if (error instanceof TelegramError) console.error(`${error.message} Network: ${error.networkCode ?? 'none'}.`);
   else if (error instanceof Error && /^(Set |Invalid TELEGRAM|CLAUDE_|MAX_|JOB_TIMEOUT|This bot already|Cannot load bot state)/.test(error.message)) console.error(error.message);
   else console.error('Startup/runtime failed. Check configuration, credentials and persistent storage.');
   process.exitCode = 1;

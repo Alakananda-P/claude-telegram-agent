@@ -2,6 +2,15 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { chunks, redact } from './safety.js';
 import type { Buttons } from './ui.js';
 import type { StateStore } from './state.js';
+import { Agent, fetch, FormData } from 'undici';
+import type { LookupFunction } from 'node:net';
+
+export function createTelegramDispatcher(lookup?: LookupFunction): Agent {
+  // Render's dual-stack fetch attempted an unreachable IPv6 path after the
+  // IPv4 attempt timed out; a same-host IPv4-only Telegram probe returned 200.
+  return new Agent({ connect: { family: 4, autoSelectFamily: false, lookup } });
+}
+const telegramDispatcher = createTelegramDispatcher();
 
 export class TelegramError extends Error {
   constructor(public code: number, public retryAfter = 0, public unchanged = false, public networkCode?: string) { super(`Telegram request failed (status ${code}).`); }
@@ -10,18 +19,19 @@ export class TelegramError extends Error {
 function networkCode(error: unknown): string {
   const e = error as { name?: string; cause?: { code?: string } };
   const code = e?.cause?.code;
-  if (code && ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_SOCKET'].includes(code)) return code;
+  if (code && ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'ENETUNREACH', 'EHOSTUNREACH', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_SOCKET'].includes(code)) return code;
   return e?.name === 'TimeoutError' ? 'TIMEOUT' : e?.name === 'AbortError' ? 'ABORTED' : 'NETWORK';
 }
 
 export class Telegram {
   timeline?: StateStore;
-  constructor(private token: string, private secrets: string[], private base = 'https://api.telegram.org') {}
+  constructor(private token: string, private secrets: string[], private base = 'https://api.telegram.org', private dispatcher = telegramDispatcher) {}
 
   async call<T = unknown>(method: string, payload: Record<string, unknown> | FormData = {}, signal?: AbortSignal): Promise<T> {
     for (let attempt = 0; attempt < 3; attempt++) {
       const form = payload instanceof FormData;
       const response = await fetch(`${this.base}/bot${this.token}/${method}`, {
+        dispatcher: this.dispatcher,
         method: 'POST', headers: form ? undefined : { 'Content-Type': 'application/json' },
         body: form ? payload : JSON.stringify(payload),
         signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(45_000)]) : AbortSignal.timeout(45_000),
@@ -128,7 +138,7 @@ export class Telegram {
     const file = await this.call<{ file_path?: string; file_size?: number }>('getFile', { file_id: fileId });
     if (!file.file_path || !/^[a-zA-Z0-9_./-]+$/.test(file.file_path) || file.file_path.split('/').includes('..')) throw new Error('Invalid Telegram file path.');
     if ((file.file_size ?? 0) > 20_000_000) throw new Error('Upload exceeds the 20 MB limit.');
-    const response = await fetch(`${this.base}/file/bot${this.token}/${file.file_path}`, { signal: AbortSignal.timeout(45_000), redirect: 'error' })
+    const response = await fetch(`${this.base}/file/bot${this.token}/${file.file_path}`, { dispatcher: this.dispatcher, signal: AbortSignal.timeout(45_000), redirect: 'error' })
       .catch(() => { throw new TelegramError(0); });
     if (!response.ok || !response.body) throw new TelegramError(response.status);
     const reader = response.body.getReader();
