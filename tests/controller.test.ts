@@ -51,7 +51,7 @@ test('unauthorized messages do not produce replies, uploads or jobs', async () =
 test('largest direct photo is acknowledged and captionless upload attaches to the next task', async () => {
   const { bot, downloads, calls, indicators, panels, store } = await setup();
   await bot.handle(photo('bill')); assert.deepEqual(downloads, ['bill-large']); assert.equal(calls.length, 0);
-  assert.ok(indicators.some(t => /Receiving photo/.test(t))); assert.match(panels.at(-1)!.text, /Photo received/);
+  assert.ok(indicators.some(t => /Receiving photo/.test(t))); assert.match(panels.at(-1)!.text, /1 image received/); assert.deepEqual(panels.at(-1)!.buttons, []);
   await bot.handle(message('Make a bill table')); await bot.idle();
   assert.match(calls[0].prompt, /Make a bill table/); assert.match(calls[0].prompt, /uploads\/.+photo.jpg/); assert.equal(store.data.batches![0].status, 'queued');
 });
@@ -59,8 +59,8 @@ test('album waits for Process, preserves every photo and processes it once', asy
   const { bot, calls, store, panels } = await setup();
   await bot.handle({ ...photo('one', 'album-1'), caption: 'Read these bills' }); await bot.handle(photo('two', 'album-1')); await bot.handle(photo('three', 'album-1'));
   assert.equal(calls.length, 0); assert.equal(store.data.batches!.length, 1); assert.equal(store.data.batches![0].uploadIds.length, 3);
-  const action = panels.at(-1)!.buttons[0][0].callback_data;
-  await bot.callback({ id: 'process', from: { id: 123 }, message: { ...message(''), message_id: 999 }, data: action }); await bot.idle();
+  assert.deepEqual(panels.at(-1)!.buttons, []);
+  await bot.handle(message('/process')); await bot.idle();
   assert.equal(calls.length, 1); assert.equal((calls[0].prompt.match(/uploads\//g) ?? []).length, 3);
   await bot.handle(message('/process')); await bot.idle(); assert.equal(calls.length, 1);
 });

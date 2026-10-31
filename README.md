@@ -60,7 +60,11 @@ API-key setup.
   are accounted for without repeatedly adding cumulative session totals.
 
 - Photos use the largest Telegram rendition, with immediate receipt/failure feedback.
-  Albums and manual batches wait for Process; captions and later instructions use saved paths.
+  Successfully saved uploads share one updating, buttonless receipt (for example, “📷 3 images
+  received”). Counts include all waiting albums in the current chat; other documents have a
+  separate file count. The receipt disappears when the files are submitted or after five idle
+  minutes, without losing the pending uploads. `/batch` opens optional Process/Discard controls.
+  Albums and manual batches wait for instructions or `/process`; captions and later instructions use saved paths.
 - Image tools preserve originals and create crop, rotation, contrast and estimated deskew copies.
   Bill instructions require clarification for unclear writing; a deterministic tool checks quantities,
   rates and totals. These checks cannot guarantee recognition accuracy.
@@ -176,8 +180,8 @@ interrupting running tasks unexpectedly; deploy manually while idle.
 | `/health` | Last Telegram/Claude success, API state, queue, schedules and disk |
 
 Upload photos or documents up to 20 MB. A standalone caption starts a task about the saved file;
-without a caption the upload waits for instructions or Process. Albums and manual batches always
-wait for Process or a later text instruction. Names receive unique prefixes to
+without a caption the upload waits for instructions or `/process`. Albums and manual batches always
+wait for `/process` or a later text instruction. `/batch` opens controls for all waiting files. Names receive unique prefixes to
 avoid overwriting existing files. Archives are not automatically extracted.
 Downloads are limited to 49 MB. Hidden credential paths and symlinks are rejected
 by the transfer layer; known configured credentials are refused in outgoing files.

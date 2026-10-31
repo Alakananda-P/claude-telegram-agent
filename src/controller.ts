@@ -54,7 +54,7 @@ Send a task in plain text, or upload a document with instructions in its caption
 /get PATH — download a project file (up to 49 MB)
 /help — this guide
 Auto uses safety checks and can deny actions. No unrestricted permission bypass.
-Photos and documents: up to 20 MB each. Albums wait for Process.
+Photos and documents: up to 20 MB each. Send instructions after uploading, or use /process.
 /batch — collect multiple files; /process — process the current batch
 /queue — tasks, cancel, reorder, pause/resume and explicit retry
 /schedules — reminders and recurring tasks; ask Claude to create or edit them
@@ -340,6 +340,7 @@ export class Controller {
       if (command === 'project') {
         const name = projectName(argument);
         await this.workspace(name);
+        await this.dismiss('uploads');
         this.store.data.project = name;
         await this.store.save();
         return this.panel(`Active project: ${name}. Its saved conversation will resume.`, HOME);
@@ -514,6 +515,20 @@ export class Controller {
     const key = this.resolveChat(this.chatKey());
     return this.store.data.batches!.filter(b => b.status === 'collecting' && b.project === this.store.data.project && this.resolveChat(b.chatKey) === key);
   }
+  private async uploadReceipt(): Promise<void> {
+    const ids = new Set(this.pendingBatches().flatMap(b => b.uploadIds));
+    const uploads = this.store.data.uploads!.filter(u => ids.has(u.id));
+    if (!uploads.length) return this.dismiss('uploads');
+    const images = uploads.filter(u => u.photo || /\.(png|jpe?g|webp|gif|bmp|heic|heif|tiff?|avif)$/i.test(u.name)).length;
+    const files = uploads.length - images;
+    const text = [images ? `📷 ${images} image${images === 1 ? '' : 's'}` : '', files ? `📎 ${files} file${files === 1 ? '' : 's'}` : ''].filter(Boolean).join(' · ') + ' received';
+    // A single buttonless receipt across albums; never replace a clicked control panel.
+    if (this.messenger.panel) {
+      try { await this.messenger.panel(this.config.owner, text, [], undefined, 'uploads'); return; }
+      catch { /* Keep the saved upload available even if Telegram cannot update its receipt. */ }
+    }
+    await this.say(text, false, 'uploads');
+  }
   private async receive(message: Message, root: string): Promise<void> {
     const photo = message.photo?.slice().sort((a, b) => b.width * b.height - a.width * a.height)[0];
     const attachment = photo ?? message.document!;
@@ -547,7 +562,7 @@ export class Controller {
       if (message.caption?.trim()) batch.prompt = (batch.prompt ? batch.prompt + '\n' : '') + message.caption.trim();
       await this.chats.append(this.resolveChat(batch.chatKey), { role: 'user', text: `Attachment: ${base}\nProject path: ${relative}`, file: { id: attachment.file_id, name: base } });
       await this.store.save(); success = true;
-      await this.panel(`${photo ? 'Photo' : base} received · ${batch.uploadIds.length} file(s) in this batch.\n${batch.manual || batch.groupId ? 'Send more files, then tap Process or send your instructions.' : 'Send instructions or tap Process.'}\nOriginal saved.`, [[button('Process', 'process ' + batch.id), button('Discard batch', 'discard ' + batch.id)], ...BACK], 'batch-' + batch.id);
+      await this.uploadReceipt();
       if (message.caption?.trim() && !batch.manual && !batch.groupId) await this.processBatches([batch], batch.prompt!);
     } catch {
       await this.say('Upload could not be accepted. Check file size/format and send it again. No processing started.');
@@ -564,6 +579,7 @@ export class Controller {
     const task = await this.automation.enqueue({ kind: 'agent', project: batches[0].project, chatKey: batches[0].chatKey,
       prompt: prompt + '\n\nAttached project files:\n' + files.map(f => f.path).join('\n'), displayPrompt: prompt + `\n[${files.length} attached files]`, settings: { ...this.settings }, interactive: true });
     for (const batch of batches) await this.dismiss('batch-' + batch.id);
+    await this.uploadReceipt();
     await this.dismiss('controls');
     await this.say(`${files.length} file(s) queued for processing.`, false, 'task-' + task.id); this.kick();
   }
@@ -587,9 +603,13 @@ export class Controller {
     else if (command === 'batch') {
       let batch = this.pendingBatches().find(b => b.manual);
       if (!batch) { batch = { id: randomUUID().slice(0, 8), project: d.project, chatKey: this.chatKey(), uploadIds: [], status: 'collecting', manual: true, updatedAt: new Date().toISOString() }; d.batches!.push(batch); await this.store.save(); }
-      await this.panel(`Batch open · ${batch.uploadIds.length} files. Send photos/documents, then your instructions or tap Process.`, [[button('Process batch', 'process ' + batch.id), button('Discard batch', 'discard ' + batch.id)], ...BACK], 'batch-' + batch.id);
+      const pending = this.pendingBatches();
+      const count = pending.reduce((n, b) => n + b.uploadIds.length, 0);
+      await this.panel(`Batch open · ${count} files waiting in this chat. Send photos/documents, then your instructions or tap Process.`, [
+        [button('Process waiting files', 'process')],
+        ...pending.map((b, i) => [button(`Discard batch ${i + 1} · ${b.uploadIds.length} files`, 'discard ' + b.id)]), ...BACK], 'batch-' + batch.id);
     } else if (command === 'process') await this.processBatches(this.pendingBatches().filter(b => !argument || b.id === argument));
-    else if (command === 'discard') { const b = this.pendingBatches().find(b => b.id === argument); if (b) { b.status = 'discarded'; await this.store.save(); } await this.dismiss('batch-' + argument); await this.panel('Batch discarded. Original uploaded files remain in the project.'); await this.dismiss('controls', 3000); }
+    else if (command === 'discard') { const b = this.pendingBatches().find(b => b.id === argument); if (b) { b.status = 'discarded'; await this.store.save(); } await this.dismiss('batch-' + argument); await this.uploadReceipt(); await this.panel('Batch discarded. Original uploaded files remain in the project.'); await this.dismiss('controls', 3000); }
     else if (command === 'queue') {
       if (argument === 'pause' || argument === 'resume') { await this.automation.setPaused(argument === 'pause'); if (argument === 'resume') this.kick(); }
       const waiting = d.tasks!.filter(t => ['queued', 'running'].includes(t.status)); const recent = d.tasks!.filter(t => !['queued', 'running'].includes(t.status)).slice(-6).reverse();
