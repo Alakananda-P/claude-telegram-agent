@@ -27,6 +27,14 @@ API-key setup.
   uploads, downloads, and redacted result files for recovery after delivery errors.
 - Telegram control panel: model, effort, speed, shared memory, saved sessions,
   tokens, cost, projects and task controls. Send `/menu` or tap the Menu button.
+- Menus and operational notices disappear after five minutes without interaction.
+  Navigation reuses its current panel and refreshes the timer. Completed settings/Trash
+  actions close their panels after a three-second reading pause; batch receipts and queued
+  notices close when their work moves on. Conversation replies, owner messages, reminders
+  and delivered files remain. Cleanup records persist across restarts and failed deletions retry.
+  `/menu` always reopens the controls. Panels created before this feature are adopted when
+  clicked; unknown historical messages are never guessed or deleted. Telegram's normal
+  message deletion window still applies.
 - Long-term memory is on by default and shared across all projects/chats. `/memory`
   shows or changes it. `/memory remember TEXT` stores a note without an API call;
   the agent can also maintain concise durable preferences and project facts.

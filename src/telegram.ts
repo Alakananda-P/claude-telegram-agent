@@ -25,6 +25,7 @@ function networkCode(error: unknown): string {
 
 export class Telegram {
   timeline?: StateStore;
+  private uiWork: Promise<unknown> = Promise.resolve();
   constructor(private token: string, private secrets: string[], private base = 'https://api.telegram.org', private dispatcher = telegramDispatcher) {}
 
   async call<T = unknown>(method: string, payload: Record<string, unknown> | FormData = {}, signal?: AbortSignal): Promise<T> {
@@ -79,19 +80,85 @@ export class Telegram {
 
   async remove(chat: number, id: number): Promise<void> {
     await this.call('deleteMessage', { chat_id: chat, message_id: id });
+    await this.forgetUi(chat, id, true);
   }
 
   async typing(chat: number): Promise<void> { await this.call('sendChatAction', { chat_id: chat, action: 'typing' }); }
 
-  async panel(chat: number, text: string, buttons: Buttons, editId?: number): Promise<void> {
+  async panel(chat: number, text: string, buttons: Buttons, editId?: number, scope = 'controls'): Promise<void> {
+    return this.serializeUi(async () => {
+      editId ??= this.timeline?.data.uiMessages?.findLast(m => m.chat === chat && m.kind === 'panel' && m.scope === scope)?.id;
     const payload = { chat_id: chat, text: redact(text, [this.token, ...this.secrets]),
       reply_markup: { inline_keyboard: buttons }, link_preview_options: { is_disabled: true } };
+    let id = editId;
     if (editId !== undefined) {
-      try { await this.call('editMessageText', { ...payload, message_id: editId }); return; }
-      catch (e) { if (e instanceof TelegramError && e.unchanged) return; if (!(e instanceof TelegramError) || e.code !== 400) throw e; }
+      try { await this.call('editMessageText', { ...payload, message_id: editId }); }
+      catch (e) {
+        if (!(e instanceof TelegramError) || (!e.unchanged && e.code !== 400)) throw e;
+        if (!e.unchanged) { await this.forgetUi(chat, editId); id = undefined; }
+      }
       // A removed/too-old panel is replaced. Ordinary navigation edits in place.
     }
-    await this.call('sendMessage', payload);
+    if (id === undefined) id = (await this.call<{ message_id: number }>('sendMessage', payload)).message_id;
+    await this.trackUi(chat, id, 'panel', scope);
+    for (const previous of this.timeline?.data.uiMessages ?? []) {
+      if (previous.chat === chat && previous.kind === 'panel' && previous.scope === scope && previous.id !== id) previous.expiresAt = Date.now();
+    }
+    await this.cleanupUi(chat, Date.now());
+    });
+  }
+
+  private serializeUi<T>(action: () => Promise<T>): Promise<T> {
+    const task = this.uiWork.then(action); this.uiWork = task.catch(() => {}); return task;
+  }
+  private async trackUi(chat: number, id: number, kind: 'panel' | 'notice', scope: string, ttlMs = 300000): Promise<void> {
+    if (!this.timeline) return;
+    const list = this.timeline.data.uiMessages ??= [];
+    const previous = list.find(m => m.chat === chat && m.id === id);
+    const record = { id, chat, kind, scope, createdAt: previous?.createdAt ?? Date.now(), expiresAt: Date.now() + ttlMs };
+    if (previous) Object.assign(previous, record, { retryAt: undefined, attempts: undefined }); else list.push(record);
+    await this.timeline.save();
+  }
+  private async forgetUi(chat: number, id: number, deleted = false): Promise<void> {
+    if (!this.timeline) return;
+    this.timeline.data.uiMessages = this.timeline.data.uiMessages?.filter(m => m.chat !== chat || m.id !== id);
+    if (deleted) this.timeline.data.visibleMessageIds = this.timeline.data.visibleMessageIds?.filter(m => m !== id);
+    await this.timeline.save();
+  }
+  async notice(chat: number, text: string, scope = 'notices', ttlMs = 300000): Promise<void> {
+    return this.serializeUi(async () => {
+      for (const part of chunks(redact(text, [this.token, ...this.secrets]))) {
+        const sent = await this.call<{ message_id: number }>('sendMessage', { chat_id: chat, text: part, disable_notification: true, link_preview_options: { is_disabled: true } });
+        await this.trackUi(chat, sent.message_id, 'notice', scope, ttlMs);
+      }
+    });
+  }
+  async dismiss(chat: number, scope?: string, graceMs = 0): Promise<void> {
+    return this.serializeUi(async () => {
+      if (!this.timeline) return;
+      const due = Date.now() + graceMs;
+      let changed = false;
+      for (const m of this.timeline.data.uiMessages ?? []) if (m.chat === chat && (scope === undefined || m.scope === scope)) { m.expiresAt = Math.min(m.expiresAt, due); changed = true; }
+      if (changed) await this.timeline.save();
+      if (!graceMs) await this.cleanupUi(chat, Date.now());
+    });
+  }
+  async cleanup(chat: number, now = Date.now()): Promise<void> { return this.serializeUi(() => this.cleanupUi(chat, now)); }
+  private async cleanupUi(chat: number, now: number): Promise<void> {
+    if (!this.timeline) return;
+    const due = (this.timeline.data.uiMessages ?? []).filter(m => m.chat === chat && m.expiresAt <= now && (m.retryAt ?? 0) <= now).slice(0, 20);
+    let removed = 0;
+    for (const m of due) {
+      try { await this.remove(chat, m.id); removed++; }
+      catch (e) {
+        if (e instanceof TelegramError && e.code === 400) { await this.forgetUi(chat, m.id); continue; }
+        m.attempts = (m.attempts ?? 0) + 1;
+        m.retryAt = now + Math.min(300000, 5000 * 2 ** Math.min(m.attempts, 6));
+        await this.timeline.save();
+        break; // Do not flood an unavailable or rate-limited Telegram endpoint.
+      }
+    }
+    if (removed) console.log(`Temporary UI cleanup: removed=${removed}.`);
   }
 
   async acknowledge(id: string): Promise<void> { await this.call('answerCallbackQuery', { callback_query_id: id }); }
@@ -119,6 +186,7 @@ export class Telegram {
       }
     }
     this.timeline.data.visibleMessageIds = remaining;
+    this.timeline.data.uiMessages = this.timeline.data.uiMessages?.filter(m => remaining.includes(m.id));
     await this.timeline.save();
     return remaining.length === 0;
   }

@@ -25,7 +25,10 @@ export interface Messenger {
   edit(chat: number, id: number, text: string): Promise<void>;
   remove(chat: number, id: number): Promise<void>;
   typing(chat: number): Promise<void>;
-  panel?(chat: number, text: string, buttons: Buttons, editId?: number): Promise<void>;
+  panel?(chat: number, text: string, buttons: Buttons, editId?: number, scope?: string): Promise<void>;
+  notice?(chat: number, text: string, scope?: string, ttlMs?: number): Promise<void>;
+  dismiss?(chat: number, scope?: string, graceMs?: number): Promise<void>;
+  cleanup?(chat: number, now?: number): Promise<void>;
   acknowledge?(id: string): Promise<void>;
   clear?(chat: number, includeLegacy?: boolean): Promise<boolean>;
 }
@@ -73,13 +76,14 @@ export class Controller {
   private pump?: Promise<void>;
   private timer?: ReturnType<typeof setInterval>;
   private ticking = false;
+  private cleaningUi?: Promise<void>;
   private restorePending?: { path: string; project: string; expires: number };
 
   constructor(private config: Config, private store: StateStore, private messenger: Messenger, private runner: Runner, private ledger?: UsageLedger, private titles?: TitleGenerator) {
     this.memory = new SharedMemory(config.dataDir, configSecrets(config));
     this.chats = new ChatArchive(path.join(config.dataDir, 'bot', 'chats'), configSecrets(config));
     this.sessions = new SessionCatalog(store, this.chats, configSecrets(config), path.join(config.dataDir, 'claude', 'projects'));
-    this.sessions.onDeleteRequest = async (id, title) => this.panel(`Move “${title}” to Trash? Restore within 48 hours; then the chat archive is permanently deleted. Shared memory, project files and lifetime usage stay.`, [[button('Move to Trash', 'trashmove ' + id)], ...BACK]);
+    this.sessions.onDeleteRequest = async (id, title) => this.panel(`Move “${title}” to Trash? Restore within 48 hours; then the chat archive is permanently deleted. Shared memory, project files and lifetime usage stay.`, [[button('Move to Trash', 'trashmove ' + id)], ...BACK], 'session-delete-' + id);
     this.automation = new Automation(store);
     this.backups = new Backups(config.dataDir, config.backupEncryptionKey, store, this.chats, this.memory, configSecrets(config));
   }
@@ -97,9 +101,9 @@ export class Controller {
 
   private get settings(): AgentSettings { return this.store.data.settings ?? { model: this.config.model, effort: this.config.effort, fast: this.config.fast }; }
 
-  private async panel(text: string, buttons: Buttons = BACK): Promise<void> {
+  private async panel(text: string, buttons: Buttons = BACK, scope = 'controls'): Promise<void> {
     if (!this.messenger.panel) return this.say(text);
-    try { await this.messenger.panel(this.config.owner, text, buttons, this.panelId); }
+    try { await this.messenger.panel(this.config.owner, text, buttons, this.panelId, scope); }
     catch { await this.say(text); }
   }
 
@@ -171,6 +175,9 @@ export class Controller {
 
   async tick(now = new Date()): Promise<void> {
     if (this.ticking || this.shuttingDown) return;
+    if (!this.cleaningUi && this.messenger.cleanup) {
+      this.cleaningUi = this.messenger.cleanup(this.config.owner, +now).catch(() => { console.warn('Temporary UI cleanup deferred; conversation data is unchanged.'); }).finally(() => { this.cleaningUi = undefined; });
+    }
     this.ticking = true;
     try { await this.sessions.purgeExpired(now); await this.automation.tick(now); this.kick(); }
     finally { this.ticking = false; }
@@ -188,10 +195,15 @@ export class Controller {
     await this.idle();
   }
 
-  private async say(text: string): Promise<void> {
-    try { await this.messenger.send(this.config.owner, redact(text, configSecrets(this.config))); }
+  private async say(text: string, persistent = false, scope?: string): Promise<void> {
+    try {
+      const safe = redact(text, configSecrets(this.config));
+      if (!persistent && this.messenger.notice) await this.messenger.notice(this.config.owner, safe, scope);
+      else await this.messenger.send(this.config.owner, safe);
+    }
     catch { console.warn('Owner message delivery failed; job state was preserved.'); }
   }
+  private async dismiss(scope: string, graceMs = 0): Promise<void> { await this.messenger.dismiss?.(this.config.owner, scope, graceMs).catch(() => {}); }
 
   private async workspace(name = this.store.data.project): Promise<string> {
     projectName(name);
@@ -298,7 +310,7 @@ export class Controller {
         }
         this.store.data.settings = next;
         await this.store.save();
-        return this.controls(command!);
+        await this.controls(command!); await this.dismiss('controls', 3000); return;
       }
       if (command === 'memory') {
         if (argument === 'on' || argument === 'off') {
@@ -357,8 +369,9 @@ export class Controller {
   }
 
   private async launch(prompt: string, cwd: string, displayPrompt = prompt): Promise<void> {
-    await this.automation.enqueue({ kind: 'agent', project: this.store.data.project, chatKey: this.chatKey(), prompt, displayPrompt, settings: { ...this.settings }, interactive: true });
-    if (this.pump || this.store.data.queuePaused) await this.say(`Task saved in queue · ${this.store.data.tasks!.filter(t => t.status === 'queued').length} waiting. /queue for controls.`);
+    await this.dismiss('controls');
+    const task = await this.automation.enqueue({ kind: 'agent', project: this.store.data.project, chatKey: this.chatKey(), prompt, displayPrompt, settings: { ...this.settings }, interactive: true });
+    if (this.pump || this.store.data.queuePaused) await this.say(`Task saved in queue · ${this.store.data.tasks!.filter(t => t.status === 'queued').length} waiting. /queue for controls.`, false, 'task-' + task.id);
     this.kick();
   }
 
@@ -372,6 +385,7 @@ export class Controller {
   private async runQueue(): Promise<void> {
     while (!this.shuttingDown && !this.persistenceFailed) {
       const task = await this.automation.claim(); if (!task) break;
+      await this.dismiss('task-' + task.id);
       const abort = new AbortController(); const running = { abort, done: Promise.resolve() }; this.running = running;
       running.done = (async () => {
         if (task.kind === 'agent') {
@@ -470,7 +484,7 @@ export class Controller {
       (this.store.data.health ??= {}).claudeAt = new Date().toISOString(); delete this.store.data.health.apiError;
       const preview = result.text.length > 12000 ? result.text.slice(0, 12000) + `\n\nFull result: /get ${outputName}` : result.text;
       await finishIndicator();
-      await this.say(preview);
+      await this.say(preview, true);
       const artifacts = (await changedArtifacts(cwd, before)).filter(file => !delivered.has(file));
       for (const file of artifacts.slice(0, 20)) { try { await this.deliver(cwd, file, 'Ready · ' + path.basename(file)); } catch { await this.say(`File saved; automatic delivery failed. Retry: /get ${file}`); } }
       if (artifacts.length > 20) await this.say('Additional files are saved. Use /files and /get to download them.');
@@ -492,6 +506,7 @@ export class Controller {
       this.store.data.active = null;
       try { await this.automation.finish(task.id, this.shuttingDown && status === 'cancelled' ? 'interrupted' : status); }
       catch { this.persistenceFailed = true; console.error('Job state persistence failed; new jobs disabled.'); }
+      await this.dismiss('task-' + task.id);
     }
   }
 
@@ -532,7 +547,7 @@ export class Controller {
       if (message.caption?.trim()) batch.prompt = (batch.prompt ? batch.prompt + '\n' : '') + message.caption.trim();
       await this.chats.append(this.resolveChat(batch.chatKey), { role: 'user', text: `Attachment: ${base}\nProject path: ${relative}`, file: { id: attachment.file_id, name: base } });
       await this.store.save(); success = true;
-      await this.panel(`${photo ? 'Photo' : base} received · ${batch.uploadIds.length} file(s) in this batch.\n${batch.manual || batch.groupId ? 'Send more files, then tap Process or send your instructions.' : 'Send instructions or tap Process.'}\nOriginal saved.`, [[button('Process', 'process ' + batch.id), button('Discard batch', 'discard ' + batch.id)], ...BACK]);
+      await this.panel(`${photo ? 'Photo' : base} received · ${batch.uploadIds.length} file(s) in this batch.\n${batch.manual || batch.groupId ? 'Send more files, then tap Process or send your instructions.' : 'Send instructions or tap Process.'}\nOriginal saved.`, [[button('Process', 'process ' + batch.id), button('Discard batch', 'discard ' + batch.id)], ...BACK], 'batch-' + batch.id);
       if (message.caption?.trim() && !batch.manual && !batch.groupId) await this.processBatches([batch], batch.prompt!);
     } catch {
       await this.say('Upload could not be accepted. Check file size/format and send it again. No processing started.');
@@ -546,9 +561,11 @@ export class Controller {
     const files = this.store.data.uploads!.filter(u => ids.has(u.id));
     const prompt = instruction ?? (batches.map(b => b.prompt).filter(Boolean).join('\n') || 'Inspect these files. For bill photos, extract only clear values, check arithmetic, and ask about unclear fields with relevant crops. If the desired output is unclear, ask the owner.');
     for (const batch of batches) batch.status = 'queued';
-    await this.automation.enqueue({ kind: 'agent', project: batches[0].project, chatKey: batches[0].chatKey,
+    const task = await this.automation.enqueue({ kind: 'agent', project: batches[0].project, chatKey: batches[0].chatKey,
       prompt: prompt + '\n\nAttached project files:\n' + files.map(f => f.path).join('\n'), displayPrompt: prompt + `\n[${files.length} attached files]`, settings: { ...this.settings }, interactive: true });
-    await this.say(`${files.length} file(s) queued for processing.`); this.kick();
+    for (const batch of batches) await this.dismiss('batch-' + batch.id);
+    await this.dismiss('controls');
+    await this.say(`${files.length} file(s) queued for processing.`, false, 'task-' + task.id); this.kick();
   }
   private async deliver(root: string, relative: string, preview?: string): Promise<void> {
     const file = await safeFile(root, relative);
@@ -556,7 +573,7 @@ export class Controller {
     const bytes = await readFile(file);
     if (configSecrets(this.config).some(s => s.length > 5 && bytes.includes(Buffer.from(s)))) throw new Error('Credential-bearing file cannot be sent.');
     if (/\.(png|jpe?g|webp)$/i.test(file) && this.messenger.sendPhoto) await this.messenger.sendPhoto(this.config.owner, path.basename(file), bytes, preview);
-    else { if (preview) await this.say(preview); await this.messenger.sendFile(this.config.owner, path.basename(file), bytes); }
+    else { if (preview) await this.say(preview, true); await this.messenger.sendFile(this.config.owner, path.basename(file), bytes); }
   }
   async exportBackup(files = false): Promise<void> {
     const bytes = await this.backups.export(files);
@@ -570,9 +587,9 @@ export class Controller {
     else if (command === 'batch') {
       let batch = this.pendingBatches().find(b => b.manual);
       if (!batch) { batch = { id: randomUUID().slice(0, 8), project: d.project, chatKey: this.chatKey(), uploadIds: [], status: 'collecting', manual: true, updatedAt: new Date().toISOString() }; d.batches!.push(batch); await this.store.save(); }
-      await this.panel(`Batch open · ${batch.uploadIds.length} files. Send photos/documents, then your instructions or tap Process.`, [[button('Process batch', 'process ' + batch.id), button('Discard batch', 'discard ' + batch.id)], ...BACK]);
+      await this.panel(`Batch open · ${batch.uploadIds.length} files. Send photos/documents, then your instructions or tap Process.`, [[button('Process batch', 'process ' + batch.id), button('Discard batch', 'discard ' + batch.id)], ...BACK], 'batch-' + batch.id);
     } else if (command === 'process') await this.processBatches(this.pendingBatches().filter(b => !argument || b.id === argument));
-    else if (command === 'discard') { const b = this.pendingBatches().find(b => b.id === argument); if (b) { b.status = 'discarded'; await this.store.save(); } await this.panel('Batch discarded. Original uploaded files remain in the project.'); }
+    else if (command === 'discard') { const b = this.pendingBatches().find(b => b.id === argument); if (b) { b.status = 'discarded'; await this.store.save(); } await this.dismiss('batch-' + argument); await this.panel('Batch discarded. Original uploaded files remain in the project.'); await this.dismiss('controls', 3000); }
     else if (command === 'queue') {
       if (argument === 'pause' || argument === 'resume') { await this.automation.setPaused(argument === 'pause'); if (argument === 'resume') this.kick(); }
       const waiting = d.tasks!.filter(t => ['queued', 'running'].includes(t.status)); const recent = d.tasks!.filter(t => !['queued', 'running'].includes(t.status)).slice(-6).reverse();
@@ -594,7 +611,9 @@ export class Controller {
       if (command === 'trashmove') await this.sessions.trash(argument);
       else if (command === 'restore') await this.sessions.restore(argument);
       else await this.sessions.purge(argument);
+      await this.dismiss('session-delete-' + argument);
       await this.extraCommand('trash', '');
+      await this.dismiss('controls', 3000);
     } else if (command === 'purge') { const s = d.conversations!.find(s => s.id === argument && s.trashedAt); if (s) await this.panel(`Permanently delete “${sessionTitle(s)}” now? This removes its chat archive and SDK transcript. Project files, shared memory and lifetime usage stay. Existing exported backups are separate copies.`, [[button('Delete permanently', 'purgeconfirm ' + argument)], ...BACK]); }
     else if (command === 'trash') {
       const items = this.sessions.trashList();

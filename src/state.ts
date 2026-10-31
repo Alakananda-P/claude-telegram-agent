@@ -8,6 +8,7 @@ const identifier = z.string().regex(/^[a-zA-Z0-9_-]{1,100}$/);
 const projectId = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,47}$/);
 const isoDate = z.string().datetime();
 const automationState = z.object({
+  uiMessages: z.array(z.object({ id: z.number().int().positive(), chat: z.number().int().positive(), kind: z.enum(['panel', 'notice']), scope: z.string().max(150), createdAt: z.number().finite(), expiresAt: z.number().finite(), retryAt: z.number().finite().optional(), attempts: z.number().int().nonnegative().optional() })).optional(),
   tasks: z.array(z.object({ id: identifier, project: projectId, chatKey: identifier, kind: z.enum(['agent', 'reminder', 'backup']), status: z.enum(['queued', 'running', 'completed', 'failed', 'cancelled', 'interrupted']), prompt: z.string().min(1).max(30000), createdAt: isoDate, settings: z.custom(validSettings).optional() })).optional(),
   schedules: z.array(z.object({ id: identifier, project: projectId, name: z.string().min(1).max(80), prompt: z.string().min(1).max(10000), kind: z.enum(['agent', 'reminder', 'backup']), enabled: z.boolean(), nextRun: isoDate, timezone: z.string(), at: z.string().optional(), cron: z.string().optional(), intervalMinutes: z.number().int().positive().optional() }).refine(s => [s.at, s.cron, s.intervalMinutes].filter(v => v !== undefined).length === 1)).optional(),
   uploads: z.array(z.object({ id: identifier, project: projectId, chatKey: identifier, path: z.string().regex(/^uploads\/[a-zA-Z0-9._-]+$/), name: z.string(), photo: z.boolean(), receivedAt: isoDate, batchId: identifier })).optional(),
@@ -35,6 +36,7 @@ export interface State {
   memoryEnabled?: boolean;
   conversations?: Conversation[];
   visibleMessageIds?: number[];
+  uiMessages?: { id: number; chat: number; kind: 'panel' | 'notice'; scope: string; createdAt: number; expiresAt: number; retryAt?: number; attempts?: number }[];
   chatUiResetDone?: boolean;
   upgradeCheck?: { attempted: boolean; passed: boolean; actualSpeed?: string; checkId?: string };
   tasks?: Task[]; schedules?: Schedule[]; uploads?: Upload[]; batches?: Batch[]; queuePaused?: boolean;
