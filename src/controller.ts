@@ -12,7 +12,8 @@ import { button, BACK, HOME, type Buttons } from './ui.js';
 import { ChatArchive } from './chats.js';
 import { SessionCatalog, sessionTitle } from './sessions.js';
 import { TitleAccountingError, type TitleGenerator } from './titles.js';
-import { Automation, clockInfo, type Task, type Batch, type SteerRecord } from './automation.js';
+import { Automation, clockInfo, type Task, type Batch, type SteerRecord, type TelegramMessageContext } from './automation.js';
+import type { MessageListOptions, MessageDeletion } from './telegram.js';
 import { SteeringInput } from './steering.js';
 import { artifactSnapshot, changedArtifacts } from './artifacts.js';
 import { Backups } from './backup.js';
@@ -20,6 +21,9 @@ import { KeyPool } from './key-pool.js';
 import { Transcriber, TranscriptionError, type TranscriptionService } from './transcription.js';
 
 export interface Messenger {
+  listBotMessages?(chat: number, options?: MessageListOptions): unknown;
+  deleteBotMessages?(chat: number, ids: number[], signal?: AbortSignal): Promise<MessageDeletion>;
+  rememberBotReply?(chat: number, message: Message): Promise<boolean>;
   send(chat: number, text: string): Promise<void>;
   sendFile(chat: number, name: string, bytes: Uint8Array): Promise<void>;
   sendPhoto?(chat: number, name: string, bytes: Uint8Array, caption?: string): Promise<void>;
@@ -61,6 +65,7 @@ Voice notes run immediately as spoken instructions. Audio files, photos, videos,
 /batch — collect multiple files; /process — process the current batch
 /queue — saved tasks, schedules, pause/resume and explicit retry
 New text and voice messages steer your active conversation; no separate task is queued.
+Claude can use tools without slash commands, including removing its obsolete messages. Ask naturally or reply to an old bot message to identify it. Telegram deletion normally works within 48 hours and keeps saved chats, memory and files.
 /schedules — reminders and recurring tasks; ask Claude to create or edit them
 /clock — current India time; specify other timezones in your task
 /trash — restore deleted chats within 48 hours
@@ -68,8 +73,12 @@ New text and voice messages steer your active conversation; no separate task is 
 /health — Telegram, Claude, queue, storage and API recovery
 /keys — API key status, automatic checks and saved history`;
 
+function withMessageContext(text: string, context?: TelegramMessageContext): string {
+  return context?.replyToMessageId ? text + '\n\n[Telegram reply target: bot message ID ' + context.replyToMessageId + '. Inspect list_telegram_messages for its preview before acting.]' : text;
+}
+
 export class Controller {
-  private conversation?: { task: Task; input: SteeringInput; abort: AbortController; cwd: string; ready: Promise<void>; serial: Promise<void> };
+  private conversation?: { messageContext?: TelegramMessageContext; task: Task; input: SteeringInput; abort: AbortController; cwd: string; ready: Promise<void>; serial: Promise<void> };
   private running?: { abort: AbortController; done: Promise<void> };
   private shuttingDown = false;
   private persistenceFailed = false;
@@ -126,7 +135,7 @@ export class Controller {
     try {
       if (data === 'memory confirm-clear') {
         await this.panel('Clear shared memory? Saved conversations and files will stay.', [[button('Clear memory', 'memory clear')], ...BACK]);
-      } else await this.handle({ ...callback.message, from: callback.from, text: '/' + data, document: undefined, photo: undefined, video: undefined, video_note: undefined, animation: undefined, voice: undefined, audio: undefined, media_group_id: undefined, caption: undefined });
+      } else await this.handle({ ...callback.message, from: callback.from, text: '/' + data, reply_to_message: undefined, document: undefined, photo: undefined, video: undefined, video_note: undefined, animation: undefined, voice: undefined, audio: undefined, media_group_id: undefined, caption: undefined });
     } finally { this.panelId = undefined; }
   }
 
@@ -258,13 +267,15 @@ export class Controller {
       const ids = this.store.data.visibleMessageIds ??= [];
       if (!ids.includes(message.message_id)) { ids.push(message.message_id); await this.store.save(); }
     }
+    const messageContext: TelegramMessageContext = { beforeMessageId: message.message_id };
+    if (message.reply_to_message && await this.messenger.rememberBotReply?.(this.config.owner, message.reply_to_message)) messageContext.replyToMessageId = message.reply_to_message.message_id;
     const text = message.text?.trim() ?? '';
     const match = /^\/(\w+)(?:@\w+)?(?:\s+([\s\S]*))?$/.exec(text);
     const command = match?.[1]?.toLowerCase();
     const argument = match?.[2]?.trim() ?? '';
     if (command === 'start' || command === 'menu') return this.menu();
     if (command === 'help') return this.panel(HELP);
-    try { if (await this.extraCommand(command, argument)) return; }
+    try { if (await this.extraCommand(command, argument, messageContext)) return; }
     catch { return this.say('Could not complete that action. Check the selected item, storage and command. Existing data is kept.'); }
     if (command === 'rename' && !argument) return this.panel('Send /rename followed by the new title, or ask Claude to rename this chat.');
     if (command === 'sessionpage') return this.controls('session', Math.max(0, Math.floor(Number(argument) || 0)));
@@ -366,18 +377,18 @@ export class Controller {
         return;
       }
       if (command && command !== 'run') return this.say('Unknown command. Send /help, or /run followed by your task.');
-      if (message.document || message.photo?.length || message.video || message.video_note || message.animation || message.voice || message.audio) return this.receive(message, root);
+      if (message.document || message.photo?.length || message.video || message.video_note || message.animation || message.voice || message.audio) return this.receive(message, root, messageContext);
       const prompt = command === 'run' ? argument : text;
       if (!prompt) return this.say('Send a text task, photo, video or document. Use /help for commands.');
       const pending = this.pendingBatches();
-      if (pending.length) await this.processBatches(pending, prompt);
-      else await this.launch(prompt, root);
+      if (pending.length) await this.processBatches(pending, prompt, undefined, messageContext);
+      else await this.launch(prompt, root, prompt, undefined, undefined, messageContext);
     } catch {
       await this.say('Could not process this request. Check the command, file path/size and storage. No automatic retry was performed.');
     }
   }
 
-  private async launch(prompt: string, cwd: string, displayPrompt = prompt, voiceInput?: string, attachedFiles?: string[]): Promise<void> {
+  private async launch(prompt: string, cwd: string, displayPrompt = prompt, voiceInput?: string, attachedFiles?: string[], messageContext?: TelegramMessageContext): Promise<void> {
     await this.dismiss('controls');
     // claim() persists before execute() opens its inbox. Wait only for that small
     // startup window so rapid consecutive messages join the very first task.
@@ -386,14 +397,14 @@ export class Controller {
     if (active?.input.accepting && !active.abort.signal.aborted) {
       if (active.task.project !== this.store.data.project || this.resolveChat(active.task.chatKey) !== this.resolveChat(this.chatKey())) return this.say('Another saved chat is running. Stop it before starting work in this chat. Your message was not queued.');
       const release = active.input.reserve()!;
-      const record: SteerRecord = { id: randomUUID(), text: prompt, displayText: displayPrompt, voiceInput, attachedFiles, status: 'preparing' };
+      const record: SteerRecord = { messageContext, id: randomUUID(), text: prompt, displayText: displayPrompt, voiceInput, attachedFiles, status: 'preparing' };
       (active.task.steers ??= []).push(record);
       try { await this.store.save(); } catch (error) { release(); throw error; }
       this.prepareSteer(active, record, release);
       return;
     }
     if (this.store.data.queuePaused) return this.say('Processing is paused. Resume from /queue, then send your instruction. Your message was not queued.');
-    await this.automation.enqueue({ kind: 'agent', project: this.store.data.project, chatKey: this.chatKey(), prompt, displayPrompt, voiceInput, attachedFiles, settings: { ...this.settings }, interactive: true });
+    await this.automation.enqueue({ kind: 'agent', messageContext, project: this.store.data.project, chatKey: this.chatKey(), prompt, displayPrompt, voiceInput, attachedFiles, settings: { ...this.settings }, interactive: true });
     this.kick();
   }
 
@@ -415,7 +426,8 @@ export class Controller {
         record.archived = true;
       }
       await this.store.save();
-      active.input.add(record.text, record.displayText, record.id);
+      active.messageContext = record.messageContext;
+      active.input.add(withMessageContext(record.text, record.messageContext), record.displayText, record.id);
       record.status = 'sent'; await this.store.save();
     }).catch(async error => {
       record.status = 'failed'; await this.store.save().catch(() => { this.persistenceFailed = true; active.abort.abort(); });
@@ -452,7 +464,7 @@ export class Controller {
 
   private async execute(task: Task, cwd: string, abort: AbortController): Promise<void> {
     let ready!: () => void;
-    const active = { task, input: new SteeringInput(), abort, cwd, ready: new Promise<void>(resolve => { ready = resolve; }), serial: Promise.resolve() };
+    const active = { messageContext: task.messageContext, task, input: new SteeringInput(), abort, cwd, ready: new Promise<void>(resolve => { ready = resolve; }), serial: Promise.resolve() };
     this.conversation = active;
     for (const record of task.steers ?? []) this.prepareSteer(active, record, active.input.reserve()!);
     await this.dismiss('task-' + task.id);
@@ -529,9 +541,12 @@ export class Controller {
       ready();
       const selected = effectiveSettings(task.settings ?? this.settings);
       const prior = (await this.chats.read(originalKey)).slice(-30).map(t => `${t.role}: ${t.text}`).join('\n').slice(-24000);
-      const result = await this.runner.run({ prompt, cwd, session: this.store.data.conversations!.some(s => s.id === originalKey && !s.trashedAt) ? originalKey : undefined, resumeContext: prior,
+      const result = await this.runner.run({ prompt: withMessageContext(prompt, task.messageContext), cwd, session: this.store.data.conversations!.some(s => s.id === originalKey && !s.trashedAt) ? originalKey : undefined, resumeContext: prior,
         settings: selected, memoryEnabled: this.store.data.memoryEnabled !== false, sessions: this.sessions, steering: active.input,
-        workspace: { root: cwd, project, automation: this.automation, transcribe: async (file, language) => { progress = 'Transcribing audio…'; try { return await this.transcriber.transcribe(cwd, file, language, abort.signal); } finally { progress = 'Thinking…'; } }, deliver: async (file, preview) => { await this.deliver(cwd, file, preview); delivered.add(file.replace(/\\/g, '/')); }, backup: () => this.exportBackup() } }, async event => {
+        workspace: { root: cwd, project, telegram: this.messenger.listBotMessages && this.messenger.deleteBotMessages ? {
+          list: async a => this.messenger.listBotMessages!(this.config.owner, { limit: a.limit, messageId: a.message_id, beforeMessageId: a.include_current_task ? undefined : active.messageContext?.beforeMessageId, includeUi: a.include_ui }),
+          delete: ids => this.messenger.deleteBotMessages!(this.config.owner, ids, abort.signal)
+        } : undefined, automation: this.automation, transcribe: async (file, language) => { progress = 'Transcribing audio…'; try { return await this.transcriber.transcribe(cwd, file, language, abort.signal); } finally { progress = 'Thinking…'; } }, deliver: async (file, preview) => { await this.deliver(cwd, file, preview); delivered.add(file.replace(/\\/g, '/')); }, backup: () => this.exportBackup() } }, async event => {
         if (event.type === 'session') {
           await bind(event.id);
         } else if (event.type === 'commentary') {
@@ -612,7 +627,7 @@ export class Controller {
     }
     await this.say(text, false, 'uploads');
   }
-  private async receive(message: Message, root: string): Promise<void> {
+  private async receive(message: Message, root: string, messageContext: TelegramMessageContext): Promise<void> {
     const photo = message.photo?.slice().sort((a, b) => b.width * b.height - a.width * a.height)[0];
     const media = message.video ?? message.animation ?? message.video_note ?? message.voice ?? message.audio ?? message.document;
     const attachment = photo ?? media!;
@@ -650,22 +665,22 @@ export class Controller {
       await this.chats.append(this.resolveChat(batch.chatKey), { role: 'user', text: `Attachment: ${base}\nProject path: ${relative}`, file: { id: attachment.file_id, name: base } });
       await this.store.save(); success = true;
       await this.uploadReceipt();
-      if (message.voice) await this.processBatches(this.pendingBatches(), 'Voice instruction', relative);
-      else if (message.caption?.trim() && !batch.manual && !batch.groupId) await this.processBatches([batch], batch.prompt!);
+      if (message.voice) await this.processBatches(this.pendingBatches(), 'Voice instruction', relative, messageContext);
+      else if (message.caption?.trim() && !batch.manual && !batch.groupId) await this.processBatches([batch], batch.prompt!, undefined, messageContext);
     } catch {
       await this.say('Upload could not be accepted. Check file size/format and send it again. No processing started.');
     } finally {
       if (indicator !== undefined) await this.messenger.remove(this.config.owner, indicator).catch(() => this.messenger.edit(this.config.owner, indicator, success ? 'Received.' : 'Upload failed.').catch(() => {}));
     }
   }
-  private async processBatches(batches: Batch[], instruction?: string, voiceInput?: string): Promise<void> {
+  private async processBatches(batches: Batch[], instruction?: string, voiceInput?: string, messageContext?: TelegramMessageContext): Promise<void> {
     if (!batches.length || !batches.some(b => b.uploadIds.length)) return this.say('No files waiting in this chat. Send photos, videos or documents first.');
     if (this.store.data.queuePaused && !this.conversation?.input.accepting) return this.say('Processing is paused. Files are saved; resume from /queue, then send your instruction.');
     const ids = new Set(batches.flatMap(b => b.uploadIds));
     const files = this.store.data.uploads!.filter(u => ids.has(u.id));
     const prompt = instruction ?? (batches.map(b => b.prompt).filter(Boolean).join('\n') || 'Inspect these files. For bill photos, extract only clear values, check arithmetic, and ask about unclear fields with relevant crops. If the desired output is unclear, ask the owner.');
     for (const batch of batches) batch.status = 'queued';
-    await this.launch(prompt + '\n\nAttached project files:\n' + files.map(f => f.path).join('\n'), await this.workspace(batches[0].project), prompt + `\n[${files.length} attached files]`, voiceInput, voiceInput ? files.filter(f => f.path !== voiceInput).map(f => f.path) : undefined);
+    await this.launch(prompt + '\n\nAttached project files:\n' + files.map(f => f.path).join('\n'), await this.workspace(batches[0].project), prompt + `\n[${files.length} attached files]`, voiceInput, voiceInput ? files.filter(f => f.path !== voiceInput).map(f => f.path) : undefined, messageContext);
     for (const batch of batches) await this.dismiss('batch-' + batch.id);
     await this.uploadReceipt();
     await this.dismiss('controls');
@@ -684,7 +699,7 @@ export class Controller {
     (this.store.data.health ??= {}).lastBackupAt = new Date().toISOString(); await this.store.save();
     await this.say('Encrypted backup sent. Keep the private BACKUP_ENCRYPTION_KEY from your environment to restore it on another server. Restore by uploading this .ctab file. Secrets and lifetime usage are not imported or reset.');
   }
-  private async extraCommand(command: string | undefined, argument: string): Promise<boolean> {
+  private async extraCommand(command: string | undefined, argument: string, messageContext?: TelegramMessageContext): Promise<boolean> {
     if (command === 'keys' || command === 'keyhistory') {
       const [id, page] = argument.split(' ');
       const view = this.keys.panel(command === 'keyhistory' ? id : undefined, /^\d+$/.test(page ?? '') ? Number(page) : 0);
@@ -700,7 +715,7 @@ export class Controller {
       await this.panel(`Batch open · ${count} files waiting in this chat. Send photos/videos/documents, then your instructions or tap Process.`, [
         [button('Process waiting files', 'process')],
         ...pending.map((b, i) => [button(`Discard batch ${i + 1} · ${b.uploadIds.length} files`, 'discard ' + b.id)]), ...BACK], 'batch-' + batch.id);
-    } else if (command === 'process') await this.processBatches(this.pendingBatches().filter(b => !argument || b.id === argument));
+    } else if (command === 'process') await this.processBatches(this.pendingBatches().filter(b => !argument || b.id === argument), undefined, undefined, messageContext);
     else if (command === 'discard') { const b = this.pendingBatches().find(b => b.id === argument); if (b) { b.status = 'discarded'; await this.store.save(); } await this.dismiss('batch-' + argument); await this.uploadReceipt(); await this.panel('Batch discarded. Original uploaded files remain in the project.'); await this.dismiss('controls', 3000); }
     else if (command === 'queue') {
       if (argument === 'pause' || argument === 'resume') { await this.automation.setPaused(argument === 'pause'); if (argument === 'resume') this.kick(); }

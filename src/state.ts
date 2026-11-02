@@ -8,11 +8,13 @@ import { keyRecordSchema, type KeyRecord } from './key-pool.js';
 const identifier = z.string().regex(/^[a-zA-Z0-9_-]{1,100}$/);
 const projectId = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,47}$/);
 const isoDate = z.string().datetime();
+const messageContext = z.object({ beforeMessageId: z.number().int().positive().optional(), replyToMessageId: z.number().int().positive().optional() }).optional();
 const automationState = z.object({
+  botMessages: z.array(z.object({ id: z.number().int().positive(), chat: z.number().int().positive(), sentAt: z.number().finite().nonnegative(), preview: z.string().max(1000), kind: z.string().max(32) })).max(2000).optional(),
   transcriptionUsage: z.object({ completedRequests: z.number().int().nonnegative(), seconds: z.number().nonnegative(), cachedRequests: z.number().int().nonnegative(), lastSuccessAt: isoDate.optional() }).optional(),
   keyRecords: z.record(z.string().regex(/^[a-f0-9]{16}$/), keyRecordSchema).optional(),
   uiMessages: z.array(z.object({ id: z.number().int().positive(), chat: z.number().int().positive(), kind: z.enum(['panel', 'notice']), scope: z.string().max(150), createdAt: z.number().finite(), expiresAt: z.number().finite(), retryAt: z.number().finite().optional(), attempts: z.number().int().nonnegative().optional() })).optional(),
-  tasks: z.array(z.object({ id: identifier, project: projectId, chatKey: identifier, kind: z.enum(['agent', 'reminder', 'backup']), status: z.enum(['queued', 'running', 'completed', 'failed', 'cancelled', 'interrupted']), prompt: z.string().min(1).max(30000), createdAt: isoDate, settings: z.custom(validSettings).optional(), steers: z.array(z.object({ id: identifier, text: z.string().min(1).max(30000), displayText: z.string().max(30000), status: z.enum(['preparing', 'sent', 'answered', 'failed']), voiceInput: z.string().regex(/^uploads\/[a-zA-Z0-9._-]+$/).optional(), attachedFiles: z.array(z.string().regex(/^uploads\/[a-zA-Z0-9._-]+$/)).optional(), archived: z.boolean().optional() })).optional(), voiceInput: z.string().regex(/^uploads\/[a-zA-Z0-9._-]+$/).optional(), attachedFiles: z.array(z.string().regex(/^uploads\/[a-zA-Z0-9._-]+$/)).optional() })).optional(),
+  tasks: z.array(z.object({ messageContext, id: identifier, project: projectId, chatKey: identifier, kind: z.enum(['agent', 'reminder', 'backup']), status: z.enum(['queued', 'running', 'completed', 'failed', 'cancelled', 'interrupted']), prompt: z.string().min(1).max(30000), createdAt: isoDate, settings: z.custom(validSettings).optional(), steers: z.array(z.object({ messageContext, id: identifier, text: z.string().min(1).max(30000), displayText: z.string().max(30000), status: z.enum(['preparing', 'sent', 'answered', 'failed']), voiceInput: z.string().regex(/^uploads\/[a-zA-Z0-9._-]+$/).optional(), attachedFiles: z.array(z.string().regex(/^uploads\/[a-zA-Z0-9._-]+$/)).optional(), archived: z.boolean().optional() })).optional(), voiceInput: z.string().regex(/^uploads\/[a-zA-Z0-9._-]+$/).optional(), attachedFiles: z.array(z.string().regex(/^uploads\/[a-zA-Z0-9._-]+$/)).optional() })).optional(),
   schedules: z.array(z.object({ id: identifier, project: projectId, name: z.string().min(1).max(80), prompt: z.string().min(1).max(10000), kind: z.enum(['agent', 'reminder', 'backup']), enabled: z.boolean(), nextRun: isoDate, timezone: z.string(), at: z.string().optional(), cron: z.string().optional(), intervalMinutes: z.number().int().positive().optional() }).refine(s => [s.at, s.cron, s.intervalMinutes].filter(v => v !== undefined).length === 1)).optional(),
   uploads: z.array(z.object({ id: identifier, project: projectId, chatKey: identifier, path: z.string().regex(/^uploads\/[a-zA-Z0-9._-]+$/), name: z.string(), photo: z.boolean(), mediaType: z.enum(['video', 'animation', 'audio', 'voice']).optional(), receivedAt: isoDate, batchId: identifier })).optional(),
   batches: z.array(z.object({ id: identifier, project: projectId, chatKey: identifier, uploadIds: z.array(identifier), status: z.enum(['collecting', 'queued', 'discarded']), updatedAt: isoDate })).optional(),
@@ -31,6 +33,7 @@ export interface Conversation {
   trashedAt?: string; purgeAt?: string;
 }
 export interface State {
+  botMessages?: { id: number; chat: number; sentAt: number; preview: string; kind: string }[];
   transcriptionUsage?: { completedRequests: number; seconds: number; cachedRequests: number; lastSuccessAt?: string };
   keyRecords?: Record<string, KeyRecord>;
   version: 1; offset: number; project: string; sessions: Record<string, string>;

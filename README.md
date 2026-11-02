@@ -406,3 +406,9 @@ audit, Docker build, and a dummy-key no-network container startup check.
 - [Render background workers](https://render.com/docs/background-workers)
 - [Persistent disks](https://render.com/docs/disks)
 - [Blueprint reference](https://render.com/docs/blueprint-spec)
+
+### Natural Telegram message cleanup
+
+Claude can choose its available tools without slash commands, including `list_telegram_messages` and `delete_telegram_messages`. It can remove its obsolete/redundant progress messages when useful and follow requests such as “remove your last two replies”. Useful answers and delivered files stay by default. The catalogue contains verified outgoing bot messages, with redacted previews, and survives restarts. “Last replies” excludes current-task replies and temporary UI by default; the model can explicitly include them for cleanup.
+
+To identify a message sent before tracking was installed (or outside the bounded 2,000-record catalogue), reply to that bot message in Telegram. Only this bot's messages in the owner's private chat can be targeted. Deletion normally requires messages younger than 48 hours; failures and already-missing messages are reported separately. Removing a Telegram bubble does not erase saved sessions, shared memory or project files. No standalone message-deletion command is required.

@@ -1,5 +1,5 @@
 import { setTimeout as delay } from 'node:timers/promises';
-import { chunks, redact } from './safety.js';
+import { chunks, redact, type Message } from './safety.js';
 import type { Buttons } from './ui.js';
 import type { StateStore } from './state.js';
 import { Agent, fetch, FormData } from 'undici';
@@ -13,8 +13,11 @@ export function createTelegramDispatcher(lookup?: LookupFunction): Agent {
 const telegramDispatcher = createTelegramDispatcher();
 
 export class TelegramError extends Error {
-  constructor(public code: number, public retryAfter = 0, public unchanged = false, public networkCode?: string) { super(`Telegram request failed (status ${code}).`); }
+  constructor(public code: number, public retryAfter = 0, public unchanged = false, public networkCode?: string, public messageMissing = false) { super(`Telegram request failed (status ${code}).`); }
 }
+
+export interface MessageListOptions { limit?: number; beforeMessageId?: number; messageId?: number; includeUi?: boolean }
+export interface MessageDeletion { deleted: number[]; alreadyMissing: number[]; failed: { id: number; reason: string }[] }
 
 function networkCode(error: unknown): string {
   const e = error as { name?: string; cause?: { code?: string } };
@@ -41,11 +44,19 @@ export class Telegram {
         ok: boolean; result?: T; error_code?: number; description?: string; parameters?: { retry_after?: number };
       };
       if (response.ok && body.ok) {
-        const sent = body.result as { message_id?: number } | undefined;
+        const sent = body.result as { message_id?: number; date?: number; text?: string; caption?: string; document?: { file_name?: string }; chat?: { id: number } } | undefined;
         if (this.timeline && method.startsWith('send') && sent?.message_id) {
           const ids = this.timeline.data.visibleMessageIds ??= [];
           if (!ids.includes(sent.message_id)) ids.push(sent.message_id);
+          const chat = Number(sent.chat?.id ?? (form ? (payload as FormData).get('chat_id') : (payload as Record<string, unknown>).chat_id));
+          const preview = sent.text ?? sent.caption ?? (sent.document?.file_name ? '[File: ' + sent.document.file_name + ']' : undefined) ?? String(form ? (payload as FormData).get('caption') ?? '' : (payload as Record<string, unknown>).text ?? (payload as Record<string, unknown>).caption ?? '');
+          this.rememberSent(chat, sent.message_id, preview, sent.date ? sent.date * 1000 : Date.now(), method.slice(4).toLowerCase());
           await this.timeline.save();
+        }
+        if (this.timeline && method === 'editMessageText' && !form) {
+          const p = payload as Record<string, unknown>;
+          const record = this.timeline.data.botMessages?.find(m => m.chat === Number(p.chat_id) && m.id === Number(p.message_id));
+          if (record) { record.preview = redact(String(p.text ?? ''), [this.token, ...this.secrets]).slice(0, 1000); await this.timeline.save(); }
         }
         return body.result as T;
       }
@@ -56,7 +67,7 @@ export class Telegram {
         await delay(retryAfter * 1000, undefined, { signal });
         continue;
       }
-      throw new TelegramError(code, retryAfter, code === 400 && /message is not modified/i.test(body.description ?? ''));
+      throw new TelegramError(code, retryAfter, code === 400 && /message is not modified/i.test(body.description ?? ''), undefined, code === 400 && /message to delete not found/i.test(body.description ?? ''));
     }
     throw new TelegramError(429);
   }
@@ -78,9 +89,49 @@ export class Telegram {
     await this.call('editMessageText', { chat_id: chat, message_id: id, text: redact(text, [this.token, ...this.secrets]) });
   }
 
-  async remove(chat: number, id: number): Promise<void> {
-    await this.call('deleteMessage', { chat_id: chat, message_id: id });
+  async remove(chat: number, id: number, signal?: AbortSignal): Promise<void> {
+    await this.call('deleteMessage', { chat_id: chat, message_id: id }, signal);
     await this.forgetUi(chat, id, true);
+  }
+
+  private rememberSent(chat: number, id: number, preview: string, sentAt: number, kind: string): void {
+    if (!this.timeline || !Number.isSafeInteger(chat) || chat <= 0 || !Number.isSafeInteger(id) || id <= 0) return;
+    const records = this.timeline.data.botMessages ??= [];
+    if (!records.some(m => m.chat === chat && m.id === id)) records.push({ id, chat, sentAt, preview: redact(preview, [this.token, ...this.secrets]).slice(0, 1000), kind });
+    this.timeline.data.botMessages = records.slice(-2000);
+  }
+
+  async rememberBotReply(chat: number, message: Message): Promise<boolean> {
+    if (!this.timeline || message.from?.id !== Number(this.token.split(':')[0]) || message.chat.id !== chat || message.chat.type !== 'private' || !Number.isSafeInteger(message.message_id) || message.message_id! <= 0 || !Number.isSafeInteger(message.date) || message.date! <= 0) return false;
+    this.rememberSent(chat, message.message_id!, message.text ?? message.caption ?? '[Bot attachment]', message.date! * 1000, message.text ? 'message' : 'attachment');
+    const ids = this.timeline.data.visibleMessageIds ??= []; if (!ids.includes(message.message_id!)) ids.push(message.message_id!);
+    await this.timeline.save(); return true;
+  }
+
+  listBotMessages(chat: number, options: MessageListOptions = {}) {
+    const visible = new Set(this.timeline?.data.visibleMessageIds ?? []);
+    const ui = new Set([...(this.timeline?.data.uiMessages ?? []).filter(m => m.chat === chat).map(m => m.id), ...(this.timeline?.data.indicatorIds ?? [])]);
+    const records = (this.timeline?.data.botMessages ?? []).filter(m => m.chat === chat && visible.has(m.id) && (options.messageId === undefined || m.id === options.messageId) && (options.beforeMessageId === undefined || m.id < options.beforeMessageId) && (options.includeUi || !ui.has(m.id))).sort((a, b) => b.id - a.id);
+    return { messages: records.slice(0, Math.max(1, Math.min(50, options.limit ?? 20))).map(({ chat: _chat, ...m }) => ({ ...m, deletable: Date.now() - m.sentAt < 48 * 3600000 })), total: records.length,
+      note: 'Only verified outgoing bot messages are listed. Telegram deletion normally requires age under 48 hours. Reply to an older unlisted bot message to identify it. Saved sessions and memory are separate.' };
+  }
+
+  async deleteBotMessages(chat: number, ids: number[], signal?: AbortSignal): Promise<MessageDeletion> {
+    if (!ids.length || ids.length > 20 || ids.some(id => !Number.isSafeInteger(id) || id <= 0)) throw new Error('Choose 1-20 valid message IDs from list_telegram_messages.');
+    const result: MessageDeletion = { deleted: [], alreadyMissing: [], failed: [] };
+    for (const id of new Set(ids)) {
+      signal?.throwIfAborted();
+      const record = this.timeline?.data.botMessages?.find(m => m.chat === chat && m.id === id);
+      if (!record) { result.failed.push({ id, reason: 'untracked_or_not_owned' }); continue; }
+      if (Date.now() - record.sentAt >= 48 * 3600000) { result.failed.push({ id, reason: 'too_old' }); continue; }
+      try { await this.remove(chat, id, signal); result.deleted.push(id); }
+      catch (error) {
+        signal?.throwIfAborted();
+        if (error instanceof TelegramError && error.messageMissing) { await this.forgetUi(chat, id, true); result.alreadyMissing.push(id); }
+        else result.failed.push({ id, reason: error instanceof TelegramError && error.code >= 400 && error.code < 500 ? 'telegram_rejected' : 'unconfirmed' });
+      }
+    }
+    return result;
   }
 
   async typing(chat: number): Promise<void> { await this.call('sendChatAction', { chat_id: chat, action: 'typing' }); }
@@ -123,6 +174,7 @@ export class Telegram {
     if (!this.timeline) return;
     this.timeline.data.uiMessages = this.timeline.data.uiMessages?.filter(m => m.chat !== chat || m.id !== id);
     if (deleted) this.timeline.data.visibleMessageIds = this.timeline.data.visibleMessageIds?.filter(m => m !== id);
+    if (deleted) this.timeline.data.botMessages = this.timeline.data.botMessages?.filter(m => m.chat !== chat || m.id !== id);
     await this.timeline.save();
   }
   async notice(chat: number, text: string, scope = 'notices', ttlMs = 300000): Promise<void> {
@@ -186,6 +238,7 @@ export class Telegram {
       }
     }
     this.timeline.data.visibleMessageIds = remaining;
+    this.timeline.data.botMessages = this.timeline.data.botMessages?.filter(m => m.chat !== chat || remaining.includes(m.id));
     this.timeline.data.uiMessages = this.timeline.data.uiMessages?.filter(m => remaining.includes(m.id));
     await this.timeline.save();
     return remaining.length === 0;

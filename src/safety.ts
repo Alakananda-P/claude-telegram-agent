@@ -6,7 +6,9 @@ interface TelegramVideo extends TelegramFile { width?: number; height?: number; 
 
 export interface Message {
   message_id?: number;
-  from?: { id: number };
+  date?: number;
+  from?: { id: number; is_bot?: boolean };
+  reply_to_message?: Message;
   chat: { id: number; type: string };
   text?: string; caption?: string;
   document?: TelegramFile;

@@ -462,3 +462,33 @@ test('memory survives new chats and project switches; OFF reaches the runner', a
   await bot.handle(message('/memory clear'));
   assert.ok(!replies.at(-1)!.includes('Answer in Hindi'));
 });
+
+
+test('message tools bind to the owner and keep reply targets and last-message cutoff across text and voice steering', async () => {
+  let began!: () => void, release!: () => void; const started = new Promise<void>(r => { began = r; }); const wait = new Promise<void>(r => { release = r; });
+  let request!: AgentRequest;
+  const { bot, sender, store } = await setup({ async run(r) { request = r; began(); await wait; return { session: 'message-tools', text: 'Done', cumulativeCost: 0 }; } }, { async transcribe() { return speech; } });
+  const lists: unknown[] = [], deletes: unknown[] = [], adopted: number[] = [];
+  Object.assign(sender, {
+    async rememberBotReply(_chat: number, m: Message) { adopted.push(m.message_id!); return true; },
+    listBotMessages(chat: number, options: unknown) { lists.push({ chat, options }); return { messages: [], total: 0 }; },
+    async deleteBotMessages(chat: number, ids: number[], signal: AbortSignal) { deletes.push({ chat, ids }); assert.equal(signal.aborted, false); return { deleted: ids, alreadyMissing: [], failed: [] }; }
+  });
+  const target: Message = { ...message('Old status'), message_id: 45, from: { id: 123456 }, date: Math.floor(Date.now() / 1000) };
+  try {
+    await bot.handle({ ...message('Remove this obsolete reply'), message_id: 50, reply_to_message: target }); await started;
+    assert.match(request.prompt, /Telegram reply target: bot message ID 45/);
+    await request.workspace!.telegram!.list({ limit: 2 });
+    assert.deepEqual(lists[0], { chat: 123, options: { limit: 2, messageId: undefined, beforeMessageId: 50, includeUi: undefined } });
+    await request.workspace!.telegram!.delete([45]); assert.deepEqual(deletes, [{ chat: 123, ids: [45] }]);
+    await bot.handle({ ...voice(), message_id: 70, reply_to_message: { ...target, message_id: 65 } });
+    await request.steering!.settled(new AbortController().signal);
+    assert.match(request.steering!.messages[0].text, /Telegram reply target: bot message ID 65/);
+    await request.workspace!.telegram!.list({ limit: 2 });
+    assert.deepEqual(lists[1], { chat: 123, options: { limit: 2, messageId: undefined, beforeMessageId: 70, includeUi: undefined } });
+    await request.workspace!.telegram!.list({ include_current_task: true });
+    assert.deepEqual(lists[2], { chat: 123, options: { limit: undefined, messageId: undefined, beforeMessageId: undefined, includeUi: undefined } });
+    await bot.handle({ ...message('Remove it'), from: { id: 666 }, reply_to_message: target }); assert.deepEqual(adopted, [45, 65]);
+  } finally { release(); await bot.idle(); }
+  const saved = await StateStore.open(store.file); assert.equal(saved.data.tasks![0].messageContext!.replyToMessageId, 45); assert.equal(saved.data.tasks![0].steers![0].messageContext!.replyToMessageId, 65);
+});
