@@ -4,12 +4,15 @@ import type { StateStore } from './state.js';
 import type { AgentSettings } from './settings.js';
 import { projectName } from './safety.js';
 
+export interface SteerRecord { id: string; text: string; displayText: string; voiceInput?: string; attachedFiles?: string[]; status: 'preparing' | 'sent' | 'answered' | 'failed'; archived?: boolean }
+
 export interface Task {
   id: string; kind: 'agent' | 'reminder' | 'backup'; project: string; chatKey: string; prompt: string;
   status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted';
   createdAt: string; startedAt?: string; finishedAt?: string; scheduleId?: string; occurrence?: string;
   interactive?: boolean; settings?: AgentSettings; displayPrompt?: string;
   voiceInput?: string; attachedFiles?: string[];
+  steers?: SteerRecord[];
 }
 export interface Schedule {
   id: string; name: string; kind: Task['kind']; prompt: string; project: string; timezone: string;
@@ -68,7 +71,7 @@ export class Automation {
     const task = this.store.data.tasks!.find(t => t.id === id);
     if (!task || !['failed', 'interrupted', 'cancelled'].includes(task.status)) throw new Error('Choose a failed or interrupted task.');
     if (task.prompt === '[Deleted session]') throw new Error('This task belongs to a permanently deleted chat.');
-    return this.enqueue({ kind: task.kind, project: task.project, chatKey: task.chatKey, prompt: task.prompt, displayPrompt: task.displayPrompt, voiceInput: task.voiceInput, attachedFiles: task.attachedFiles, interactive: task.interactive, settings: task.settings });
+    return this.enqueue({ kind: task.kind, project: task.project, chatKey: task.chatKey, prompt: task.prompt, displayPrompt: task.displayPrompt, voiceInput: task.voiceInput, attachedFiles: task.attachedFiles, steers: task.steers?.map(s => ({ ...s, id: randomUUID(), status: 'preparing' })), interactive: task.interactive, settings: task.settings });
   }
   async prioritize(id: string): Promise<void> {
     const list = this.store.data.tasks!; const i = list.findIndex(t => t.id === id && t.status === 'queued');

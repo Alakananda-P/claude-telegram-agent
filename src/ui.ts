@@ -7,7 +7,7 @@ export const HOME: Buttons = [
   [button('📝 Memory', 'memory'), button('📁 Projects', 'projects')],
   [button('📊 Tokens', 'token count'), button('💵 Cost', 'cost')],
   [button('📎 Files', 'files'), button('ℹ️ Status', 'status')],
-  [button('📷 Photo batch', 'batch'), button('📋 Task queue', 'queue')],
+  [button('📷 Photo batch', 'batch'), button('📋 Tasks & retries', 'queue')],
   [button('⏰ Schedules', 'schedules'), button('🗑 Trash', 'trash')],
   [button('💾 Backups', 'backup'), button('🩺 Health', 'health')],
   [button('🔑 Key status', 'keys')],

@@ -5,6 +5,13 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { ChatArchive } from '../src/chats.js';
 
+test('session binding and simultaneous steering preserve conversation order', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'tg-bind-steer-')); const chats = new ChatArchive(dir, []);
+  await chats.append('draft-default', { role: 'user', text: 'Original request' });
+  await Promise.all([chats.bind('draft-default', 'new-session'), chats.append('new-session', { role: 'user', text: 'Correction during initialization' })]);
+  assert.deepEqual((await chats.read('new-session')).map(t => t.text), ['Original request', 'Correction during initialization']);
+});
+
 test('chat archives retain turns across fresh chats, session binding and restart', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'tg-chats-'));
   const chats = new ChatArchive(dir, ['private-secret']);

@@ -17,6 +17,19 @@ API-key setup.
 
 ## What it does
 
+- Live steering is always on. While Claude works, new owner text and transcribed
+  voice instructions join the active conversation instead of creating separate
+  queued jobs. Pending attachments accompany the next instruction. The SDK reads
+  updates at its next tool boundary; a message arriving after a turn ends continues
+  in the same session. Long tool calls can delay pickup. Other projects stay isolated.
+- Claude's ordinary assistant progress messages appear during substantial work and
+  stay in the chat archive. Hidden thinking and subagent text are not forwarded.
+  The temporary activity indicator refreshes with elapsed time while a tool runs,
+  then disappears. Final text already shown is not sent twice.
+- Steering messages are saved before delivery. Stop cancels pending input and voice
+  processing; interrupted tasks require explicit retry. Explicitly paused processing
+  never silently queues new chat messages. Scheduled jobs retain their durable queue.
+
 - Voice notes automatically become instructions: ElevenLabs Scribe v2 transcribes
   them before Claude runs. Pending photos/files accompany the spoken instruction.
   Audio files and videos still wait for a caption/text task; recorded speech inside

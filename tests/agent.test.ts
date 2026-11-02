@@ -10,8 +10,25 @@ import { StateStore } from '../src/state.js';
 import { ChatArchive } from '../src/chats.js';
 import { SessionCatalog, SESSION_TOOL_NAMES } from '../src/sessions.js';
 import { MEMORY_TOOL_NAMES } from '../src/memory-tools.js';
+import { SteeringInput } from '../src/steering.js';
 
 const config = loadConfig({ TELEGRAM_BOT_TOKEN: '123456:abcdefghijklmnopqrstuvw', TELEGRAM_OWNER_ID: '123', ANTHROPIC_API_KEY: 'test-only-not-real' });
+
+test('runner uses an open input stream for conversational steering', async () => {
+  const make: QueryFactory = ({ prompt }) => {
+    assert.notEqual(typeof prompt, 'string');
+    return { async *[Symbol.asyncIterator]() { yield init as SDKMessage; yield result as unknown as SDKMessage; }, close() {} };
+  };
+  await new ClaudeRunner(config, make).run({ prompt: 'Hello', cwd: '/work' }, () => {}, new AbortController());
+});
+
+test('ordinary assistant progress is emitted while raw reasoning and subagent text stay private', async () => {
+  const events: AgentEvent[] = [];
+  const assistant = { type: 'assistant', uuid: 'msg-1', session_id: 'session-1', parent_tool_use_id: null, message: { id: 'msg-1', model: config.model, content: [{ type: 'thinking', thinking: 'PRIVATE REASONING' }, { type: 'text', text: 'I found the totals; checking the dates next.' }, { type: 'tool_use', name: 'Read', id: 'tool-1', input: {} }] } };
+  await new ClaudeRunner(config, factory([init, assistant, assistant, { ...assistant, parent_tool_use_id: 'subagent' }, result])).run({ prompt: 'Check bills', cwd: '/work' }, e => { events.push(e); }, new AbortController());
+  assert.equal(events.filter(e => e.type === 'commentary').length, 1);
+  assert.ok(JSON.stringify(events).includes('checking the dates')); assert.ok(!JSON.stringify(events).includes('PRIVATE REASONING'));
+});
 const init = { type: 'system', subtype: 'init', model: 'claude-opus-5-5', permissionMode: 'auto', effort: 'high', fast_mode_state: 'on',
   session_id: 'session-1', uuid: 'uuid-1', apiKeySource: 'env', claude_code_version: '2.1.314', cwd: '/work',
   tools: ['Bash', 'Read', 'Edit', 'Write'], mcp_servers: [], slash_commands: [], output_style: 'default', skills: [], plugins: [] };
@@ -27,6 +44,29 @@ function factory(messages: unknown[], capture: (o: Options) => void = () => {}):
     return { async *[Symbol.asyncIterator]() { for (const m of messages) yield m as SDKMessage; }, close() {} };
   };
 }
+
+test('late steering survives the first result and finishes in the same SDK conversation', async () => {
+  const steering = new SteeringInput(); let sends = 0; let closed = 0; const events: AgentEvent[] = [];
+  const make: QueryFactory = ({ prompt }) => ({ async *[Symbol.asyncIterator]() {
+    assert.notEqual(typeof prompt, 'string'); const incoming = (prompt as AsyncIterable<import('@anthropic-ai/claude-agent-sdk').SDKUserMessage>)[Symbol.asyncIterator]();
+    const first = (await incoming.next()).value!; sends++; yield init as SDKMessage;
+    const release = steering.reserve(); assert.ok(release);
+    const update = steering.add('Use CSV instead'); release();
+    yield { ...result, user_message_uuids: [first.uuid], queued_turn_count: 1 } as unknown as SDKMessage;
+    const second = (await incoming.next()).value!; sends++; assert.equal(second.uuid, update.id); assert.equal(second.priority, 'next');
+    yield { ...result, uuid: 'result-two', result: 'CSV ready', user_message_uuids: [second.uuid], total_cost_usd: 0.15, queued_turn_count: 0 } as unknown as SDKMessage;
+  }, close() { closed++; } });
+  const output = await new ClaudeRunner(config, make).run({ prompt: 'Make Excel', cwd: '/work', steering }, e => { events.push(e); }, new AbortController());
+  assert.equal(output.text, 'CSV ready'); assert.equal(sends, 2); assert.equal(closed, 1); assert.equal(steering.messages[0].answered, true);
+  assert.deepEqual(events.filter(e => e.type === 'usage').map(e => e.cost), [0.1, 0.15]);
+});
+
+test('a failed input preparation racing with the last result cannot leave the conversation open', async () => {
+  const steering = new SteeringInput(); const settled = steering.settled.bind(steering); let raced = false;
+  steering.settled = async signal => { await settled(signal); if (!raced) { raced = true; queueMicrotask(() => { const release = steering.reserve()!; setTimeout(release, 10); }); } };
+  await new ClaudeRunner(config, factory([init, result])).run({ prompt: 'Task', cwd: '/work', steering }, () => {}, new AbortController());
+  assert.equal(steering.accepting, false);
+});
 
 test('runner passes exact requested settings, resume, limits and a filtered child environment', async () => {
   const events: AgentEvent[] = [];

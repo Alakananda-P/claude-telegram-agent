@@ -34,11 +34,13 @@ export class ChatArchive {
   }
   async bind(from: string, to: string): Promise<void> {
     if (from === to) return;
-    await this.writing;
-    const existing = await this.read(to);
-    const incoming = await this.read(from);
-    if (incoming.length) await this.write(to, [...existing, ...incoming]);
-    if (from.startsWith('draft-')) await unlink(this.file(from)).catch(e => { if (e.code !== 'ENOENT') throw e; });
+    const task = this.writing.then(async () => {
+      const existing = await this.read(to);
+      const incoming = await this.read(from);
+      if (incoming.length) await this.write(to, [...existing, ...incoming]);
+      if (from.startsWith('draft-')) await unlink(this.file(from)).catch(e => { if (e.code !== 'ENOENT') throw e; });
+    });
+    this.writing = task.catch(() => {}); await task;
   }
   async resetDraft(project: string): Promise<void> { await this.writing; await unlink(this.file('draft-' + project)).catch(e => { if (e.code !== 'ENOENT') throw e; }); }
   async purge(id: string, transcriptRoot?: string): Promise<void> {

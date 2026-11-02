@@ -8,6 +8,7 @@ import { ResilientRunner } from '../src/recovery.js';
 import { AgentApiError, type AgentRequest, type Runner } from '../src/agent.js';
 import { loadConfig } from '../src/config.js';
 import { StateStore } from '../src/state.js';
+import { SteeringInput } from '../src/steering.js';
 
 async function setup(factory: (key: string) => Runner) {
   const dir = await mkdtemp(path.join(tmpdir(), 'tg-recovery-'));
@@ -32,6 +33,16 @@ test('no automatic replay after tools or output have started', async () => {
   const { runner } = await setup(() => ({ async run(_r, emit) { calls++; await emit({ type: 'effect' }); throw new AgentApiError('authentication_failed', 'Rejected'); } }));
   await assert.rejects(runner.run({ prompt: 'Pay invoice', cwd: '.' }, () => {}, new AbortController()), /no automatic replay/i);
   assert.equal(calls, 1);
+});
+
+test('pre-effect key recovery retains steering input for the fresh attempt', async () => {
+  const steering = new SteeringInput(); const update = steering.add('Use the corrected date'); const received: string[] = [];
+  const { runner } = await setup(key => ({ async run(request, _emit, abort) {
+    const input = request.steering!.stream(request.prompt, abort.signal); await input.next(); const next = (await input.next()).value!; received.push(next.uuid!); await input.return(undefined);
+    if (key.endsWith('primary')) throw new AgentApiError('billing_error', 'No credits');
+    steering.acknowledge([update.id]); steering.finish(); return { session: 'recovered', text: 'Corrected', cumulativeCost: 0 };
+  } }));
+  await runner.run({ prompt: 'Process bill', cwd: '.', steering }, () => {}, new AbortController()); assert.deepEqual(received, [update.id, update.id]);
 });
 test('rate limits retry the same key once and never rotate keys', async () => {
   const calls: string[] = [];

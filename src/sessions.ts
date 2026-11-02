@@ -75,7 +75,7 @@ export class SessionCatalog {
     await this.store.save();
     const related = this.relatedKeys(id);
     await this.chats.purge(id, this.transcriptRoot);
-    for (const task of this.store.data.tasks ?? []) if (related.has(task.chatKey)) { task.prompt = '[Deleted session]'; delete task.displayPrompt; delete task.voiceInput; delete task.attachedFiles; }
+    for (const task of this.store.data.tasks ?? []) if (related.has(task.chatKey)) { task.prompt = '[Deleted session]'; delete task.displayPrompt; delete task.voiceInput; delete task.attachedFiles; delete task.steers; }
     this.store.data.conversations = this.store.data.conversations!.filter(s => s.id !== id);
     for (const [key, value] of Object.entries(this.store.data.bindings ?? {})) if (related.has(value)) delete this.store.data.bindings![key];
     await this.store.save();

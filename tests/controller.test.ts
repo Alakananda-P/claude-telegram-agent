@@ -89,11 +89,11 @@ test('Stop aborts transcription and never starts Claude', async () => {
   assert.equal(calls.length, 0); assert.equal(store.data.tasks![0].status, 'cancelled'); assert.ok(deleted.length);
 });
 
-test('queued voice metadata survives state reload and retry without corrupting old sessions', async () => {
+test('explicitly paused processing retains voice uploads without queueing new messages', async () => {
   const { bot, store } = await setup(); await bot.automation.setPaused(true);
   await bot.handle(voice()); const saved = await StateStore.open(store.file);
-  assert.equal(saved.data.uploads![0].mediaType, 'voice'); assert.ok(saved.data.tasks![0].voiceInput?.endsWith('voice.ogg'));
-  assert.equal(saved.data.tasks![0].status, 'queued'); assert.deepEqual(saved.data.tasks![0].attachedFiles, []);
+  assert.equal(saved.data.uploads![0].mediaType, 'voice'); assert.equal(saved.data.tasks!.length, 0);
+  assert.equal(saved.data.batches![0].status, 'collecting');
 });
 
 test('unauthorized messages do not produce replies, uploads or jobs', async () => {
@@ -192,12 +192,49 @@ test('download failure shows failure and creates no false upload or job', async 
   await bot.handle(photo('broken'));
   assert.equal(store.data.uploads!.length, 0); assert.equal(calls.length, 0); assert.match(replies.at(-1)!, /Upload could not be accepted/); assert.ok(!replies.join('').includes('private-network-detail'));
 });
-test('queued tasks run serially and resume the session created by the first task', async () => {
+test('new messages steer the running conversation instead of becoming separate queued tasks', async () => {
   let release!: () => void; let began!: () => void;
   const ready = new Promise<void>(resolve => { began = resolve; }); const wait = new Promise<void>(resolve => { release = resolve; }); const calls: AgentRequest[] = [];
   const { bot, store } = await setup({ async run(r, emit) { calls.push(r); if (calls.length === 1) { began(); await wait; } await emit({ type: 'session', id: 'same-chat' }); return { session: 'same-chat', text: 'Done', cumulativeCost: 0 }; } });
-  await bot.handle(message('First')); await ready; await bot.handle(message('Second')); assert.equal(calls.length, 1); assert.equal(store.data.tasks![1].status, 'queued');
-  release(); await bot.idle(); assert.equal(calls.length, 2); assert.equal(calls[1].session, 'same-chat'); assert.ok(store.data.tasks!.every(t => t.status === 'completed'));
+  await bot.handle(message('First')); await ready; await bot.handle(message('Second')); assert.equal(calls.length, 1); assert.equal(store.data.tasks!.length, 1);
+  await calls[0].steering!.settled(new AbortController().signal);
+  assert.equal(calls[0].steering!.messages[0].text, 'Second');
+  release(); await bot.idle(); assert.equal(calls.length, 1); assert.ok(store.data.tasks!.every(t => t.status === 'completed'));
+});
+
+test('steering during startup is prepared once even while a Telegram notice is being cleared', async () => {
+  let waiting!: () => void; let release!: () => void; const reached = new Promise<void>(r => { waiting = r; }); const pause = new Promise<void>(r => { release = r; }); let count = 0;
+  const { bot, sender } = await setup({ async run(request) { await request.steering!.settled(new AbortController().signal); count = request.steering!.messages.length; return { session: 'startup-chat', text: 'Done', cumulativeCost: 0 }; } });
+  Object.assign(sender, { async dismiss(_chat: number, scope: string) { if (scope.startsWith('task-') && !count) { waiting(); await pause; } } });
+  await bot.handle(message('First')); await reached;
+  try { await bot.handle(message('Correction during startup')); } finally { release(); }
+  await bot.idle(); assert.equal(count, 1);
+});
+
+test('voice and pending photos join the running task; final text is sent and archived only once', async () => {
+  let release!: () => void; let began!: () => void; const ready = new Promise<void>(r => { began = r; }); const waiting = new Promise<void>(r => { release = r; }); let current!: AgentRequest;
+  const { bot, store, replies, dataDir } = await setup({ async run(r, emit) {
+    current = r; await emit({ type: 'session', id: 'steer-chat' }); await emit({ type: 'commentary', id: 'progress', text: 'I found the bill; checking totals.' }); began(); await waiting;
+    const ids = r.steering!.messages.map(m => m.id); r.steering!.acknowledge(ids); await emit({ type: 'steered', ids });
+    await emit({ type: 'commentary', id: 'final', text: 'Done with your correction.' }); return { session: 'steer-chat', text: 'Done with your correction.', cumulativeCost: 0 };
+  } }, { async transcribe() { return { ...speech, text: 'Please make one CSV' }; } });
+  try {
+    await bot.handle(message('Read bills')); await ready; assert.ok(replies.includes('I found the bill; checking totals.'));
+    await bot.handle(photo('bill')); await bot.handle(voice()); await current.steering!.settled(new AbortController().signal);
+    assert.equal(store.data.tasks!.length, 1); assert.match(current.steering!.messages[0].text, /Please make one CSV/); assert.match(current.steering!.messages[0].text, /photo.jpg/);
+  } finally { release(); await bot.idle(); }
+  assert.equal(replies.filter(t => t === 'Done with your correction.').length, 1);
+  const archive = await new ChatArchive(path.join(dataDir, 'bot/chats'), []).read('steer-chat');
+  assert.equal(archive.filter(t => t.text === 'Done with your correction.').length, 1); assert.ok(archive.some(t => t.role === 'user' && t.text === 'Please make one CSV'));
+  const reopened = await StateStore.open(store.file); assert.equal(reopened.data.tasks![0].steers![0].status, 'answered');
+});
+
+test('Stop remains responsive while a steering voice is transcribing', async () => {
+  let started!: () => void; let speaking!: () => void;
+  const ready = new Promise<void>(r => { started = r; }); const voiceReady = new Promise<void>(r => { speaking = r; });
+  const { bot, store } = await setup({ async run(_request, _emit, abort) { started(); await new Promise((_, reject) => abort.signal.addEventListener('abort', () => reject(new Error('stopped')), { once: true })); throw new Error('unreachable'); } }, { async transcribe(_root, _file, _language, signal) { speaking(); await new Promise((_, reject) => signal!.addEventListener('abort', () => reject(new Error('stopped')), { once: true })); return speech; } });
+  await bot.handle(message('Long task')); await ready; await bot.handle(voice()); await voiceReady;
+  await bot.handle(message('/stop')); await bot.idle(); assert.equal(store.data.tasks!.length, 1); assert.equal(store.data.tasks![0].status, 'cancelled'); assert.equal(store.data.tasks![0].steers![0].status, 'failed');
 });
 test('completed files send automatically and scheduled reminders work without a Claude call', async () => {
   const { bot, files, replies, store } = await setup({ async run(r, emit) { await emit({ type: 'session', id: 'artifact-chat' }); await mkdir(path.join(r.cwd, 'output')); await writeFile(path.join(r.cwd, 'output', 'bills.csv'), 'item,total\nMilk,50'); return { session: 'artifact-chat', text: 'Table ready', cumulativeCost: 0 }; } });
@@ -249,7 +286,7 @@ test('session resumes by project, /new keeps files and new projects are isolated
   assert.equal(store.data.sessions.default, 'session-2');
 });
 
-test('busy task queues new work, blocks project changes, /status stays responsive and /stop pauses queue', async () => {
+test('busy task accepts steering, blocks project changes, /status stays responsive and /stop cancels without replay', async () => {
   let calls = 0;
   let started!: () => void;
   const ready = new Promise<void>(resolve => { started = resolve; });
@@ -273,7 +310,7 @@ test('busy task queues new work, blocks project changes, /status stays responsiv
   assert.equal(store.data.lastJob?.status, 'cancelled');
   assert.equal(store.data.active, null);
   assert.equal(store.data.queuePaused, true);
-  assert.equal(store.data.tasks!.filter(t => t.status === 'queued').length, 1);
+  assert.equal(store.data.tasks!.filter(t => t.status === 'queued').length, 0);
 });
 
 test('work continues beyond the former daily cap without budget reservations', async () => {

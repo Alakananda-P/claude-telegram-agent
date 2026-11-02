@@ -12,7 +12,8 @@ import { button, BACK, HOME, type Buttons } from './ui.js';
 import { ChatArchive } from './chats.js';
 import { SessionCatalog, sessionTitle } from './sessions.js';
 import { TitleAccountingError, type TitleGenerator } from './titles.js';
-import { Automation, clockInfo, type Task, type Batch } from './automation.js';
+import { Automation, clockInfo, type Task, type Batch, type SteerRecord } from './automation.js';
+import { SteeringInput } from './steering.js';
 import { artifactSnapshot, changedArtifacts } from './artifacts.js';
 import { Backups } from './backup.js';
 import { KeyPool } from './key-pool.js';
@@ -58,7 +59,8 @@ Send a task in plain text, or upload a document with instructions in its caption
 Auto uses safety checks and can deny actions. No unrestricted permission bypass.
 Voice notes run immediately as spoken instructions. Audio files, photos, videos, animations and documents: up to 20 MB each. Send instructions after uploading, or use /process.
 /batch — collect multiple files; /process — process the current batch
-/queue — tasks, cancel, reorder, pause/resume and explicit retry
+/queue — saved tasks, schedules, pause/resume and explicit retry
+New text and voice messages steer your active conversation; no separate task is queued.
 /schedules — reminders and recurring tasks; ask Claude to create or edit them
 /clock — current India time; specify other timezones in your task
 /trash — restore deleted chats within 48 hours
@@ -67,6 +69,7 @@ Voice notes run immediately as spoken instructions. Audio files, photos, videos,
 /keys — API key status, automatic checks and saved history`;
 
 export class Controller {
+  private conversation?: { task: Task; input: SteeringInput; abort: AbortController; cwd: string; ready: Promise<void>; serial: Promise<void> };
   private running?: { abort: AbortController; done: Promise<void> };
   private shuttingDown = false;
   private persistenceFailed = false;
@@ -290,7 +293,7 @@ export class Controller {
       this.running.abort.abort();
       return this.say('Stop requested; queue paused. File edits already made are kept; external effects are not undone. Resume queued work from /queue.');
     }
-    if (this.pump && command && !['run', 'get', 'files'].includes(command)) return this.say('Busy with your current task. Send more tasks to queue them; switch chats or settings after it finishes.');
+    if (this.pump && command && !['run', 'get', 'files'].includes(command)) return this.say('Busy with your current task. New messages steer it; switch chats or settings after it finishes.');
     if (this.persistenceFailed) return this.say('State storage failed. Restart only after checking the persistent disk; new tasks are disabled.');
     try {
       const root = await this.workspace();
@@ -374,11 +377,50 @@ export class Controller {
     }
   }
 
-  private async launch(prompt: string, cwd: string, displayPrompt = prompt): Promise<void> {
+  private async launch(prompt: string, cwd: string, displayPrompt = prompt, voiceInput?: string, attachedFiles?: string[]): Promise<void> {
     await this.dismiss('controls');
-    const task = await this.automation.enqueue({ kind: 'agent', project: this.store.data.project, chatKey: this.chatKey(), prompt, displayPrompt, settings: { ...this.settings }, interactive: true });
-    if (this.pump || this.store.data.queuePaused) await this.say(`Task saved in queue · ${this.store.data.tasks!.filter(t => t.status === 'queued').length} waiting. /queue for controls.`, false, 'task-' + task.id);
+    // claim() persists before execute() opens its inbox. Wait only for that small
+    // startup window so rapid consecutive messages join the very first task.
+    while (this.pump && !this.conversation && !this.running && !this.store.data.queuePaused) await new Promise(r => setTimeout(r, 5));
+    const active = this.conversation;
+    if (active?.input.accepting && !active.abort.signal.aborted) {
+      if (active.task.project !== this.store.data.project || this.resolveChat(active.task.chatKey) !== this.resolveChat(this.chatKey())) return this.say('Another saved chat is running. Stop it before starting work in this chat. Your message was not queued.');
+      const release = active.input.reserve()!;
+      const record: SteerRecord = { id: randomUUID(), text: prompt, displayText: displayPrompt, voiceInput, attachedFiles, status: 'preparing' };
+      (active.task.steers ??= []).push(record);
+      try { await this.store.save(); } catch (error) { release(); throw error; }
+      this.prepareSteer(active, record, release);
+      return;
+    }
+    if (this.store.data.queuePaused) return this.say('Processing is paused. Resume from /queue, then send your instruction. Your message was not queued.');
+    await this.automation.enqueue({ kind: 'agent', project: this.store.data.project, chatKey: this.chatKey(), prompt, displayPrompt, voiceInput, attachedFiles, settings: { ...this.settings }, interactive: true });
     this.kick();
+  }
+
+  private prepareSteer(active: NonNullable<Controller['conversation']>, record: SteerRecord, release: () => void): void {
+    active.serial = active.serial.then(async () => {
+      await active.ready;
+      active.abort.signal.throwIfAborted();
+      if (!active.input.accepting) throw new AgentError('This conversation stopped before the new instruction could be delivered. The instruction is saved with its task.');
+      if (record.voiceInput) {
+        const transcript = await this.transcriber.transcribe(active.cwd, record.voiceInput, undefined, active.abort.signal);
+        if (!transcript.hasSpeech) throw new TranscriptionError('No speech was detected. Please record the voice instruction again.');
+        record.text = transcript.text + (record.attachedFiles?.length ? '\n\nAttached project files:\n' + record.attachedFiles.join('\n') : '');
+        record.displayText = transcript.text; delete record.voiceInput;
+      }
+      if (!record.text.trim() || record.text.length > 30000) throw new AgentError('This instruction is too long. Send a shorter message.');
+      active.abort.signal.throwIfAborted();
+      if (!record.archived) {
+        await this.chats.append(this.resolveChat(active.task.chatKey), { role: 'user', text: record.displayText });
+        record.archived = true;
+      }
+      await this.store.save();
+      active.input.add(record.text, record.displayText, record.id);
+      record.status = 'sent'; await this.store.save();
+    }).catch(async error => {
+      record.status = 'failed'; await this.store.save().catch(() => { this.persistenceFailed = true; active.abort.abort(); });
+      if (!active.abort.signal.aborted) await this.say(error instanceof AgentError || error instanceof TranscriptionError ? error.message : 'The new instruction could not be delivered. It is saved with the current task; no automatic replay was performed.');
+    }).finally(release);
   }
 
   private kick(): void {
@@ -391,7 +433,6 @@ export class Controller {
   private async runQueue(): Promise<void> {
     while (!this.shuttingDown && !this.persistenceFailed) {
       const task = await this.automation.claim(); if (!task) break;
-      await this.dismiss('task-' + task.id);
       const abort = new AbortController(); const running = { abort, done: Promise.resolve() }; this.running = running;
       running.done = (async () => {
         if (task.kind === 'agent') {
@@ -410,6 +451,11 @@ export class Controller {
   }
 
   private async execute(task: Task, cwd: string, abort: AbortController): Promise<void> {
+    let ready!: () => void;
+    const active = { task, input: new SteeringInput(), abort, cwd, ready: new Promise<void>(resolve => { ready = resolve; }), serial: Promise.resolve() };
+    this.conversation = active;
+    for (const record of task.steers ?? []) this.prepareSteer(active, record, active.input.reserve()!);
+    await this.dismiss('task-' + task.id);
     let { prompt } = task; const { project } = task;
     const job = { id: task.id, project, startedAt: task.startedAt! };
     this.store.data.active = job; await this.store.save();
@@ -417,12 +463,15 @@ export class Controller {
     let archiveKey = this.resolveChat(task.chatKey);
     const originalKey = archiveKey;
     const delivered = new Set<string>();
+    const published = new Set<string>();
+    let lastPublished = '';
     const before = await artifactSnapshot(cwd);
     const bind = async (id: string) => {
       const active = task.interactive && (this.chatKey() === archiveKey || this.resolveChat(this.chatKey()) === archiveKey);
-      await this.chats.bind(archiveKey, id);
+      const previous = archiveKey;
       if (archiveKey !== id) (this.store.data.bindings ??= {})[archiveKey] = id;
       this.store.data.bindings![task.chatKey] = id; archiveKey = id;
+      await this.chats.bind(previous, id);
       if (active) await this.session(id, project);
       else {
         if (!this.store.data.conversations!.some(s => s.id === id)) this.store.data.conversations!.push({ id, project, updatedAt: new Date().toISOString() });
@@ -440,8 +489,9 @@ export class Controller {
       if (!uiWork && !abort.signal.aborted) {
         uiWork = (async () => {
           await this.messenger.typing(this.config.owner).catch(() => {});
-          if (indicator !== undefined && progress !== lastProgress && Date.now() - lastEdit >= 8000) {
-            await this.messenger.edit(this.config.owner, indicator, progress).catch(() => {});
+          if (indicator !== undefined && ((progress !== lastProgress && Date.now() - lastEdit >= 8000) || Date.now() - lastEdit >= 30000)) {
+            const seconds = Math.floor((Date.now() - Date.parse(job.startedAt)) / 1000);
+            await this.messenger.edit(this.config.owner, indicator, progress + (seconds >= 30 ? ` · ${Math.floor(seconds / 60)}m ${seconds % 60}s elapsed` : '')).catch(() => {});
             lastProgress = progress; lastEdit = Date.now();
           }
         })().finally(() => { uiWork = undefined; });
@@ -476,13 +526,24 @@ export class Controller {
         if (indicator !== undefined) await this.messenger.edit(this.config.owner, indicator, progress).catch(() => {});
       }
       await this.chats.append(archiveKey, { role: 'user', text: task.displayPrompt ?? prompt });
+      ready();
       const selected = effectiveSettings(task.settings ?? this.settings);
       const prior = (await this.chats.read(originalKey)).slice(-30).map(t => `${t.role}: ${t.text}`).join('\n').slice(-24000);
       const result = await this.runner.run({ prompt, cwd, session: this.store.data.conversations!.some(s => s.id === originalKey && !s.trashedAt) ? originalKey : undefined, resumeContext: prior,
-        settings: selected, memoryEnabled: this.store.data.memoryEnabled !== false, sessions: this.sessions,
+        settings: selected, memoryEnabled: this.store.data.memoryEnabled !== false, sessions: this.sessions, steering: active.input,
         workspace: { root: cwd, project, automation: this.automation, transcribe: async (file, language) => { progress = 'Transcribing audio…'; try { return await this.transcriber.transcribe(cwd, file, language, abort.signal); } finally { progress = 'Thinking…'; } }, deliver: async (file, preview) => { await this.deliver(cwd, file, preview); delivered.add(file.replace(/\\/g, '/')); }, backup: () => this.exportBackup() } }, async event => {
         if (event.type === 'session') {
           await bind(event.id);
+        } else if (event.type === 'commentary') {
+          const text = redact(event.text, configSecrets(this.config)).trim();
+          const key = event.id + ':' + text;
+          if (text && !published.has(key)) {
+            published.add(key); lastPublished = text; await this.chats.append(archiveKey, { role: 'assistant', text });
+            await this.say(text.length > 12000 ? text.slice(0, 12000) + '\n\nFull text is saved in this chat history.' : text, true);
+          }
+        } else if (event.type === 'steered') {
+          for (const record of task.steers ?? []) if (active.input.messages.some(m => m.id === record.id && m.answered)) record.status = 'answered';
+          await this.store.save();
         } else if (event.type === 'usage' || event.type === 'step') {
           try {
             if (event.type === 'usage') await this.ledger?.recordResult(event.session, event.id, event.models, event.cost);
@@ -493,7 +554,8 @@ export class Controller {
       }, abort);
       abort.signal.throwIfAborted();
       await bind(result.session);
-      await this.chats.append(result.session, { role: 'assistant', text: result.text });
+      const alreadyPublished = lastPublished !== '' && lastPublished === redact(result.text, configSecrets(this.config)).trim();
+      if (!alreadyPublished) await this.chats.append(result.session, { role: 'assistant', text: result.text });
       // Store a redacted result in the project so a Telegram outage is recoverable.
       const outputName = `result-${job.id}.txt`;
       await writeFile(path.join(cwd, outputName), redact(result.text, configSecrets(this.config)), { flag: 'wx', mode: 0o600 });
@@ -501,7 +563,7 @@ export class Controller {
       (this.store.data.health ??= {}).claudeAt = new Date().toISOString(); delete this.store.data.health.apiError;
       const preview = result.text.length > 12000 ? result.text.slice(0, 12000) + `\n\nFull result: /get ${outputName}` : result.text;
       await finishIndicator();
-      await this.say(preview, true);
+      if (!alreadyPublished) await this.say(preview, true);
       const artifacts = (await changedArtifacts(cwd, before)).filter(file => !delivered.has(file));
       for (const file of artifacts.slice(0, 20)) { try { await this.deliver(cwd, file, 'Ready · ' + path.basename(file)); } catch { await this.say(`File saved; automatic delivery failed. Retry: /get ${file}`); } }
       if (artifacts.length > 20) await this.say('Additional files are saved. Use /files and /get to download them.');
@@ -517,6 +579,8 @@ export class Controller {
         : abort.signal.aborted ? 'Task stopped.'
         : error instanceof AgentError || error instanceof TranscriptionError ? error.message : 'The task could not finish. Check API access and storage, or try a smaller task.');
     } finally {
+      ready(); active.input.close(); await active.serial;
+      if (this.conversation === active) this.conversation = undefined;
       clearTimeout(timeout); clearInterval(heartbeat);
       await finishIndicator();
       this.store.data.lastJob = { ...job, status, finishedAt: new Date().toISOString() };
@@ -596,16 +660,15 @@ export class Controller {
   }
   private async processBatches(batches: Batch[], instruction?: string, voiceInput?: string): Promise<void> {
     if (!batches.length || !batches.some(b => b.uploadIds.length)) return this.say('No files waiting in this chat. Send photos, videos or documents first.');
+    if (this.store.data.queuePaused && !this.conversation?.input.accepting) return this.say('Processing is paused. Files are saved; resume from /queue, then send your instruction.');
     const ids = new Set(batches.flatMap(b => b.uploadIds));
     const files = this.store.data.uploads!.filter(u => ids.has(u.id));
     const prompt = instruction ?? (batches.map(b => b.prompt).filter(Boolean).join('\n') || 'Inspect these files. For bill photos, extract only clear values, check arithmetic, and ask about unclear fields with relevant crops. If the desired output is unclear, ask the owner.');
     for (const batch of batches) batch.status = 'queued';
-    const task = await this.automation.enqueue({ kind: 'agent', project: batches[0].project, chatKey: batches[0].chatKey,
-      prompt: prompt + '\n\nAttached project files:\n' + files.map(f => f.path).join('\n'), displayPrompt: prompt + `\n[${files.length} attached files]`, voiceInput, attachedFiles: voiceInput ? files.filter(f => f.path !== voiceInput).map(f => f.path) : undefined, settings: { ...this.settings }, interactive: true });
+    await this.launch(prompt + '\n\nAttached project files:\n' + files.map(f => f.path).join('\n'), await this.workspace(batches[0].project), prompt + `\n[${files.length} attached files]`, voiceInput, voiceInput ? files.filter(f => f.path !== voiceInput).map(f => f.path) : undefined);
     for (const batch of batches) await this.dismiss('batch-' + batch.id);
     await this.uploadReceipt();
     await this.dismiss('controls');
-    if (!voiceInput || this.pump || this.store.data.queuePaused) await this.say(voiceInput ? 'Voice instruction queued.' : `${files.length} file(s) queued for processing.`, false, 'task-' + task.id); this.kick();
   }
   private async deliver(root: string, relative: string, preview?: string): Promise<void> {
     const file = await safeFile(root, relative);
