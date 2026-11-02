@@ -65,6 +65,13 @@ API-key setup.
   separate file count. The receipt disappears when the files are submitted or after five idle
   minutes, without losing the pending uploads. `/batch` opens optional Process/Discard controls.
   Albums and manual batches wait for instructions or `/process`; captions and later instructions use saved paths.
+- Direct Telegram videos, round video notes and animations use the same durable upload flow.
+  One receipt counts images, videos, animations and other files separately; captionless clips wait
+  for the next text prompt, while a standalone caption can start processing. Mixed photo/video
+  albums wait for instructions or `/process`. Original files are saved, not just their thumbnails.
+  The incoming limit remains 20 MB per file (Telegram cloud Bot API download limit); larger clips
+  must be compressed or split. FFmpeg/ffprobe are included for metadata and bounded frame extraction
+  when the agent processes a video. Receiving a clip does not mean its full contents/audio were analyzed.
 - Image tools preserve originals and create crop, rotation, contrast and estimated deskew copies.
   Bill instructions require clarification for unclear writing; a deterministic tool checks quantities,
   rates and totals. These checks cannot guarantee recognition accuracy.

@@ -1,12 +1,18 @@
 import path from 'node:path';
 import { lstat, realpath } from 'node:fs/promises';
 
+interface TelegramFile { file_id: string; file_name?: string; file_size?: number; mime_type?: string }
+interface TelegramVideo extends TelegramFile { width?: number; height?: number; duration?: number; thumbnail?: { file_id: string } }
+
 export interface Message {
   message_id?: number;
   from?: { id: number };
   chat: { id: number; type: string };
   text?: string; caption?: string;
-  document?: { file_id: string; file_name?: string; file_size?: number };
+  document?: TelegramFile;
+  video?: TelegramVideo;
+  animation?: TelegramVideo;
+  video_note?: TelegramFile & { length?: number; duration?: number };
   photo?: { file_id: string; file_unique_id?: string; width: number; height: number; file_size?: number }[];
   media_group_id?: string;
 }

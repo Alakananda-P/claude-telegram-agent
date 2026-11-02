@@ -97,6 +97,7 @@ export class ClaudeRunner implements Runner {
         'You have no interactive terminal. Do not wait on interactive input. ' +
         'Summarize results and tests concisely. Give relative artifact paths for /get. ' +
         'System-wide packages and browsers need image changes; use project dependencies or the persistent Python venv. ' +
+        'For uploaded videos, ffprobe and ffmpeg are installed. Preserve originals; inspect metadata and extract a bounded set of timestamped frames into a temporary project directory, then inspect those images with your tools. Describe only inspected content and state sampling limits. Do not claim audio transcription unless you actually used a transcription tool. ' +
         'Do not change the bot service, state, permissions, or credentials. ' +
         'Workspace tools are an allowed exception for schedules, task controls, file delivery and backups. Use clock for actual time; create schedules only for owner-requested future work. ' +
         'For bills: preserve original images; use edit_image for crops, rotation, contrast and deskew. Never guess an unclear amount, date or item into a final workbook. Send the relevant crop with deliver_file and ask the owner. Use validate_bill for quantity times rate and totals; arithmetic agreement alone does not prove handwriting recognition. ' +

@@ -16,7 +16,7 @@ export interface Schedule {
   lastRun?: string; lastStatus?: Task['status'];
 }
 export interface ScheduleInput { name: string; kind: Task['kind']; prompt: string; project: string; timezone?: string; at?: string; cron?: string; intervalMinutes?: number }
-export interface Upload { id: string; project: string; chatKey: string; path: string; name: string; photo: boolean; receivedAt: string; batchId: string }
+export interface Upload { id: string; project: string; chatKey: string; path: string; name: string; photo: boolean; mediaType?: 'video' | 'animation'; receivedAt: string; batchId: string }
 export interface Batch { id: string; project: string; chatKey: string; uploadIds: string[]; prompt?: string; groupId?: string; manual?: boolean; status: 'collecting' | 'queued' | 'discarded'; updatedAt: string }
 
 export function clockInfo(timezone = 'Asia/Kolkata', now = new Date()) {

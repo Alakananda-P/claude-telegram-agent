@@ -55,7 +55,7 @@ Send a task in plain text, or upload a document with instructions in its caption
 /get PATH — download a project file (up to 49 MB)
 /help — this guide
 Auto uses safety checks and can deny actions. No unrestricted permission bypass.
-Photos and documents: up to 20 MB each. Send instructions after uploading, or use /process.
+Photos, videos, animations and documents: up to 20 MB each. Send instructions after uploading, or use /process.
 /batch — collect multiple files; /process — process the current batch
 /queue — tasks, cancel, reorder, pause/resume and explicit retry
 /schedules — reminders and recurring tasks; ask Claude to create or edit them
@@ -122,7 +122,7 @@ export class Controller {
     try {
       if (data === 'memory confirm-clear') {
         await this.panel('Clear shared memory? Saved conversations and files will stay.', [[button('Clear memory', 'memory clear')], ...BACK]);
-      } else await this.handle({ ...callback.message, from: callback.from, text: '/' + data, document: undefined, photo: undefined, media_group_id: undefined, caption: undefined });
+      } else await this.handle({ ...callback.message, from: callback.from, text: '/' + data, document: undefined, photo: undefined, video: undefined, video_note: undefined, animation: undefined, media_group_id: undefined, caption: undefined });
     } finally { this.panelId = undefined; }
   }
 
@@ -360,9 +360,9 @@ export class Controller {
         return;
       }
       if (command && command !== 'run') return this.say('Unknown command. Send /help, or /run followed by your task.');
-      if (message.document || message.photo?.length) return this.receive(message, root);
+      if (message.document || message.photo?.length || message.video || message.video_note || message.animation) return this.receive(message, root);
       const prompt = command === 'run' ? argument : text;
-      if (!prompt) return this.say('Send a text task, photo or document. Use /help for commands.');
+      if (!prompt) return this.say('Send a text task, photo, video or document. Use /help for commands.');
       const pending = this.pendingBatches();
       if (pending.length) await this.processBatches(pending, prompt);
       else await this.launch(prompt, root);
@@ -521,9 +521,11 @@ export class Controller {
     const ids = new Set(this.pendingBatches().flatMap(b => b.uploadIds));
     const uploads = this.store.data.uploads!.filter(u => ids.has(u.id));
     if (!uploads.length) return this.dismiss('uploads');
-    const images = uploads.filter(u => u.photo || /\.(png|jpe?g|webp|gif|bmp|heic|heif|tiff?|avif)$/i.test(u.name)).length;
-    const files = uploads.length - images;
-    const text = [images ? `📷 ${images} image${images === 1 ? '' : 's'}` : '', files ? `📎 ${files} file${files === 1 ? '' : 's'}` : ''].filter(Boolean).join(' · ') + ' received';
+    const videos = uploads.filter(u => u.mediaType === 'video' || (!u.mediaType && !u.photo && /\.(mp4|mov|m4v|webm|mkv|avi|mpeg|mpg|3gp|ts)$/i.test(u.name))).length;
+    const animations = uploads.filter(u => u.mediaType === 'animation').length;
+    const images = uploads.filter(u => !u.mediaType && (u.photo || /\.(png|jpe?g|webp|gif|bmp|heic|heif|tiff?|avif)$/i.test(u.name))).length;
+    const files = uploads.length - images - videos - animations;
+    const text = [images ? `📷 ${images} image${images === 1 ? '' : 's'}` : '', videos ? `🎬 ${videos} video${videos === 1 ? '' : 's'}` : '', animations ? `🎞 ${animations} animation${animations === 1 ? '' : 's'}` : '', files ? `📎 ${files} file${files === 1 ? '' : 's'}` : ''].filter(Boolean).join(' · ') + ' received';
     // A single buttonless receipt across albums; never replace a clicked control panel.
     if (this.messenger.panel) {
       try { await this.messenger.panel(this.config.owner, text, [], undefined, 'uploads'); return; }
@@ -533,11 +535,14 @@ export class Controller {
   }
   private async receive(message: Message, root: string): Promise<void> {
     const photo = message.photo?.slice().sort((a, b) => b.width * b.height - a.width * a.height)[0];
-    const attachment = photo ?? message.document!;
-    if ((attachment.file_size ?? 0) > 20000000) return this.say('Upload exceeds the 20 MB incoming file limit.');
-    const base = photo ? 'photo.jpg' : path.basename((message.document!.file_name ?? 'document.bin').replace(/\\/g, '/'));
+    const media = message.video ?? message.animation ?? message.video_note ?? message.document;
+    const attachment = photo ?? media!;
+    if ((attachment.file_size ?? 0) > 20000000) return this.say('Upload exceeds the 20 MB incoming file limit. Compress or split the video/file and send it again.');
+    const fallback = message.video ? 'video.mp4' : message.animation ? (message.animation.mime_type === 'image/gif' ? 'animation.gif' : 'animation.mp4') : message.video_note ? 'video-note.mp4' : media?.mime_type?.startsWith('video/') ? 'video.mp4' : 'document.bin';
+    const base = photo ? 'photo.jpg' : path.basename((media?.file_name ?? fallback).replace(/\\/g, '/'));
+    const mediaType = photo ? undefined : message.animation && !message.video ? 'animation' as const : (message.video || message.video_note || media?.mime_type?.startsWith('video/')) ? 'video' as const : undefined;
     if (secretPath(base)) return this.say('Do not send credential files through Telegram. Configure secrets in Render.');
-    const indicator = await this.messenger.temporary(this.config.owner, 'Receiving ' + (photo ? 'photo…' : 'file…')).catch(() => undefined);
+    const indicator = await this.messenger.temporary(this.config.owner, 'Receiving ' + (photo ? 'photo' : mediaType ?? 'file') + '…').catch(() => undefined);
     let success = false;
     try {
       const uploads = path.join(root, 'uploads'); await mkdir(uploads, { recursive: true, mode: 0o700 });
@@ -559,7 +564,7 @@ export class Controller {
         batch = { id: randomUUID().slice(0, 8), project: this.store.data.project, chatKey: this.chatKey(), uploadIds: [], status: 'collecting', groupId: message.media_group_id, updatedAt: new Date().toISOString() };
         this.store.data.batches!.push(batch);
       }
-      const upload = { id: randomUUID().slice(0, 8), project: batch.project, chatKey: batch.chatKey, path: relative, name: base, photo: !!photo, receivedAt: new Date().toISOString(), batchId: batch.id };
+      const upload = { id: randomUUID().slice(0, 8), project: batch.project, chatKey: batch.chatKey, path: relative, name: base, photo: !!photo, mediaType, receivedAt: new Date().toISOString(), batchId: batch.id };
       this.store.data.uploads!.push(upload); batch.uploadIds.push(upload.id); batch.updatedAt = upload.receivedAt;
       if (message.caption?.trim()) batch.prompt = (batch.prompt ? batch.prompt + '\n' : '') + message.caption.trim();
       await this.chats.append(this.resolveChat(batch.chatKey), { role: 'user', text: `Attachment: ${base}\nProject path: ${relative}`, file: { id: attachment.file_id, name: base } });
@@ -573,7 +578,7 @@ export class Controller {
     }
   }
   private async processBatches(batches: Batch[], instruction?: string): Promise<void> {
-    if (!batches.length || !batches.some(b => b.uploadIds.length)) return this.say('No files waiting in this chat. Send photos or documents first.');
+    if (!batches.length || !batches.some(b => b.uploadIds.length)) return this.say('No files waiting in this chat. Send photos, videos or documents first.');
     const ids = new Set(batches.flatMap(b => b.uploadIds));
     const files = this.store.data.uploads!.filter(u => ids.has(u.id));
     const prompt = instruction ?? (batches.map(b => b.prompt).filter(Boolean).join('\n') || 'Inspect these files. For bill photos, extract only clear values, check arithmetic, and ask about unclear fields with relevant crops. If the desired output is unclear, ask the owner.');
@@ -612,7 +617,7 @@ export class Controller {
       if (!batch) { batch = { id: randomUUID().slice(0, 8), project: d.project, chatKey: this.chatKey(), uploadIds: [], status: 'collecting', manual: true, updatedAt: new Date().toISOString() }; d.batches!.push(batch); await this.store.save(); }
       const pending = this.pendingBatches();
       const count = pending.reduce((n, b) => n + b.uploadIds.length, 0);
-      await this.panel(`Batch open · ${count} files waiting in this chat. Send photos/documents, then your instructions or tap Process.`, [
+      await this.panel(`Batch open · ${count} files waiting in this chat. Send photos/videos/documents, then your instructions or tap Process.`, [
         [button('Process waiting files', 'process')],
         ...pending.map((b, i) => [button(`Discard batch ${i + 1} · ${b.uploadIds.length} files`, 'discard ' + b.id)]), ...BACK], 'batch-' + batch.id);
     } else if (command === 'process') await this.processBatches(this.pendingBatches().filter(b => !argument || b.id === argument));

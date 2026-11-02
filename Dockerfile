@@ -9,7 +9,7 @@ RUN npm run build
 FROM node:22-bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash ca-certificates curl git ripgrep python3 python3-venv python3-pip \
-    build-essential gosu tini unzip \
+    build-essential gosu tini unzip ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY package.json package-lock.json ./

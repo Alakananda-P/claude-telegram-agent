@@ -12,6 +12,7 @@ import type { Buttons } from '../src/ui.js';
 
 const message = (text: string): Message => ({ from: { id: 123 }, chat: { id: 123, type: 'private' }, text });
 const photo = (id: string, group?: string): Message => ({ ...message(''), media_group_id: group, photo: [{ file_id: id + '-small', width: 100, height: 100 }, { file_id: id + '-large', width: 1200, height: 900 }] });
+const video = (id: string, group?: string): Message => ({ ...message(''), media_group_id: group, video: { file_id: id, width: 640, height: 360, duration: 2, file_size: 8, thumbnail: { file_id: id + '-thumb' } } } as Message);
 async function setup(runner?: Runner) {
   const dataDir = await mkdtemp(path.join(tmpdir(), 'tg-agent-controller-'));
   const config = loadConfig({ TELEGRAM_BOT_TOKEN: '123456:abcdefghijklmnopqrstuvw', TELEGRAM_OWNER_ID: '123', ANTHROPIC_API_KEY: 'test-only', DATA_DIR: dataDir });
@@ -66,6 +67,54 @@ test('largest direct photo is acknowledged and captionless upload attaches to th
   assert.ok(indicators.some(t => /Receiving photo/.test(t))); assert.match(panels.at(-1)!.text, /1 image received/); assert.deepEqual(panels.at(-1)!.buttons, []);
   await bot.handle(message('Make a bill table')); await bot.idle();
   assert.match(calls[0].prompt, /Make a bill table/); assert.match(calls[0].prompt, /uploads\/.+photo.jpg/); assert.equal(store.data.batches![0].status, 'queued');
+});
+
+test('direct video downloads the original, shows a receipt and waits for the next text prompt', async () => {
+  const { bot, store, downloads, calls, indicators, panels, dataDir } = await setup();
+  await bot.handle(video('clip'));
+  assert.deepEqual(downloads, ['clip']); assert.equal(calls.length, 0);
+  assert.ok(indicators.some(t => /Receiving video/.test(t)));
+  assert.match(panels.at(-1)!.text, /1 video received/); assert.deepEqual(panels.at(-1)!.buttons, []);
+  assert.equal(await readFile(path.join(dataDir, 'workspaces/default', store.data.uploads![0].path), 'utf8'), 'uploaded');
+  await bot.handle(message('Summarize this clip')); await bot.idle();
+  assert.equal(calls.length, 1); assert.match(calls[0].prompt, /uploads\/.+video\.mp4/);
+});
+
+test('video captions start work once and filenames stay inside uploads', async () => {
+  const { bot, store, calls } = await setup();
+  await bot.handle({ ...video('captioned'), video: { file_id: 'captioned', file_name: '../../clip.mp4' }, caption: 'Inspect this video' } as Message);
+  await bot.idle(); assert.equal(calls.length, 1); assert.match(calls[0].prompt, /Inspect this video/);
+  assert.match(store.data.uploads![0].path, /^uploads\/[a-zA-Z0-9-]+-clip\.mp4$/);
+});
+
+test('mixed photo/video album waits, keeps all originals and batches them once', async () => {
+  const { bot, store, calls, panels } = await setup();
+  await bot.handle({ ...video('clip-one', 'album'), caption: 'Compare these' });
+  await bot.handle(photo('image', 'album')); await bot.handle(video('clip-two', 'album'));
+  assert.equal(calls.length, 0); assert.equal(store.data.batches!.length, 1);
+  assert.match(panels.at(-1)!.text, /1 image.*2 videos.*received/);
+  await bot.handle(message('/process')); await bot.idle();
+  assert.equal(calls.length, 1); assert.equal((calls[0].prompt.match(/uploads\//g) ?? []).length, 3);
+});
+
+test('round videos and animations are accepted without duplicate legacy document uploads', async () => {
+  const { bot, downloads, store, panels, calls } = await setup();
+  await bot.handle({ ...message(''), video_note: { file_id: 'round', length: 240, duration: 2 } } as Message);
+  await bot.handle({ ...message(''), animation: { file_id: 'gif', mime_type: 'image/gif' }, document: { file_id: 'gif-legacy', file_name: 'duplicate.gif' } } as Message);
+  assert.deepEqual(downloads, ['round', 'gif']); assert.equal(calls.length, 0);
+  assert.equal(store.data.uploads![0].name, 'video-note.mp4'); assert.equal(store.data.uploads![1].name, 'animation.gif');
+  assert.match(panels.at(-1)!.text, /1 video.*1 animation.*received/);
+});
+
+test('oversized, failed and unauthorized videos never produce a false receipt or a model job', async () => {
+  const { bot, sender, downloads, calls, store, replies, panels } = await setup();
+  await bot.handle({ ...video('foreign'), from: { id: 999 } }); assert.equal(downloads.length, 0);
+  await bot.handle({ ...video('oversized'), video: { file_id: 'oversized', file_size: 20_000_001 } } as Message);
+  assert.match(replies.at(-1)!, /20 MB/); assert.equal(downloads.length, 0);
+  sender.download = async () => { throw new Error('private-network-detail'); };
+  await bot.handle(video('failed')); assert.match(replies.at(-1)!, /Upload could not be accepted/);
+  assert.equal(store.data.uploads!.length, 0); assert.equal(panels.length, 0); assert.equal(calls.length, 0);
+  assert.ok(!replies.join('').includes('private-network-detail'));
 });
 test('album waits for Process, preserves every photo and processes it once', async () => {
   const { bot, calls, store, panels } = await setup();

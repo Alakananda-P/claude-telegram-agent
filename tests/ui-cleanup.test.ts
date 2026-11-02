@@ -45,6 +45,7 @@ test('idle cleanup deletes only marked UI and keeps conversation messages and de
 
 const ownerMessage = (text: string) => ({ chat: { id: 123, type: 'private' }, from: { id: 123 }, text });
 const uploadPhoto = (id: string, group?: string) => ({ ...ownerMessage(''), media_group_id: group, photo: [{ file_id: id, width: 100, height: 100 }] });
+const uploadVideo = (id: string) => ({ ...ownerMessage(''), video: { file_id: id, file_name: 'clip.mp4', width: 320, height: 240, duration: 1 } });
 function photoController(store: StateStore, tg: Telegram, prompts: string[] = []) {
   const config = loadConfig({ TELEGRAM_BOT_TOKEN: '123456:abcdefghijklmnopqrstuvw', TELEGRAM_OWNER_ID: '123', ANTHROPIC_API_KEY: 'test-only', DATA_DIR: path.dirname(store.file) });
   return new Controller(config, store, tg, { async run(request, emit) {
@@ -52,6 +53,24 @@ function photoController(store: StateStore, tg: Telegram, prompts: string[] = []
     return { text: 'Photo report complete', session: 'photo-session', cumulativeCost: 0 };
   } });
 }
+
+test('video receipt persists across restart, updates mixed counts and clears when the prompt is submitted', async t => {
+  const { tg, store, requests } = await setup(t); const prompts: string[] = [];
+  const original = photoController(store, tg, prompts); t.after(() => original.stop());
+  await original.handle(uploadVideo('first-video')); await original.handle(uploadPhoto('image'));
+  assert.equal(prompts.length, 0); assert.equal(store.data.uiMessages!.length, 1);
+  const receiptId = store.data.uiMessages![0].id;
+  const reopened = await StateStore.open(store.file); tg.timeline = reopened;
+  const bot = photoController(reopened, tg, prompts); t.after(() => bot.stop());
+  await bot.handle(uploadVideo('second-video'));
+  await bot.handle({ ...ownerMessage(''), document: { file_id: 'video-as-file', file_name: 'third.MOV' } });
+  const receipt = requests.findLast(r => r.method === 'editMessageText' && r.body.message_id === receiptId)!;
+  assert.match(receipt.body.text, /1 image.*3 videos.*received/); assert.deepEqual(receipt.body.reply_markup.inline_keyboard, []);
+  assert.equal(reopened.data.uiMessages!.length, 1); assert.equal(prompts.length, 0);
+  await bot.handle(ownerMessage('Summarize all clips')); await bot.idle();
+  assert.equal(prompts.length, 1); assert.equal((prompts[0].match(/uploads\//g) ?? []).length, 4);
+  assert.ok(requests.some(r => r.method === 'deleteMessage' && r.body.message_id === receiptId));
+});
 
 test('photo and album receipts update one buttonless count and wait for instructions before submitting files', async t => {
   const { tg, store, requests } = await setup(t); const prompts: string[] = [];
