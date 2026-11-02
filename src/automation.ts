@@ -9,6 +9,7 @@ export interface Task {
   status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted';
   createdAt: string; startedAt?: string; finishedAt?: string; scheduleId?: string; occurrence?: string;
   interactive?: boolean; settings?: AgentSettings; displayPrompt?: string;
+  voiceInput?: string; attachedFiles?: string[];
 }
 export interface Schedule {
   id: string; name: string; kind: Task['kind']; prompt: string; project: string; timezone: string;
@@ -16,7 +17,7 @@ export interface Schedule {
   lastRun?: string; lastStatus?: Task['status'];
 }
 export interface ScheduleInput { name: string; kind: Task['kind']; prompt: string; project: string; timezone?: string; at?: string; cron?: string; intervalMinutes?: number }
-export interface Upload { id: string; project: string; chatKey: string; path: string; name: string; photo: boolean; mediaType?: 'video' | 'animation'; receivedAt: string; batchId: string }
+export interface Upload { id: string; project: string; chatKey: string; path: string; name: string; photo: boolean; mediaType?: 'video' | 'animation' | 'audio' | 'voice'; receivedAt: string; batchId: string }
 export interface Batch { id: string; project: string; chatKey: string; uploadIds: string[]; prompt?: string; groupId?: string; manual?: boolean; status: 'collecting' | 'queued' | 'discarded'; updatedAt: string }
 
 export function clockInfo(timezone = 'Asia/Kolkata', now = new Date()) {
@@ -67,7 +68,7 @@ export class Automation {
     const task = this.store.data.tasks!.find(t => t.id === id);
     if (!task || !['failed', 'interrupted', 'cancelled'].includes(task.status)) throw new Error('Choose a failed or interrupted task.');
     if (task.prompt === '[Deleted session]') throw new Error('This task belongs to a permanently deleted chat.');
-    return this.enqueue({ kind: task.kind, project: task.project, chatKey: task.chatKey, prompt: task.prompt, interactive: task.interactive, settings: task.settings });
+    return this.enqueue({ kind: task.kind, project: task.project, chatKey: task.chatKey, prompt: task.prompt, displayPrompt: task.displayPrompt, voiceInput: task.voiceInput, attachedFiles: task.attachedFiles, interactive: task.interactive, settings: task.settings });
   }
   async prioritize(id: string): Promise<void> {
     const list = this.store.data.tasks!; const i = list.findIndex(t => t.id === id && t.status === 'queued');

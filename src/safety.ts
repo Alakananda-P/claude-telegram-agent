@@ -10,6 +10,8 @@ export interface Message {
   chat: { id: number; type: string };
   text?: string; caption?: string;
   document?: TelegramFile;
+  voice?: TelegramFile & { duration?: number };
+  audio?: TelegramFile & { duration?: number; title?: string; performer?: string };
   video?: TelegramVideo;
   animation?: TelegramVideo;
   video_note?: TelegramFile & { length?: number; duration?: number };

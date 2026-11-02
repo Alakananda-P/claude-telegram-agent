@@ -11,7 +11,7 @@ export async function artifactSnapshot(root: string): Promise<Record<string, str
     for (const entry of await readdir(path.join(root, relative), { withFileTypes: true })) {
       if (++visited > 10000) return;
       const name = relative ? relative + '/' + entry.name : entry.name;
-      if (entry.isSymbolicLink() || secretPath(name) || ['node_modules', '.venv', 'venv', 'uploads', '.cache', 'backups'].includes(entry.name)) continue;
+      if (entry.isSymbolicLink() || secretPath(name) || ['node_modules', '.venv', 'venv', 'uploads', 'transcripts', '.cache', 'backups'].includes(entry.name)) continue;
       if (entry.isDirectory()) await walk(name, depth + 1);
       else if (entry.isFile() && deliverable.test(entry.name) && !/^result-[a-z0-9-]+\.txt$/i.test(entry.name)) {
         const s = await lstat(path.join(root, name));

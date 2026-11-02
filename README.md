@@ -17,9 +17,28 @@ API-key setup.
 
 ## What it does
 
+- Voice notes automatically become instructions: ElevenLabs Scribe v2 transcribes
+  them before Claude runs. Pending photos/files accompany the spoken instruction.
+  Audio files and videos still wait for a caption/text task; recorded speech inside
+  those attachments is content, not permission to execute commands.
+- Claude can call `transcribe_media` for local audio/video whenever the task needs
+  speech recognition. It detects language automatically, preserves the original
+  language, and saves TXT plus JSON with speaker/timestamp information under the
+  project's `transcripts/`. Originals remain untouched. Use `/get` or ask Claude
+  to send a transcript; routine voice instructions do not spam transcript files.
+- Set optional `ELEVENLABS_API_KEY` privately in Render. It is excluded from
+  Claude's subprocess environment. The provider receives the selected media.
+  Identical content/options reuse a persistent cache, including after restarts.
+  `/cost` shows successful STT requests and minutes separately from Claude's cost;
+  ElevenLabs is the billing authority. No billing cap is imposed. Incoming Telegram
+  files remain limited to 20 MB; the tool accepts local media up to 50 MB.
+- `/stop` cancels transcription as well as agent work. Failed transcription does
+  not start Claude or retry automatically; saved tasks can be retried from `/queue`.
+  Uncertain network outcomes may still be billed. Silence never becomes an instruction.
+
 - Runs Claude Code's standard tools: shell commands, code/file editing, Git,
   dependency installation, tests and other tasks supported by the runtime.
-- Uses Telegram private text, photo and document messages; only your numeric Telegram
+- Uses Telegram private text, photo, video, audio and voice messages; only your numeric Telegram
   user ID may issue work. Groups and other senders are ignored.
 - Saves a separate conversation for each named project. Files and transcripts
   survive redeploys when the `/data` disk is attached.
@@ -110,7 +129,7 @@ API-key setup.
   transcripts are not in these portable exports; retain whole-disk backups for full disaster recovery.
   Keep `BACKUP_ENCRYPTION_KEY` privately; losing it makes encrypted exports unreadable.
 
-This version does not include a web chat, voice transcription, interactive terminal UI,
+This version does not include a web chat, voice synthesis, interactive terminal UI,
 arbitrary plugins, or external MCP servers. Configured MCP servers are in-process handlers
 for sessions, memory and the bounded workspace tools above. Standard tools run in a Linux
 container. There is no desktop, GPU, Docker daemon, sudo, or access to your laptop.

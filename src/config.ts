@@ -6,10 +6,10 @@ export interface Config {
   model: string; effort: Effort; fast: boolean; permissionMode: 'auto';
   maxTurns: number; timeoutMs: number;
   backupKeys?: string[]; backupEncryptionKey?: string;
-  keyLabels?: string[];
+  keyLabels?: string[]; elevenLabsKey?: string;
 }
 
-export function configSecrets(c: Config): string[] { return [c.token, c.apiKey, ...(c.backupKeys ?? []), ...(c.backupEncryptionKey ? [c.backupEncryptionKey] : [])]; }
+export function configSecrets(c: Config): string[] { return [c.token, c.apiKey, ...(c.backupKeys ?? []), ...(c.backupEncryptionKey ? [c.backupEncryptionKey] : []), ...(c.elevenLabsKey ? [c.elevenLabsKey] : [])]; }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const required = (key: string) => {
@@ -45,7 +45,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     catch { throw new Error('Set ANTHROPIC_KEY_LABELS to unique non-secret labels for each unique configured key.'); }
   }
   if (backupEncryptionKey && !/^[a-f0-9]{64}$/i.test(backupEncryptionKey)) throw new Error('Set BACKUP_ENCRYPTION_KEY to 32 random bytes encoded as hex.');
-  return { token, owner, apiKey: required('ANTHROPIC_API_KEY'), model, backupKeys, backupEncryptionKey, keyLabels,
+  return { token, owner, apiKey: required('ANTHROPIC_API_KEY'), model, backupKeys, backupEncryptionKey, keyLabels, elevenLabsKey: env.ELEVENLABS_API_KEY?.trim() || undefined,
     effort, fast: (env.CLAUDE_FAST_MODE ?? 'true') === 'true', permissionMode: 'auto', maxTurns,
     timeoutMs: positive('JOB_TIMEOUT_MINUTES', 20) * 60_000,
     dataDir: path.resolve(env.DATA_DIR ?? './data') };

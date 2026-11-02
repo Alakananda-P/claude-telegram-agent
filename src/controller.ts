@@ -16,6 +16,7 @@ import { Automation, clockInfo, type Task, type Batch } from './automation.js';
 import { artifactSnapshot, changedArtifacts } from './artifacts.js';
 import { Backups } from './backup.js';
 import { KeyPool } from './key-pool.js';
+import { Transcriber, TranscriptionError, type TranscriptionService } from './transcription.js';
 
 export interface Messenger {
   send(chat: number, text: string): Promise<void>;
@@ -55,7 +56,7 @@ Send a task in plain text, or upload a document with instructions in its caption
 /get PATH — download a project file (up to 49 MB)
 /help — this guide
 Auto uses safety checks and can deny actions. No unrestricted permission bypass.
-Photos, videos, animations and documents: up to 20 MB each. Send instructions after uploading, or use /process.
+Voice notes run immediately as spoken instructions. Audio files, photos, videos, animations and documents: up to 20 MB each. Send instructions after uploading, or use /process.
 /batch — collect multiple files; /process — process the current batch
 /queue — tasks, cancel, reorder, pause/resume and explicit retry
 /schedules — reminders and recurring tasks; ask Claude to create or edit them
@@ -81,7 +82,7 @@ export class Controller {
   private cleaningUi?: Promise<void>;
   private restorePending?: { path: string; project: string; expires: number };
 
-  constructor(private config: Config, private store: StateStore, private messenger: Messenger, private runner: Runner, private ledger?: UsageLedger, private titles?: TitleGenerator, private keys = new KeyPool(config, store)) {
+  constructor(private config: Config, private store: StateStore, private messenger: Messenger, private runner: Runner, private ledger?: UsageLedger, private titles?: TitleGenerator, private keys = new KeyPool(config, store), private transcriber: TranscriptionService = new Transcriber(config, store)) {
     this.memory = new SharedMemory(config.dataDir, configSecrets(config));
     this.chats = new ChatArchive(path.join(config.dataDir, 'bot', 'chats'), configSecrets(config));
     this.sessions = new SessionCatalog(store, this.chats, configSecrets(config), path.join(config.dataDir, 'claude', 'projects'));
@@ -122,7 +123,7 @@ export class Controller {
     try {
       if (data === 'memory confirm-clear') {
         await this.panel('Clear shared memory? Saved conversations and files will stay.', [[button('Clear memory', 'memory clear')], ...BACK]);
-      } else await this.handle({ ...callback.message, from: callback.from, text: '/' + data, document: undefined, photo: undefined, video: undefined, video_note: undefined, animation: undefined, media_group_id: undefined, caption: undefined });
+      } else await this.handle({ ...callback.message, from: callback.from, text: '/' + data, document: undefined, photo: undefined, video: undefined, video_note: undefined, animation: undefined, voice: undefined, audio: undefined, media_group_id: undefined, caption: undefined });
     } finally { this.panelId = undefined; }
   }
 
@@ -269,7 +270,9 @@ export class Controller {
       return this.history(id, Number(page) || 0);
     }
     if (command === 'token' || command === 'tokens' || command === 'cost') {
-      return this.panel(this.ledger?.report(command === 'cost' ? 'cost' : 'tokens') ?? 'Usage records are not available yet.');
+      const usage = this.store.data.transcriptionUsage;
+      const speechUsage = command === 'cost' && usage ? `\n\nElevenLabs Scribe: ${usage.completedRequests} successful request(s) · ${(usage.seconds / 60).toFixed(2)} audio minutes · ${usage.cachedRequests} cache reuse(s).\nBilled separately from Claude; exact amount depends on your ElevenLabs plan. Failed/ambiguous requests may also be charged by the provider.` : '';
+      return this.panel((this.ledger?.report(command === 'cost' ? 'cost' : 'tokens') ?? 'Usage records are not available yet.') + speechUsage);
     }
     if (command === 'status') {
       const d = this.store.data;
@@ -360,7 +363,7 @@ export class Controller {
         return;
       }
       if (command && command !== 'run') return this.say('Unknown command. Send /help, or /run followed by your task.');
-      if (message.document || message.photo?.length || message.video || message.video_note || message.animation) return this.receive(message, root);
+      if (message.document || message.photo?.length || message.video || message.video_note || message.animation || message.voice || message.audio) return this.receive(message, root);
       const prompt = command === 'run' ? argument : text;
       if (!prompt) return this.say('Send a text task, photo, video or document. Use /help for commands.');
       const pending = this.pendingBatches();
@@ -407,7 +410,7 @@ export class Controller {
   }
 
   private async execute(task: Task, cwd: string, abort: AbortController): Promise<void> {
-    const { prompt, project } = task;
+    let { prompt } = task; const { project } = task;
     const job = { id: task.id, project, startedAt: task.startedAt! };
     this.store.data.active = job; await this.store.save();
     let status: 'completed' | 'failed' | 'cancelled' = 'failed';
@@ -415,7 +418,6 @@ export class Controller {
     const originalKey = archiveKey;
     const delivered = new Set<string>();
     const before = await artifactSnapshot(cwd);
-    await this.chats.append(archiveKey, { role: 'user', text: task.displayPrompt ?? prompt });
     const bind = async (id: string) => {
       const active = task.interactive && (this.chatKey() === archiveKey || this.resolveChat(this.chatKey()) === archiveKey);
       await this.chats.bind(archiveKey, id);
@@ -427,7 +429,7 @@ export class Controller {
         await this.sessions.ensureName(id); await this.store.save();
       }
     };
-    let progress = 'Thinking…';
+    let progress = task.voiceInput ? 'Transcribing voice…' : 'Thinking…';
     let timedOut = false;
     const timeout = setTimeout(() => { timedOut = true; abort.abort(); }, this.config.timeoutMs);
     let indicator: number | undefined;
@@ -462,11 +464,23 @@ export class Controller {
         await this.store.save();
       }
       abort.signal.throwIfAborted();
+      if (task.voiceInput) {
+        const transcript = await this.transcriber.transcribe(cwd, task.voiceInput, undefined, abort.signal);
+        if (!transcript.hasSpeech) throw new TranscriptionError('No speech was detected in this voice note. Please record it again or type the instruction.');
+        if (transcript.text.length > 24000) throw new TranscriptionError(`This voice note is too long to run as one instruction. Transcript saved: ${transcript.transcriptFile}. Send a shorter instruction.`);
+        prompt = transcript.text + (task.attachedFiles?.length ? '\n\nAttached project files:\n' + task.attachedFiles.join('\n') : '');
+        if (prompt.length > 30000) throw new TranscriptionError('Voice instruction and attachment list are too long. Use a shorter instruction or fewer files. The transcript is saved.');
+        task.prompt = prompt; task.displayPrompt = transcript.text + (task.attachedFiles?.length ? `\n[${task.attachedFiles.length} attached files]` : '');
+        delete task.voiceInput; await this.store.save();
+        progress = 'Thinking…';
+        if (indicator !== undefined) await this.messenger.edit(this.config.owner, indicator, progress).catch(() => {});
+      }
+      await this.chats.append(archiveKey, { role: 'user', text: task.displayPrompt ?? prompt });
       const selected = effectiveSettings(task.settings ?? this.settings);
       const prior = (await this.chats.read(originalKey)).slice(-30).map(t => `${t.role}: ${t.text}`).join('\n').slice(-24000);
       const result = await this.runner.run({ prompt, cwd, session: this.store.data.conversations!.some(s => s.id === originalKey && !s.trashedAt) ? originalKey : undefined, resumeContext: prior,
         settings: selected, memoryEnabled: this.store.data.memoryEnabled !== false, sessions: this.sessions,
-        workspace: { root: cwd, project, automation: this.automation, deliver: async (file, preview) => { await this.deliver(cwd, file, preview); delivered.add(file.replace(/\\/g, '/')); }, backup: () => this.exportBackup() } }, async event => {
+        workspace: { root: cwd, project, automation: this.automation, transcribe: async (file, language) => { progress = 'Transcribing audio…'; try { return await this.transcriber.transcribe(cwd, file, language, abort.signal); } finally { progress = 'Thinking…'; } }, deliver: async (file, preview) => { await this.deliver(cwd, file, preview); delivered.add(file.replace(/\\/g, '/')); }, backup: () => this.exportBackup() } }, async event => {
         if (event.type === 'session') {
           await bind(event.id);
         } else if (event.type === 'usage' || event.type === 'step') {
@@ -501,7 +515,7 @@ export class Controller {
       await this.say(timedOut ? 'This task reached its time limit and was stopped.'
         : this.persistenceFailed ? 'Usage storage failed. New tasks are paused until storage is restored.'
         : abort.signal.aborted ? 'Task stopped.'
-        : error instanceof AgentError ? error.message : 'The task could not finish. Check API access and storage, or try a smaller task.');
+        : error instanceof AgentError || error instanceof TranscriptionError ? error.message : 'The task could not finish. Check API access and storage, or try a smaller task.');
     } finally {
       clearTimeout(timeout); clearInterval(heartbeat);
       await finishIndicator();
@@ -524,8 +538,9 @@ export class Controller {
     const videos = uploads.filter(u => u.mediaType === 'video' || (!u.mediaType && !u.photo && /\.(mp4|mov|m4v|webm|mkv|avi|mpeg|mpg|3gp)$/i.test(u.name))).length;
     const animations = uploads.filter(u => u.mediaType === 'animation').length;
     const images = uploads.filter(u => !u.mediaType && (u.photo || /\.(png|jpe?g|webp|gif|bmp|heic|heif|tiff?|avif)$/i.test(u.name))).length;
-    const files = uploads.length - images - videos - animations;
-    const text = [images ? `📷 ${images} image${images === 1 ? '' : 's'}` : '', videos ? `🎬 ${videos} video${videos === 1 ? '' : 's'}` : '', animations ? `🎞 ${animations} animation${animations === 1 ? '' : 's'}` : '', files ? `📎 ${files} file${files === 1 ? '' : 's'}` : ''].filter(Boolean).join(' · ') + ' received';
+    const audios = uploads.filter(u => u.mediaType === 'voice' || u.mediaType === 'audio' || (!u.mediaType && /\.(mp3|wav|ogg|oga|opus|m4a|aac|flac|aiff?|wma)$/i.test(u.name))).length;
+    const files = uploads.length - images - videos - animations - audios;
+    const text = [audios ? `🎙 ${audios} audio file${audios === 1 ? '' : 's'}` : '', images ? `📷 ${images} image${images === 1 ? '' : 's'}` : '', videos ? `🎬 ${videos} video${videos === 1 ? '' : 's'}` : '', animations ? `🎞 ${animations} animation${animations === 1 ? '' : 's'}` : '', files ? `📎 ${files} file${files === 1 ? '' : 's'}` : ''].filter(Boolean).join(' · ') + ' received';
     // A single buttonless receipt across albums; never replace a clicked control panel.
     if (this.messenger.panel) {
       try { await this.messenger.panel(this.config.owner, text, [], undefined, 'uploads'); return; }
@@ -535,12 +550,13 @@ export class Controller {
   }
   private async receive(message: Message, root: string): Promise<void> {
     const photo = message.photo?.slice().sort((a, b) => b.width * b.height - a.width * a.height)[0];
-    const media = message.video ?? message.animation ?? message.video_note ?? message.document;
+    const media = message.video ?? message.animation ?? message.video_note ?? message.voice ?? message.audio ?? message.document;
     const attachment = photo ?? media!;
     if ((attachment.file_size ?? 0) > 20000000) return this.say('Upload exceeds the 20 MB incoming file limit. Compress or split the video/file and send it again.');
-    const fallback = message.video ? 'video.mp4' : message.animation ? (message.animation.mime_type === 'image/gif' ? 'animation.gif' : 'animation.mp4') : message.video_note ? 'video-note.mp4' : media?.mime_type?.startsWith('video/') ? 'video.mp4' : 'document.bin';
+    const audioExt = media?.mime_type === 'audio/mpeg' ? 'mp3' : media?.mime_type === 'audio/wav' ? 'wav' : media?.mime_type === 'audio/mp4' ? 'm4a' : media?.mime_type === 'audio/flac' ? 'flac' : 'ogg';
+    const fallback = message.voice ? 'voice.' + audioExt : message.audio || media?.mime_type?.startsWith('audio/') ? 'audio.' + audioExt : message.video ? 'video.mp4' : message.animation ? (message.animation.mime_type === 'image/gif' ? 'animation.gif' : 'animation.mp4') : message.video_note ? 'video-note.mp4' : media?.mime_type?.startsWith('video/') ? 'video.mp4' : 'document.bin';
     const base = photo ? 'photo.jpg' : path.basename((media?.file_name ?? fallback).replace(/\\/g, '/'));
-    const mediaType = photo ? undefined : message.animation && !message.video ? 'animation' as const : (message.video || message.video_note || media?.mime_type?.startsWith('video/')) ? 'video' as const : undefined;
+    const mediaType = photo ? undefined : message.voice ? 'voice' as const : message.audio || media?.mime_type?.startsWith('audio/') ? 'audio' as const : message.animation && !message.video ? 'animation' as const : (message.video || message.video_note || media?.mime_type?.startsWith('video/')) ? 'video' as const : undefined;
     if (secretPath(base)) return this.say('Do not send credential files through Telegram. Configure secrets in Render.');
     const indicator = await this.messenger.temporary(this.config.owner, 'Receiving ' + (photo ? 'photo' : mediaType ?? 'file') + '…').catch(() => undefined);
     let success = false;
@@ -570,25 +586,26 @@ export class Controller {
       await this.chats.append(this.resolveChat(batch.chatKey), { role: 'user', text: `Attachment: ${base}\nProject path: ${relative}`, file: { id: attachment.file_id, name: base } });
       await this.store.save(); success = true;
       await this.uploadReceipt();
-      if (message.caption?.trim() && !batch.manual && !batch.groupId) await this.processBatches([batch], batch.prompt!);
+      if (message.voice) await this.processBatches(this.pendingBatches(), 'Voice instruction', relative);
+      else if (message.caption?.trim() && !batch.manual && !batch.groupId) await this.processBatches([batch], batch.prompt!);
     } catch {
       await this.say('Upload could not be accepted. Check file size/format and send it again. No processing started.');
     } finally {
       if (indicator !== undefined) await this.messenger.remove(this.config.owner, indicator).catch(() => this.messenger.edit(this.config.owner, indicator, success ? 'Received.' : 'Upload failed.').catch(() => {}));
     }
   }
-  private async processBatches(batches: Batch[], instruction?: string): Promise<void> {
+  private async processBatches(batches: Batch[], instruction?: string, voiceInput?: string): Promise<void> {
     if (!batches.length || !batches.some(b => b.uploadIds.length)) return this.say('No files waiting in this chat. Send photos, videos or documents first.');
     const ids = new Set(batches.flatMap(b => b.uploadIds));
     const files = this.store.data.uploads!.filter(u => ids.has(u.id));
     const prompt = instruction ?? (batches.map(b => b.prompt).filter(Boolean).join('\n') || 'Inspect these files. For bill photos, extract only clear values, check arithmetic, and ask about unclear fields with relevant crops. If the desired output is unclear, ask the owner.');
     for (const batch of batches) batch.status = 'queued';
     const task = await this.automation.enqueue({ kind: 'agent', project: batches[0].project, chatKey: batches[0].chatKey,
-      prompt: prompt + '\n\nAttached project files:\n' + files.map(f => f.path).join('\n'), displayPrompt: prompt + `\n[${files.length} attached files]`, settings: { ...this.settings }, interactive: true });
+      prompt: prompt + '\n\nAttached project files:\n' + files.map(f => f.path).join('\n'), displayPrompt: prompt + `\n[${files.length} attached files]`, voiceInput, attachedFiles: voiceInput ? files.filter(f => f.path !== voiceInput).map(f => f.path) : undefined, settings: { ...this.settings }, interactive: true });
     for (const batch of batches) await this.dismiss('batch-' + batch.id);
     await this.uploadReceipt();
     await this.dismiss('controls');
-    await this.say(`${files.length} file(s) queued for processing.`, false, 'task-' + task.id); this.kick();
+    if (!voiceInput || this.pump || this.store.data.queuePaused) await this.say(voiceInput ? 'Voice instruction queued.' : `${files.length} file(s) queued for processing.`, false, 'task-' + task.id); this.kick();
   }
   private async deliver(root: string, relative: string, preview?: string): Promise<void> {
     const file = await safeFile(root, relative);

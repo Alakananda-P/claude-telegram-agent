@@ -3,17 +3,19 @@ import assert from 'node:assert/strict';
 import { mkdtemp, readFile, readdir, mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { ChatArchive } from '../src/chats.js';
 import { Controller } from '../src/controller.js';
 import type { Runner, AgentRequest } from '../src/agent.js';
 import { loadConfig } from '../src/config.js';
 import { StateStore } from '../src/state.js';
 import type { Message } from '../src/safety.js';
 import type { Buttons } from '../src/ui.js';
+import { TranscriptionError, type TranscriptionService } from '../src/transcription.js';
 
 const message = (text: string): Message => ({ from: { id: 123 }, chat: { id: 123, type: 'private' }, text });
 const photo = (id: string, group?: string): Message => ({ ...message(''), media_group_id: group, photo: [{ file_id: id + '-small', width: 100, height: 100 }, { file_id: id + '-large', width: 1200, height: 900 }] });
 const video = (id: string, group?: string): Message => ({ ...message(''), media_group_id: group, video: { file_id: id, width: 640, height: 360, duration: 2, file_size: 8, thumbnail: { file_id: id + '-thumb' } } } as Message);
-async function setup(runner?: Runner) {
+async function setup(runner?: Runner, transcriber?: TranscriptionService) {
   const dataDir = await mkdtemp(path.join(tmpdir(), 'tg-agent-controller-'));
   const config = loadConfig({ TELEGRAM_BOT_TOKEN: '123456:abcdefghijklmnopqrstuvw', TELEGRAM_OWNER_ID: '123', ANTHROPIC_API_KEY: 'test-only', DATA_DIR: dataDir });
   const store = await StateStore.open(path.join(dataDir, 'bot', 'state.json'));
@@ -39,8 +41,60 @@ async function setup(runner?: Runner) {
     calls.push(request); await emit({ type: 'session', id: 'session-' + calls.length });
     return { text: 'Task complete', session: 'session-' + calls.length, cumulativeCost: 0.1 };
   } };
-  return { bot: new Controller(config, store, sender, agent), store, replies, calls, config, dataDir, deleted, indicators, screens, panels, acknowledgements, downloads, files, sender };
+  return { bot: new Controller(config, store, sender, agent, undefined, undefined, undefined, transcriber), store, replies, calls, config, dataDir, deleted, indicators, screens, panels, acknowledgements, downloads, files, sender };
 }
+
+const voice = (): Message => ({ ...message(''), voice: { file_id: 'voice-original', duration: 3, mime_type: 'audio/ogg' } });
+const speech = { text: 'Please read the attached bill', language: 'eng', durationSeconds: 3, provider: 'ElevenLabs' as const, model: 'scribe_v2' as const, cached: false, hasSpeech: true, transcriptFile: 'transcripts/voice.txt', metadataFile: 'transcripts/voice.json' };
+
+test('voice executes spoken instructions immediately, consumes pending photos and persists actual text', async () => {
+  let transcriptions = 0;
+  const { bot, downloads, calls, store, indicators, dataDir } = await setup(undefined, { async transcribe(_root, file) { transcriptions++; assert.match(file, /voice\.ogg$/); return speech; } });
+  await bot.handle(photo('bill')); await bot.handle(voice()); await bot.idle();
+  assert.equal(transcriptions, 1); assert.deepEqual(downloads, ['bill-large', 'voice-original']);
+  assert.equal(calls.length, 1); assert.match(calls[0].prompt, /Please read the attached bill/); assert.match(calls[0].prompt, /photo\.jpg/);
+  assert.equal(store.data.tasks![0].voiceInput, undefined); assert.match(store.data.tasks![0].displayPrompt!, /Please read/);
+  assert.ok(indicators.some(t => /Transcribing/.test(t)));
+  const saved = await new ChatArchive(path.join(dataDir, 'bot/chats'), []).read('session-1'); assert.ok(saved.some(t => t.role === 'user' && t.text.includes('Please read the attached bill')));
+  assert.ok(calls[0].workspace?.transcribe);
+});
+
+test('audio files wait for a text prompt and expose callable transcription without executing recorded speech', async () => {
+  let transcriptions = 0;
+  const { bot, calls, panels } = await setup(undefined, { async transcribe() { transcriptions++; return speech; } });
+  await bot.handle({ ...message(''), audio: { file_id: 'song', file_name: 'song.mp3', mime_type: 'audio/mpeg' } });
+  assert.equal(calls.length, 0); assert.equal(transcriptions, 0); assert.match(panels.at(-1)!.text, /1 audio.*received/);
+  await bot.handle(message('Summarize the recording')); await bot.idle(); assert.equal(calls.length, 1); assert.equal(transcriptions, 0);
+  assert.equal((await calls[0].workspace!.transcribe!('uploads/song.mp3')).text, speech.text);
+});
+
+test('transcription failure makes no Claude call and explicit retry keeps voice input', async () => {
+  let attempts = 0; const { bot, calls, replies, store } = await setup(undefined, { async transcribe() { attempts++; if (attempts === 1) throw new TranscriptionError('ElevenLabs quota exhausted.'); return speech; } });
+  await bot.handle(voice()); await bot.idle(); assert.equal(calls.length, 0); assert.match(replies.join('\n'), /quota exhausted/);
+  const task = store.data.tasks![0]; assert.equal(task.status, 'failed'); assert.ok(task.voiceInput);
+  await bot.automation.retryTask(task.id); await bot.handle(message('/queue resume')); await bot.idle();
+  assert.equal(calls.length, 1); assert.equal(attempts, 2); assert.match(calls[0].prompt, /Please read/);
+});
+
+test('silent or unauthorized voice notes never run Claude', async () => {
+  let attempts = 0; const { bot, calls, downloads, replies } = await setup(undefined, { async transcribe() { attempts++; return { ...speech, hasSpeech: false, text: '[music]' }; } });
+  await bot.handle({ ...voice(), from: { id: 666 } }); assert.equal(downloads.length, 0);
+  await bot.handle(voice()); await bot.idle(); assert.equal(attempts, 1); assert.equal(calls.length, 0); assert.match(replies.join('\n'), /No speech/);
+});
+
+test('Stop aborts transcription and never starts Claude', async () => {
+  let started!: () => void; const ready = new Promise<void>(r => { started = r; });
+  const { bot, calls, store, deleted } = await setup(undefined, { async transcribe(_root, _file, _language, signal) { started(); await new Promise((_, reject) => signal!.addEventListener('abort', () => reject(new Error('aborted')), { once: true })); return speech; } });
+  await bot.handle(voice()); await ready; await bot.handle(message('/stop')); await bot.idle();
+  assert.equal(calls.length, 0); assert.equal(store.data.tasks![0].status, 'cancelled'); assert.ok(deleted.length);
+});
+
+test('queued voice metadata survives state reload and retry without corrupting old sessions', async () => {
+  const { bot, store } = await setup(); await bot.automation.setPaused(true);
+  await bot.handle(voice()); const saved = await StateStore.open(store.file);
+  assert.equal(saved.data.uploads![0].mediaType, 'voice'); assert.ok(saved.data.tasks![0].voiceInput?.endsWith('voice.ogg'));
+  assert.equal(saved.data.tasks![0].status, 'queued'); assert.deepEqual(saved.data.tasks![0].attachedFiles, []);
+});
 
 test('unauthorized messages do not produce replies, uploads or jobs', async () => {
   const { bot, replies, calls } = await setup();

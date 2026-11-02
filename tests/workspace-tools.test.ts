@@ -12,7 +12,8 @@ import { StateStore } from '../src/state.js';
 test('workspace MCP transport exposes valid schemas and manages real schedules, clock and bill validation', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'tg-mcp-')); const store = await StateStore.open(path.join(root, 'state.json'));
   const delivered: string[] = [];
-  const server = workspaceServer({ root, project: 'default', automation: new Automation(store), deliver: async f => { delivered.push(f); }, backup: async () => {} });
+  const transcribed: string[] = [];
+  const server = workspaceServer({ root, project: 'default', automation: new Automation(store), deliver: async f => { delivered.push(f); }, backup: async () => {}, transcribe: async (file, language) => { transcribed.push(file + ':' + language); return { text: 'हैलो '.repeat(5000), language: 'hin', durationSeconds: 3, provider: 'ElevenLabs', model: 'scribe_v2', cached: false, hasSpeech: true, transcriptFile: 'transcripts/test.txt', metadataFile: 'transcripts/test.json' }; } });
   const client = new Client({ name: 'workspace-test', version: '1.0.0' }); const [a, b] = InMemoryTransport.createLinkedPair();
   try {
     await server.instance.connect(b); await client.connect(a);
@@ -26,5 +27,17 @@ test('workspace MCP transport exposes valid schemas and manages real schedules, 
     await call('manage_schedule', { id: s.id, action: 'pause' }); assert.equal(store.data.schedules![0].enabled, false);
     const bill = await call('validate_bill', { rows: [{ label: 'Item', quantity: 2, rate: 15, amount: 30 }], total: 30, uncertain: ['date'] }); assert.equal(bill.ready, false);
     await call('deliver_file', { file: 'output/table.csv', preview: 'Ready' }); assert.deepEqual(delivered, ['output/table.csv']);
+    const transcription = await call('transcribe_media', { file: 'uploads/voice.ogg', language: 'hi' });
+    assert.deepEqual(transcribed, ['uploads/voice.ogg:hi']); assert.equal(transcription.model, 'scribe_v2');
+    assert.equal(transcription.text.length, 20000); assert.equal(transcription.truncated, true);
+    assert.equal(transcription.transcriptFile, 'transcripts/test.txt');
   } finally { await client.close(); await server.instance.close(); }
+});
+
+test('transcription tool returns a clear configuration error over MCP', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'tg-stt-mcp-')); const store = await StateStore.open(path.join(root, 'state.json'));
+  const server = workspaceServer({ root, project: 'default', automation: new Automation(store), deliver: async () => {}, backup: async () => {} });
+  const client = new Client({ name: 'stt-test', version: '1.0.0' }); const [a, b] = InMemoryTransport.createLinkedPair();
+  try { await server.instance.connect(b); await client.connect(a); const result = await client.callTool({ name: 'transcribe_media', arguments: { file: 'uploads/voice.ogg' } }); assert.equal(result.isError, true); assert.match(JSON.stringify(result.content), /ElevenLabs transcription is not configured/); }
+  finally { await client.close(); await server.instance.close(); }
 });
