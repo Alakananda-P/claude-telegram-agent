@@ -521,7 +521,7 @@ export class Controller {
     const ids = new Set(this.pendingBatches().flatMap(b => b.uploadIds));
     const uploads = this.store.data.uploads!.filter(u => ids.has(u.id));
     if (!uploads.length) return this.dismiss('uploads');
-    const videos = uploads.filter(u => u.mediaType === 'video' || (!u.mediaType && !u.photo && /\.(mp4|mov|m4v|webm|mkv|avi|mpeg|mpg|3gp|ts)$/i.test(u.name))).length;
+    const videos = uploads.filter(u => u.mediaType === 'video' || (!u.mediaType && !u.photo && /\.(mp4|mov|m4v|webm|mkv|avi|mpeg|mpg|3gp)$/i.test(u.name))).length;
     const animations = uploads.filter(u => u.mediaType === 'animation').length;
     const images = uploads.filter(u => !u.mediaType && (u.photo || /\.(png|jpe?g|webp|gif|bmp|heic|heif|tiff?|avif)$/i.test(u.name))).length;
     const files = uploads.length - images - videos - animations;

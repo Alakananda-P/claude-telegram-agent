@@ -106,6 +106,14 @@ test('round videos and animations are accepted without duplicate legacy document
   assert.match(panels.at(-1)!.text, /1 video.*1 animation.*received/);
 });
 
+test('TypeScript documents remain files while explicit video MIME metadata is preserved', async () => {
+  const { bot, panels, store } = await setup();
+  await bot.handle({ ...message(''), document: { file_id: 'code', file_name: 'main.ts' } });
+  await bot.handle({ ...message(''), document: { file_id: 'transport-video', file_name: 'clip.ts', mime_type: 'video/mp2t' } });
+  assert.match(panels.at(-1)!.text, /1 video.*1 file.*received/);
+  assert.equal(store.data.uploads![0].mediaType, undefined); assert.equal(store.data.uploads![1].mediaType, 'video');
+});
+
 test('oversized, failed and unauthorized videos never produce a false receipt or a model job', async () => {
   const { bot, sender, downloads, calls, store, replies, panels } = await setup();
   await bot.handle({ ...video('foreign'), from: { id: 999 } }); assert.equal(downloads.length, 0);
