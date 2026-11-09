@@ -62,3 +62,11 @@ test('restored archives start a fresh SDK session with bounded historical contex
   await runner.run({ cwd: '.', prompt: 'Continue', session: 'restored', resumeContext: 'past conversation' }, () => {}, new AbortController());
   assert.equal(actual!.session, undefined); assert.match(actual!.prompt, /past conversation/);
 });
+
+
+test('safety refusals never rotate keys or replay the task automatically', async () => {
+  const { AgentSafetyError } = await import('../src/agent.js'); let calls=0;
+  const {runner,store}=await setup(()=>({async run(){calls++;throw new AgentSafetyError('cyber');}}));
+  await assert.rejects(runner.run({prompt:'Current task',cwd:'.'},()=>{},new AbortController()),/safety system/);
+  assert.equal(calls,1);assert.deepEqual(store.data.disabledKeyIds,[]);
+});

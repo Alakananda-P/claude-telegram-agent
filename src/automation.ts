@@ -9,6 +9,7 @@ export interface TelegramMessageContext { beforeMessageId?: number; replyToMessa
 export interface SteerRecord { messageContext?: TelegramMessageContext; id: string; text: string; displayText: string; voiceInput?: string; attachedFiles?: string[]; status: 'preparing' | 'sent' | 'answered' | 'failed'; archived?: boolean }
 
 export interface Task {
+  failureKind?: 'safety_refusal';
   messageContext?: TelegramMessageContext;
   id: string; kind: 'agent' | 'reminder' | 'backup'; project: string; chatKey: string; prompt: string;
   status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted';

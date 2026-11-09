@@ -412,3 +412,13 @@ audit, Docker build, and a dummy-key no-network container startup check.
 Claude can choose its available tools without slash commands, including `list_telegram_messages` and `delete_telegram_messages`. It can remove its obsolete/redundant progress messages when useful and follow requests such as “remove your last two replies”. Useful answers and delivered files stay by default. The catalogue contains verified outgoing bot messages, with redacted previews, and survives restarts. “Last replies” excludes current-task replies and temporary UI by default; the model can explicitly include them for cleanup.
 
 To identify a message sent before tracking was installed (or outside the bounded 2,000-record catalogue), reply to that bot message in Telegram. Only this bot's messages in the owner's private chat can be targeted. Deletion normally requires messages younger than 48 hours; failures and already-missing messages are reported separately. Removing a Telegram bubble does not erase saved sessions, shared memory or project files. No standalone message-deletion command is required.
+
+### Shared memory with topics
+
+Shared memory has no application-level character, file-size or topic-count quota. Available server disk space still applies. Existing `memory/MEMORY.md` remains the core topic without migration or truncation. Additional facts use `memory/topics/<topic>.md`. The model can call `list_memory`, `search_memory`, paginated `read_memory`, `remember` and `edit_memory` automatically. Detailed office/client/project facts belong in their own topics.
+
+Only a short core excerpt, topic index and relevant search excerpts enter each new task prompt. Page sizes and prompt excerpts limit context consumption, not saved memory. All stored content remains readable through pagination/search. Writes are serialized across worker instances of the memory service and saved by atomic replacement. Clear-memory applies to every topic. The Telegram Memory panel shows topic count and stored bytes. Memory OFF keeps the tools and saved facts out of new requests.
+
+Encrypted backups include core and all topics and accept old backups. Backup transfer/decompression limits remain separate from live memory storage; oversized backups fail explicitly rather than silently omitting memory.
+
+Structured Claude safety refusals now produce a specific notice and `failureKind: safety_refusal` task metadata. They do not trigger key rotation or automatic task replay. Historical failed-session diagnostics log only refusal counts, model names and machine-readable categories, never prompts, tool outputs, private reasoning or provider explanations. The provider controls classifier decisions.

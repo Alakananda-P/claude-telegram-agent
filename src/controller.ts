@@ -2,7 +2,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { mkdir, lstat, readdir, readFile, writeFile, statfs } from 'node:fs/promises';
 import { configSecrets, type Config } from './config.js';
-import { AgentError, AgentApiError, type Runner } from './agent.js';
+import { AgentError, AgentApiError, AgentSafetyError, type Runner } from './agent.js';
 import { StateStore } from './state.js';
 import { authorized, projectName, redact, safeFile, secretPath, type Message, type Callback } from './safety.js';
 import { MODELS, EFFORTS, effectiveSettings, settingsLabel, modelLabel, type AgentSettings, type Effort } from './settings.js';
@@ -242,8 +242,8 @@ export class Controller {
     if (command === 'fast') return this.panel(`Speed\n\n${settingsLabel(s)}\nFast preference: ${s.fast ? 'ON' : 'OFF'}\nFast mode applies to Opus; Fable and Sonnet use standard speed. Provider capacity can temporarily put Fast mode in cooldown.`, [
       [button('⚡ Fast ON', 'fast on'), button('Standard', 'fast off')], ...BACK]);
     if (command === 'memory') {
-      const content = await this.memory.read();
-      return this.panel(`Shared memory · ${this.store.data.memoryEnabled !== false ? 'ON' : 'OFF'}\n\n${content.slice(0, 2400) || 'Nothing saved yet. Tell me what to remember, or use /memory remember TEXT.'}${content.length > 2400 ? '\n…Ask me to show or tidy the rest.' : ''}\n\nShared across every project and new chat. Turning it off does not erase old conversation history.`, [
+      const memoryPage = await this.memory.page('core', 0, 2400); const content = memoryPage.text; const memoryStats = await this.memory.list(0, 15);
+      return this.panel(`Shared memory · ${this.store.data.memoryEnabled !== false ? 'ON' : 'OFF'}\n\n${content.slice(0, 2400) || 'Nothing saved yet. Tell me what to remember, or use /memory remember TEXT.'}${memoryPage.nextOffset !== null ? '\n…Ask me to show or tidy the rest.' : ''}\n\nTopics: ${memoryStats.totalTopics} · Stored: ${memoryStats.totalBytes.toLocaleString()} bytes · No fixed memory storage cap.\n${memoryStats.topics.map(t => t.topic).join(', ')}\nAsk naturally to search, read or update a topic.\n\nShared across every project and new chat. Turning it off does not erase old conversation history.`, [
         [button('Memory ON', 'memory on'), button('Memory OFF', 'memory off')], [button('Clear saved memory', 'memory confirm-clear')], ...BACK]);
     }
     const list = [...(this.store.data.conversations ?? [])].filter(s => !s.trashedAt).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
@@ -586,6 +586,7 @@ export class Controller {
       console.log(`Claude task completed: ${selected.model}; effort=${selected.effort}; requestedFast=${selected.fast}; reportedSpeed=${this.store.data.lastSpeed ?? 'unknown'}.`);
     } catch (error) {
       if (error instanceof TitleAccountingError) this.persistenceFailed = true;
+      if (error instanceof AgentSafetyError) { task.failureKind = 'safety_refusal'; console.warn(JSON.stringify({ event: 'claude_safety_stop', task: task.id, session: archiveKey, model: task.settings?.model ?? this.config.model, category: error.category ?? 'unreported', time: new Date().toISOString() })); }
       if (error instanceof AgentApiError) { (this.store.data.health ??= {}).apiError = error.kind; console.warn(`Claude task API failure: ${error.kind}.`); await this.automation.setPaused(true); }
       status = abort.signal.aborted ? 'cancelled' : 'failed';
       await finishIndicator();

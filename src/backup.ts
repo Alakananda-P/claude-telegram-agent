@@ -12,7 +12,7 @@ import { Automation } from './automation.js';
 const id = z.string().regex(/^[a-zA-Z0-9_-]{1,100}$/);
 const project = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,47}$/);
 const date = z.string().datetime();
-const schema = z.object({ version: z.literal(1), createdAt: date, memory: z.string().max(64000),
+const schema = z.object({ version: z.literal(1), createdAt: date, memory: z.string(), memoryTopics: z.array(z.object({ topic: z.string().regex(/^[a-z0-9][a-z0-9_-]{0,79}$/), text: z.string() })).optional(),
   chats: z.array(z.object({ id, project, updatedAt: date, title: z.string().max(96).optional(), turns: z.array(z.object({ role: z.enum(['user', 'assistant']), text: z.string().max(1000000) })).max(100000) })).max(10000),
   schedules: z.array(z.object({ id, name: z.string().min(1).max(80), kind: z.enum(['agent', 'reminder', 'backup']), prompt: z.string().min(1).max(10000), project, timezone: z.string(), at: z.string().optional(), cron: z.string().optional(), intervalMinutes: z.number().int().positive().optional(), nextRun: date })).max(10000),
   files: z.array(z.object({ project, path: z.string().max(512), base64: z.string().max(60000000) })).max(10000),
@@ -45,7 +45,8 @@ export class Backups {
         }; await walk('', 0);
       }
     }
-    const payload = schema.parse({ version: 1, createdAt: new Date().toISOString(), memory: await this.memory.read(), chats, schedules: this.store.data.schedules ?? [], files });
+    const savedMemory = await this.memory.snapshot();
+    const payload = schema.parse({ version: 1, createdAt: new Date().toISOString(), memory: savedMemory.find(t => t.topic === 'core')?.text ?? '', memoryTopics: savedMemory.filter(t => t.topic !== 'core'), chats, schedules: this.store.data.schedules ?? [], files });
     const plain = Buffer.from(JSON.stringify(payload));
     if (this.secrets.some(s => s.length > 5 && plain.includes(Buffer.from(s)))) throw new Error('Backup contains a configured credential; remove it from saved content before exporting.');
     if (plain.length > 64000000) throw new Error('Backup exceeds the 64 MB uncompressed limit.');
@@ -75,9 +76,8 @@ export class Backups {
         if (stat?.isSymbolicLink()) throw new Error('Refusing restore through a symlink.');
       }
     }
-    const existing = await this.memory.read();
-    const mergeMemory = payload.memory.trim() && !existing.includes(payload.memory.trim());
-    if (mergeMemory && ((existing + payload.memory).length + 4 > 16000 || redact(payload.memory, this.secrets).includes('[REDACTED]'))) throw new Error('Review memory before restoring; the merged memory is oversized or contains redacted secrets.');
+    const memoryEntries = [{ topic: 'core', text: payload.memory }, ...(payload.memoryTopics ?? [])];
+    if (memoryEntries.some(entry => redact(entry.text, this.secrets).includes('[REDACTED]'))) throw new Error('Review memory before restoring; it contains redacted secrets.');
     for (const s of payload.schedules) {
       const scratch = { data: { tasks: [], schedules: [] }, save: async () => {} } as unknown as StateStore;
       await new Automation(scratch).createSchedule({ ...s, at: s.at ? new Date(Date.now() + 60000).toISOString() : undefined });
@@ -89,7 +89,7 @@ export class Backups {
       this.store.data.conversations!.push({ id: s.id, project: s.project, updatedAt: s.updatedAt, title: s.title ? redact(s.title, this.secrets) : undefined });
       (this.store.data.resumeDisabled ??= []).push(s.id); chats++;
     }
-    if (mergeMemory) await this.memory.remember(payload.memory);
+    await this.memory.merge(memoryEntries);
     for (const s of payload.schedules) if (!this.store.data.schedules!.some(x => x.id === s.id)) { this.store.data.schedules!.push({ ...s, enabled: false }); schedules++; }
     for (const f of payload.files) {
       const base = path.resolve(this.root, 'workspaces'); await mkdir(base, { recursive: true });

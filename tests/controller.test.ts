@@ -356,6 +356,7 @@ test('project names matching Object prototype properties start without a phantom
 
 test('timeout still aborts bounded work without a spending cap', async () => {
   const runner: Runner = { async run(_request, _emit, abort) {
+    abort.signal.throwIfAborted();
     await new Promise<void>((_resolve, reject) => abort.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true }));
     throw new Error('unreachable');
   } };
@@ -491,4 +492,14 @@ test('message tools bind to the owner and keep reply targets and last-message cu
     await bot.handle({ ...message('Remove it'), from: { id: 666 }, reply_to_message: target }); assert.deepEqual(adopted, [45, 65]);
   } finally { release(); await bot.idle(); }
   const saved = await StateStore.open(store.file); assert.equal(saved.data.tasks![0].messageContext!.replyToMessageId, 45); assert.equal(saved.data.tasks![0].steers![0].messageContext!.replyToMessageId, 65);
+});
+
+
+test('safety refusal is recorded distinctly without pausing unrelated future requests', async () => {
+  const {AgentSafetyError}=await import('../src/agent.js');
+  const {bot,store,replies}=await setup({async run(_r,emit){await emit({type:'session',id:'refused-session'});throw new AgentSafetyError('cyber');}});
+  await bot.handle(message('Current task'));await bot.idle();
+  assert.equal(store.data.tasks![0].status,'failed');assert.equal(store.data.tasks![0].failureKind,'safety_refusal');assert.ok(!store.data.queuePaused);
+  assert.match(replies.join('\n'),/safety system stopped/);
+  const reopened=await StateStore.open(store.file);assert.equal(reopened.data.tasks![0].failureKind,'safety_refusal');
 });

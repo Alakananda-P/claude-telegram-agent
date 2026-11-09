@@ -43,3 +43,19 @@ test('tampered exports, wrong keys, unsafe paths and configured secrets fail clo
   await new Automation(source.store).createSchedule({ name: 'Secret task', kind: 'agent', project: 'default', prompt: 'private-secret', intervalMinutes: 5 });
   await assert.rejects(source.backups.export(), /credential/);
 });
+
+
+test('topic and legacy memory round-trip beyond previous caps and old backups remain compatible', async () => {
+  const source = await setup(); const large = 'Long office record '.repeat(5000);
+  await source.memory.remember(large); await source.memory.remember('Project details '.repeat(7000), 'project-timestral');
+  const bytes = await source.backups.export(); const decoded = source.backups.decode(bytes);
+  assert.ok(decoded.memory.length > 64000); assert.equal(decoded.memoryTopics!.length, 1);
+  const target = await setup(); await target.memory.remember('Existing fact', 'project-timestral');
+  await target.backups.restore(bytes); assert.match(await target.memory.read('project-timestral'), /Existing fact/); assert.match(await target.memory.read('project-timestral'), /Project details/);
+  assert.equal(await target.memory.read(), await source.memory.read());
+  const once = await target.memory.read('project-timestral'); await target.backups.restore(bytes); assert.equal(await target.memory.read('project-timestral'), once);
+  const old = { ...decoded, memory: 'Old backup fact', memoryTopics: undefined };
+  const iv = randomBytes(12), cipher = createCipheriv('aes-256-gcm', Buffer.from(key,'hex'), iv);
+  const encrypted = Buffer.concat([cipher.update(gzipSync(JSON.stringify(old))), cipher.final()]);
+  await target.backups.restore(Buffer.concat([Buffer.from('CTAB1'), iv, cipher.getAuthTag(), encrypted])); assert.match(await target.memory.read(), /Old backup fact/);
+});

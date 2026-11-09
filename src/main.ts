@@ -12,6 +12,8 @@ import { ChatArchive } from './chats.js';
 import { HaikuTitles } from './titles.js';
 import { ResilientRunner } from './recovery.js';
 import { acceptance } from './acceptance.js';
+import { SharedMemory } from './memory.js';
+import { diagnoseFailedSessions } from './diagnostics.js';
 import { Automation } from './automation.js';
 import { KeyPool, messageProbe } from './key-pool.js';
 
@@ -29,6 +31,9 @@ async function main(): Promise<void> {
     if (!store.data.conversations?.some(x => x.id === chat.id)) (store.data.conversations ??= []).push(chat);
   }
   await store.save();
+  const memoryStats = await new SharedMemory(config.dataDir, configSecrets(config)).list();
+  console.log(JSON.stringify({ event: 'memory_storage_ready', topics: memoryStats.totalTopics, bytes: memoryStats.totalBytes, applicationStorageCap: null }));
+  try { for (const diagnostic of await diagnoseFailedSessions(config.dataDir, store.data)) console.log(JSON.stringify({ event: 'session_failure_diagnostic', ...diagnostic })); } catch { console.warn('Historical failure diagnostics unavailable; existing data is kept.'); }
   const ledger = await UsageLedger.open(path.join(config.dataDir, 'bot', 'usage.jsonl'));
   await ledger.importHistory(path.join(config.dataDir, 'claude', 'projects'));
   const totals = ledger.totals();

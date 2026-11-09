@@ -182,3 +182,29 @@ test('only registered session and enabled memory tools receive automatic approva
     }
   }
 });
+
+
+test('structured safety refusal and SDK fallback stop cleanly without accepting another model or leaking provider explanation', async () => {
+  for (const frame of [
+    { type: 'system', subtype: 'model_refusal_fallback', scope: 'session', original_model: config.model, fallback_model: 'claude-sonnet-5-5', api_refusal_category: 'cyber', api_refusal_explanation: 'PRIVATE DETAIL', session_id: 'session-1', uuid: 'refusal' },
+    { ...result, stop_reason: 'refusal', result: 'PRIVATE DETAIL' }
+  ]) {
+    const events: AgentEvent[] = [];
+    await assert.rejects(new ClaudeRunner(config, factory([init, frame, result])).run({ prompt: 'Hello', cwd: '/work' }, e => { events.push(e); }, new AbortController()), (e: any) => { assert.equal(e.name,'AgentSafetyError'); assert.match(e.message, /safety/i); assert.doesNotMatch(e.message,/PRIVATE DETAIL|model changed unexpectedly/); return true; });
+    assert.ok(!JSON.stringify(events).includes('PRIVATE DETAIL'));
+  }
+});
+
+
+test('refused stream retains usage accounting and never publishes refused text', async () => {
+  const events: AgentEvent[]=[];
+  const assistant={type:'assistant',uuid:'refused',session_id:'session-1',parent_tool_use_id:null,message:{id:'m',model:config.model,stop_reason:'refusal',content:[{type:'text',text:'PRIVATE REFUSED TEXT'}]}};
+  await assert.rejects(new ClaudeRunner(config,factory([init,assistant,{...result,stop_reason:'refusal'}])).run({prompt:'x',cwd:'/work'},e=>{events.push(e);},new AbortController()),/safety/);
+  assert.equal(events.filter(e=>e.type==='usage').length,1);assert.ok(!JSON.stringify(events).includes('PRIVATE REFUSED TEXT'));
+});
+
+
+test('local subagent refusal does not misclassify the main task as refused', async () => {
+  const frames = [init,{type:'stream_event',parent_tool_use_id:'subtask',session_id:'session-1',uuid:'sub-refusal',event:{type:'message_delta',delta:{stop_reason:'refusal'},usage:{output_tokens:1}}},{type:'system',subtype:'model_refusal_fallback',scope:'local',session_id:'session-1',uuid:'local',api_refusal_category:'cyber'},result];
+  const response = await new ClaudeRunner(config,factory(frames)).run({prompt:'Task',cwd:'/work'},()=>{},new AbortController());assert.equal(response.text,result.result);
+});
