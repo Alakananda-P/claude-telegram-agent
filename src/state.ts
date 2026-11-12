@@ -9,7 +9,9 @@ const identifier = z.string().regex(/^[a-zA-Z0-9_-]{1,100}$/);
 const projectId = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,47}$/);
 const isoDate = z.string().datetime();
 const messageContext = z.object({ beforeMessageId: z.number().int().positive().optional(), replyToMessageId: z.number().int().positive().optional() }).optional();
+const outage = z.object({ startedAt: isoDate, failures: z.number().int().positive(), reason: z.string().max(64) });
 const automationState = z.object({
+  health: z.object({ telegramOutage: outage.optional(), telegramOutages: z.array(outage.extend({ endedAt: isoDate, durationMs: z.number().finite().nonnegative() })).max(50).optional() }).passthrough().optional(),
   pendingMessageCleanup: z.array(z.object({ chat: z.number().int().positive(), id: z.number().int().positive(), retryAt: z.number().finite().nonnegative().optional(), attempts: z.number().int().nonnegative().optional() })).optional(),
   undeletableMessageIds: z.array(z.number().int().positive()).optional(),
   botMessages: z.array(z.object({ id: z.number().int().positive(), chat: z.number().int().positive(), sentAt: z.number().finite().nonnegative(), preview: z.string().max(1000), kind: z.string().max(32) })).max(2000).optional(),
@@ -34,6 +36,7 @@ export interface Conversation {
   title?: string; titleSource?: 'fallback' | 'auto' | 'model' | 'manual'; titleAttempted?: boolean;
   trashedAt?: string; purgeAt?: string;
 }
+export interface TelegramOutage { startedAt: string; endedAt: string; durationMs: number; failures: number; reason: string }
 export interface State {
   pendingMessageCleanup?: { chat: number; id: number; retryAt?: number; attempts?: number }[];
   undeletableMessageIds?: number[];
@@ -54,7 +57,7 @@ export interface State {
   tasks?: Task[]; schedules?: Schedule[]; uploads?: Upload[]; batches?: Batch[]; queuePaused?: boolean;
   bindings?: Record<string, string>; drafts?: Record<string, string>; purgedSessions?: string[];
   resumeDisabled?: string[]; sessionCredentials?: Record<string, string>; disabledKeyIds?: string[]; activeKeyId?: string;
-  health?: { telegramAt?: string; claudeAt?: string; apiError?: string; lastAlert?: string; lastBackupAt?: string; activeCredential?: number; disabledCredentials?: number[] };
+  health?: { telegramAt?: string; claudeAt?: string; apiError?: string; lastAlert?: string; lastBackupAt?: string; activeCredential?: number; disabledCredentials?: number[]; telegramOutage?: Omit<TelegramOutage, 'endedAt' | 'durationMs'>; telegramOutages?: TelegramOutage[] };
 }
 
 export class StateStore {

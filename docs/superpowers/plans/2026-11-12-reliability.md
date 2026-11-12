@@ -17,19 +17,19 @@ Source: the owner's `Bot_Issues_Report.md` and request to retire keys after 48 h
 
 ### 1. Authentication retirement
 
-- [ ] Add failing deterministic tests in `tests/key-pool.test.ts`: exact 48-hour boundary, success/non-auth reset, legacy-history migration, late success not resurrecting a retired key, restart durability, all-retired empty routing and no further probes.
-- [ ] Extend `keyRecordSchema` in `src/key-pool.ts` with streak/retirement timestamps, retired status and history event. Migrate only a consecutive observed authentication-failure suffix.
-- [ ] Retire only on fresh failure; exclude retired credentials from active routing/checks and expose archived history in the existing keys menu.
-- [ ] Update `src/controller.ts` key menu callback and health counts.
-- [ ] Run key-pool/recovery tests, typecheck and inspect the diff; commit the subsystem.
+- [x] Add failing deterministic tests in `tests/key-pool.test.ts`: exact 48-hour boundary, success/non-auth reset, legacy-history migration, late success not resurrecting a retired key, restart durability, all-retired empty routing and no further probes.
+- [x] Extend `keyRecordSchema` in `src/key-pool.ts` with streak/retirement timestamps, retired status and history event. Migrate only a consecutive observed authentication-failure suffix.
+- [x] Retire only on fresh failure; exclude retired credentials from active routing/checks and expose archived history in the existing keys menu.
+- [x] Update `src/controller.ts` key menu callback and health counts.
+- [x] Run key-pool/recovery tests, typecheck and inspect the diff; commit the subsystem.
 
 ### 2. Output delivery and polling
 
-- [ ] Add failing tests for output-only automatic delivery, ordinary CSV deliverables, symlink/secret exclusions and explicit file access.
-- [ ] Restrict `src/artifacts.ts` scanning to the real `output/` directory; align the agent prompt.
-- [ ] Add deterministic polling tests for short/long outages, persisted safe outage history, retry and fetched updates surviving recovery-notification failure.
-- [ ] Extend `src/polling.ts`, `src/state.ts`, `src/main.ts` and health display without changing update replay guarantees.
-- [ ] Run targeted tests and typecheck; commit.
+- [x] Add failing tests for output-only automatic delivery, ordinary CSV deliverables, symlink/secret exclusions and explicit file access.
+- [x] Restrict `src/artifacts.ts` scanning to the real `output/` directory; align the agent prompt.
+- [x] Add deterministic polling tests for short/long outages, persisted safe outage history, retry and fetched updates surviving recovery-notification failure.
+- [x] Extend `src/polling.ts`, `src/state.ts`, `src/main.ts` and health display without changing update replay guarantees.
+- [x] Run targeted tests and typecheck; commit.
 
 ### 3. Fresh continuation and reply integrity
 
@@ -57,3 +57,6 @@ Source: the owner's `Bot_Issues_Report.md` and request to retire keys after 48 h
 
 - Baseline: prior `f1ae5da` verification recorded 166 tests (166 passing on Linux; Windows skips two filesystem cases), clean typecheck/build. This is a historical baseline, not verification of the new changes.
 - New changes: pending.
+
+- Key retirement: 22 key-pool/recovery tests passing; typecheck clean. Commit `a5bdc75`.
+- Output/polling: 61 targeted tests, 60 passing and one Windows file-symlink skip; typecheck clean. Linux link checks remain required. Recovery-notification failure test confirms fetched owner updates are dispatched.

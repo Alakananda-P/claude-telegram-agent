@@ -19,7 +19,12 @@ export async function artifactSnapshot(root: string): Promise<Record<string, str
       }
     }
   };
-  await walk('', 0); return out;
+  // Automatic delivery is restricted to the dedicated deliverables directory.
+  try {
+    const output = await lstat(path.join(root, 'output'));
+    if (!output.isDirectory() || output.isSymbolicLink()) return out;
+  } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return out; throw error; }
+  await walk('output', 0); return out;
 }
 export async function changedArtifacts(root: string, before: Record<string, string>): Promise<string[]> {
   const after = await artifactSnapshot(root);

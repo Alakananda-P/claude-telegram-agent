@@ -140,8 +140,8 @@ async function main(): Promise<void> {
     console.log('Private Telegram worker started.');
     controller.start();
     keys.start();
-    await poll(telegram, store, message => controller.handle(message), shutdown.signal, callback => controller.callback(callback), async failures => {
-      if (failures >= 3) await telegram.send(config.owner, 'Telegram connection recovered. Queued work and stored files are preserved. Check /health for the latest status.').catch(() => {});
+    await poll(telegram, store, message => controller.handle(message), shutdown.signal, callback => controller.callback(callback), async (_failures, outage) => {
+      await telegram.send(config.owner, `Telegram connection recovered after ${Math.ceil(outage.durationMs / 1000)}s. Queued work and stored files are preserved. Check /health for the latest status.`);
     });
   } finally {
     stop();
