@@ -132,3 +132,64 @@ test('key history survives re-open, has usable pages, and never exposes key valu
   assert.match(reopened.panel(id, 1).text, /added/);
   for (const key of keys) assert.ok(!JSON.stringify(view).includes(key));
 });
+
+const HOUR = 60 * 60_000;
+
+test('continuous authentication failures retire a key only after a fresh failure at 48 hours', async () => {
+  const { pool, store, advance, keys } = await setup(); const id = pool.list()[0].id;
+  await pool.begin(id); await pool.failure(id, 'authentication_failed');
+  advance(48 * HOUR - 1); await pool.failure(id, 'authentication_failed');
+  assert.equal(pool.list()[0].status, 'rejected');
+  advance(1); await pool.failure(id, 'authentication_failed');
+  assert.equal(pool.list().length, 4); assert.ok(!pool.available().some(c => c.id === id));
+  assert.equal(store.data.keyRecords![id].status, 'retired');
+  assert.equal(store.data.keyRecords![id].retiredAt, '2026-11-03T00:00:00.000Z');
+  assert.notEqual(store.data.activeKeyId, id);
+  assert.match(pool.panel('retired').text, /Key 1/); assert.match(pool.panel(id).text, /retired/);
+  for (const key of keys) assert.ok(!JSON.stringify(pool.panel(id)).includes(key));
+});
+
+test('authentication success and different failures each restart the retirement clock', async () => {
+  const { pool, advance } = await setup(); const id = pool.list()[0].id;
+  await pool.failure(id, 'authentication_failed'); advance(47 * HOUR); await pool.success(id);
+  await pool.failure(id, 'authentication_failed'); advance(2 * HOUR); await pool.failure(id, 'authentication_failed');
+  assert.equal(pool.list()[0].status, 'rejected');
+  advance(45 * HOUR); await pool.failure(id, 'network_error'); await pool.failure(id, 'authentication_failed');
+  advance(2 * HOUR); await pool.failure(id, 'authentication_failed');
+  assert.equal(pool.list()[0].status, 'rejected');
+});
+
+test('old last-success timestamps never retire a recovered key; a fresh probe is required', async () => {
+  const { pool, store, advance } = await setup(); const id = pool.list()[0].id;
+  await pool.success(id); await pool.failure(id, 'authentication_failed'); advance(72 * HOUR);
+  assert.equal(pool.list()[0].status, 'rejected');
+  await pool.checkDue(); assert.equal(store.data.keyRecords![id].status, 'healthy');
+  assert.equal(store.data.keyRecords![id].authFailureSince, undefined);
+});
+
+test('retired keys survive restart with history but never route, check or resurrect', async () => {
+  let calls = 0;
+  const { pool, store, config, advance } = await setup(async () => { calls++; return { ok: false, kind: 'authentication_failed' }; });
+  for (const r of pool.list()) await pool.failure(r.id, 'authentication_failed');
+  advance(48 * HOUR); await pool.checkDue();
+  assert.equal(calls, 5); assert.equal(pool.list().length, 0); assert.deepEqual(pool.available(), []);
+  assert.equal(pool.selectedConfig(), undefined);
+  const id = Object.keys(store.data.keyRecords!)[0]; await pool.success(id);
+  assert.equal(store.data.keyRecords![id].status, 'retired');
+  const reopened = new KeyPool(config, await StateStore.open(store.file), async () => { calls++; return { ok: true }; });
+  await reopened.initialize(); await reopened.requestChecks(); await reopened.checkDue();
+  assert.equal(calls, 5); assert.equal(reopened.list().length, 0);
+  assert.match(reopened.panel('retired').text, /5/); assert.match(reopened.panel(id).text, /retired/);
+});
+
+test('legacy authentication history migrates only the current consecutive failure streak', async () => {
+  const { pool, config, store, advance } = await setup(); const [first, second] = pool.list();
+  await pool.failure(first.id, 'authentication_failed'); await pool.failure(second.id, 'authentication_failed');
+  advance(47 * HOUR); await pool.failure(second.id, 'billing_error'); await pool.failure(second.id, 'authentication_failed');
+  for (const r of Object.values(store.data.keyRecords!)) delete r.authFailureSince;
+  advance(HOUR);
+  const migrated = new KeyPool(config, store, async () => ({ ok: false, kind: 'authentication_failed' }), () => Date.parse('2026-11-03T00:00:00Z'));
+  await migrated.initialize(); await migrated.checkDue();
+  assert.equal(store.data.keyRecords![first.id].status, 'retired');
+  assert.equal(store.data.keyRecords![second.id].status, 'rejected');
+});

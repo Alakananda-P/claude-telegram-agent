@@ -131,7 +131,7 @@ export class Controller {
     if (!callback.message || !authorized({ ...callback.message, from: callback.from }, this.config.owner)) return;
     await this.messenger.acknowledge?.(callback.id).catch(() => {});
     const data = callback.data ?? '';
-    if (!/^(menu|help|status|stop|rename|new chat|model(?: (?:fable|opus|sonnet))?|efforts(?: (?:low|medium|high|xhigh|max))?|fast(?: (?:on|off))?|token count|cost|memory(?: (?:on|off|confirm-clear|clear))?|session(?: [a-zA-Z0-9_-]+)?|sessionpage \d+|history [a-zA-Z0-9_-]+ \d+|projects|project [a-zA-Z0-9_-]+|files|batch|process(?: [a-zA-Z0-9_-]+)?|discard [a-zA-Z0-9_-]+|queue(?: (?:pause|resume))?|task(?:cancel|first|retry|confirm) [a-zA-Z0-9_-]+|schedules|schedule(?:pause|resume|delete) [a-zA-Z0-9_-]+|trash|(?:delete|trashmove|restore|purge|purgeconfirm) [a-zA-Z0-9_-]+|backup(?: (?:export|files|daily|off))?|restorebackup confirm|health(?: retry)?|keys|keyhistory [a-f0-9]{16} \d+|clock)$/.test(data)) return;
+    if (!/^(menu|help|status|stop|rename|new chat|model(?: (?:fable|opus|sonnet))?|efforts(?: (?:low|medium|high|xhigh|max))?|fast(?: (?:on|off))?|token count|cost|memory(?: (?:on|off|confirm-clear|clear))?|session(?: [a-zA-Z0-9_-]+)?|sessionpage \d+|history [a-zA-Z0-9_-]+ \d+|projects|project [a-zA-Z0-9_-]+|files|batch|process(?: [a-zA-Z0-9_-]+)?|discard [a-zA-Z0-9_-]+|queue(?: (?:pause|resume))?|task(?:cancel|first|retry|confirm) [a-zA-Z0-9_-]+|schedules|schedule(?:pause|resume|delete) [a-zA-Z0-9_-]+|trash|(?:delete|trashmove|restore|purge|purgeconfirm) [a-zA-Z0-9_-]+|backup(?: (?:export|files|daily|off))?|restorebackup confirm|health(?: retry)?|keys(?: retired)?|keyhistory [a-f0-9]{16} \d+|clock)$/.test(data)) return;
     this.panelId = callback.message.message_id;
     try {
       if (data === 'memory confirm-clear') {
@@ -705,7 +705,7 @@ export class Controller {
   private async extraCommand(command: string | undefined, argument: string, messageContext?: TelegramMessageContext): Promise<boolean> {
     if (command === 'keys' || command === 'keyhistory') {
       const [id, page] = argument.split(' ');
-      const view = this.keys.panel(command === 'keyhistory' ? id : undefined, /^\d+$/.test(page ?? '') ? Number(page) : 0);
+      const view = this.keys.panel(command === 'keyhistory' || id === 'retired' ? id : undefined, /^\d+$/.test(page ?? '') ? Number(page) : 0);
       await this.panel(view.text, view.buttons); return true;
     }
     const d = this.store.data;
@@ -761,8 +761,8 @@ export class Controller {
       await this.panel(`Restore complete · ${result.chats} chats, ${result.schedules} paused schedules, ${result.files} files added. Existing data and lifetime usage preserved.`);
     } else if (command === 'health') {
       if (argument === 'retry') await this.keys.requestChecks();
-      const disk = await statfs(this.config.dataDir); const keys = 1 + (this.config.backupKeys?.length ?? 0);
-      await this.panel(`Health\n\nTelegram last successful poll: ${d.health?.telegramAt ?? 'not recorded'}\nClaude last success: ${d.health?.claudeAt ?? 'not recorded'}\nClaude error: ${d.health?.apiError ?? 'none recorded'}\nConfigured keys: ${keys}; disabled: ${d.disabledKeyIds?.length ?? 0}\nCurrent task: ${d.active?.id ?? 'idle'}\nQueue: ${d.tasks!.filter(t => t.status === 'queued').length} waiting · ${d.queuePaused ? 'paused' : 'on'}\nSchedules: ${d.schedules!.filter(s => s.enabled).length} enabled\nFree disk: ${(Number(disk.bavail) * Number(disk.bsize) / 1073741824).toFixed(2)} GiB\nLast backup delivered: ${d.health?.lastBackupAt ?? 'none'}\n\nLast success is historical, not a live credit-balance check. No external outage monitor is configured.`, [[button('Check API keys', 'health retry'), button('Key status', 'keys'), button('Queue', 'queue')], ...BACK]);
+      const disk = await statfs(this.config.dataDir); const keys = this.keys.list().length;
+      await this.panel(`Health\n\nTelegram last successful poll: ${d.health?.telegramAt ?? 'not recorded'}\nClaude last success: ${d.health?.claudeAt ?? 'not recorded'}\nClaude error: ${d.health?.apiError ?? 'none recorded'}\nConfigured keys: ${keys}; disabled: ${this.keys.list().filter(k => d.disabledKeyIds?.includes(k.id)).length}\nCurrent task: ${d.active?.id ?? 'idle'}\nQueue: ${d.tasks!.filter(t => t.status === 'queued').length} waiting · ${d.queuePaused ? 'paused' : 'on'}\nSchedules: ${d.schedules!.filter(s => s.enabled).length} enabled\nFree disk: ${(Number(disk.bavail) * Number(disk.bsize) / 1073741824).toFixed(2)} GiB\nLast backup delivered: ${d.health?.lastBackupAt ?? 'none'}\n\nLast success is historical, not a live credit-balance check. No external outage monitor is configured.`, [[button('Check API keys', 'health retry'), button('Key status', 'keys'), button('Queue', 'queue')], ...BACK]);
     } else return false;
     return true;
   }
