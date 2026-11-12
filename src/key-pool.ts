@@ -35,6 +35,7 @@ class ProbeAccountingError extends Error {}
 
 /** No raw credentials or provider error descriptions enter durable state. */
 export class KeyPool {
+  readonly primaryId: string;
   private credentials: { id: string; key: string; label: string }[];
   private checking?: Promise<void>;
   private probeAbort?: AbortController;
@@ -42,6 +43,7 @@ export class KeyPool {
   private timer?: ReturnType<typeof setInterval>;
   constructor(private config: Config, private store: StateStore, private probe: KeyProbe = messageProbe(), private now = Date.now) {
     this.credentials = [...new Set([config.apiKey, ...(config.backupKeys ?? [])])].map((key, i) => ({ key, id: createHash('sha256').update(key).digest('hex').slice(0, 16), label: config.keyLabels?.[i] ?? `Key ${i + 1}` }));
+    this.primaryId = this.credentials[0].id;
     store.data.keyRecords ??= Object.create(null); store.data.disabledKeyIds ??= [];
     for (const c of this.credentials) {
       const previous = store.data.keyRecords![c.id];
@@ -139,7 +141,7 @@ export class KeyPool {
       if (this.stopped || this.record(c.id).status === 'retired' || (abort.signal.aborted && !timedOut) || r.lastAttemptAt !== lastAttempt) continue;
       r.checks++; r.lastCheckAt = stamp(this.now());
       if (result.ok) await this.success(c.id, 'check'); else await this.failure(c.id, result.kind ?? 'unknown', 'check');
-      console.log(`API key check: ${r.label}; status=${r.status}; checks=${r.checks}.`);
+      console.log(`API key check: ${r.label}; status=${r.status}; checks=${r.checks}; activeKeys=${this.credentials.length}; retiredKeys=${this.archived().length}.`);
     }
   }
   start() { if (this.timer) return; const tick = () => void this.checkDue().catch(() => console.warn('Key status check deferred; storage unavailable.')); this.timer = setInterval(tick, 60_000); this.timer.unref(); tick(); }

@@ -41,10 +41,10 @@ Source: the owner's `Bot_Issues_Report.md` and request to retire keys after 48 h
 
 ### 4. Independent background execution
 
-- [ ] Add a dedicated persistent background service with validated project scripts and arguments, separate child processes, secret-free child environments, bounded concurrency/output/runtime, safe cancellation and durable redacted logs.
-- [ ] Add callable start/list/read/cancel tools and completion delivery independent of the active model query. Record restart interruption without replay.
-- [ ] Test a real child process outliving the submitting turn, success/failure/cancel/timeout/restart, completion exactly once, secret and symlink protection.
-- [ ] Update prompt/help and tests; commit.
+- [x] Add a dedicated persistent background service with validated project scripts and arguments, separate child processes, secret-free child environments, bounded concurrency/output/runtime, safe cancellation and durable redacted logs.
+- [x] Add callable start/list/read/cancel tools and completion delivery independent of the active model query. Record restart interruption without replay.
+- [x] Test a real child process outliving the submitting turn, success/failure/cancel/timeout/restart, completion exactly once, secret and symlink protection.
+- [x] Update prompt/help and tests; commit.
 
 ### 5. Production verification
 
@@ -62,3 +62,6 @@ Source: the owner's `Bot_Issues_Report.md` and request to retire keys after 48 h
 - Output/polling: 61 targeted tests, 60 passing and one Windows file-symlink skip; typecheck clean. Linux link checks remain required. Recovery-notification failure test confirms fetched owner updates are dispatched.
 
 - Conversation fixes: 69 controller/agent/steering/recovery tests passing. Verified notification-only results do not consume human input, merged placeholders receive one tool-blocked correction, safety stops never replay, and `/fresh` excludes failed requests while retaining the source archive and memory.
+
+- Full local validation: 191 tests, 187 passing, four platform skips; typecheck and production build clean. Background coverage includes real process lifetime across chat switches, split-secret redaction across interleaved streams, bounded/paged logs, shutdown/start race, timeouts/cancellation, restart interruption and delivery retries. Linux process-group and filesystem cases remain required before deployment.
+- Background execution is deliberately excluded from blanket MCP approval; SDK auto mode reviews it. A native execution denial also blocks using the background path in that turn.

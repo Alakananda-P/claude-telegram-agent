@@ -4,6 +4,7 @@ import { validSettings, type AgentSettings } from './settings.js';
 import type { Task, Schedule, Upload, Batch } from './automation.js';
 import { z } from 'zod';
 import { keyRecordSchema, type KeyRecord } from './key-pool.js';
+import { backgroundJobSchema, type BackgroundJob } from './background.js';
 
 const identifier = z.string().regex(/^[a-zA-Z0-9_-]{1,100}$/);
 const projectId = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,47}$/);
@@ -11,6 +12,7 @@ const isoDate = z.string().datetime();
 const messageContext = z.object({ beforeMessageId: z.number().int().positive().optional(), replyToMessageId: z.number().int().positive().optional() }).optional();
 const outage = z.object({ startedAt: isoDate, failures: z.number().int().positive(), reason: z.string().max(64) });
 const automationState = z.object({
+  backgroundJobs: z.array(backgroundJobSchema).optional(),
   health: z.object({ telegramOutage: outage.optional(), telegramOutages: z.array(outage.extend({ endedAt: isoDate, durationMs: z.number().finite().nonnegative() })).max(50).optional() }).passthrough().optional(),
   pendingMessageCleanup: z.array(z.object({ chat: z.number().int().positive(), id: z.number().int().positive(), retryAt: z.number().finite().nonnegative().optional(), attempts: z.number().int().nonnegative().optional() })).optional(),
   undeletableMessageIds: z.array(z.number().int().positive()).optional(),
@@ -39,6 +41,7 @@ export interface Conversation {
 }
 export interface TelegramOutage { startedAt: string; endedAt: string; durationMs: number; failures: number; reason: string }
 export interface State {
+  backgroundJobs?: BackgroundJob[];
   pendingMessageCleanup?: { chat: number; id: number; retryAt?: number; attempts?: number }[];
   undeletableMessageIds?: number[];
   botMessages?: { id: number; chat: number; sentAt: number; preview: string; kind: string }[];
@@ -104,6 +107,7 @@ export class StateStore {
       data[key] ??= [];
     }
     for (const task of data.tasks!) if (task.status === 'running') { task.status = 'interrupted'; task.finishedAt = new Date().toISOString(); }
+    for (const job of data.backgroundJobs ?? []) if (['starting', 'running'].includes(job.status)) { job.status = 'interrupted'; job.finishedAt = new Date().toISOString(); }
     data.bindings = Object.assign(Object.create(null), data.bindings ?? {});
     data.drafts = Object.assign(Object.create(null), data.drafts ?? {});
     data.health ??= {};

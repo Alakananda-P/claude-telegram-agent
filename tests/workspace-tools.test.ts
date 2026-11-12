@@ -8,6 +8,9 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { workspaceServer, WORKSPACE_TOOL_NAMES } from '../src/workspace-tools.js';
 import { Automation } from '../src/automation.js';
 import { StateStore } from '../src/state.js';
+import { BackgroundJobs } from '../src/background.js';
+import { loadConfig } from '../src/config.js';
+import { mkdir, writeFile } from 'node:fs/promises';
 
 test('workspace MCP transport exposes valid schemas and manages real schedules, clock and bill validation', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'tg-mcp-')); const store = await StateStore.open(path.join(root, 'state.json'));
@@ -62,4 +65,22 @@ test('Telegram tools are discoverable and callable without a slash command and e
     const result = await client.callTool({ name: 'delete_telegram_messages', arguments: { message_ids: [10] } }); assert.ok(!result.isError); assert.deepEqual(removed, [[10]]);
     const invalid = await client.callTool({ name: 'delete_telegram_messages', arguments: { message_ids: [] } }); assert.equal(invalid.isError, true); assert.equal(removed.length, 1);
   } finally { await client.close(); await server.instance.close(); }
+});
+
+test('background MCP tools start a real script, expose honest annotations and preserve its output', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'tg-background-mcp-')), root = path.join(dir, 'workspaces/default'); await mkdir(root, { recursive: true });
+  const store = await StateStore.open(path.join(dir, 'bot/state.json'));
+  const config = loadConfig({ TELEGRAM_BOT_TOKEN: '123456:abcdefghijklmnopqrstuvw', TELEGRAM_OWNER_ID: '123', ANTHROPIC_API_KEY: 'test-only', DATA_DIR: dir });
+  const jobs = new BackgroundJobs(config, store, async () => {}); await writeFile(path.join(root, 'monitor.mjs'), "console.log('MCP_BACKGROUND_OK');");
+  const server = workspaceServer({ root, project: 'default', automation: new Automation(store), deliver: async () => {}, backup: async () => {}, background: { start: input => jobs.start({ ...input, root, project: 'default', chatKey: 'chat' }), list: (offset, limit) => jobs.list(offset, limit), read: (id, offset, limit) => jobs.read(id, offset, limit), cancel: id => jobs.cancel(id) } });
+  const client = new Client({ name: 'background-test', version: '1' }), [a, b] = InMemoryTransport.createLinkedPair();
+  try {
+    await server.instance.connect(b); await client.connect(a); const tools = (await client.listTools()).tools;
+    assert.equal(tools.find(t => t.name === 'start_background_job')!.annotations!.destructiveHint, true);
+    assert.equal(tools.find(t => t.name === 'read_background_job')!.annotations!.readOnlyHint, true);
+    const call = async (name: string, args: Record<string, unknown>) => { const response = await client.callTool({ name, arguments: args }); assert.ok(!response.isError); return JSON.parse((response.content as { text: string }[])[0].text); };
+    const job = await call('start_background_job', { name: 'Monitor', script: 'monitor.mjs', runtime: 'node' }); await jobs.wait(job.id);
+    assert.equal((await call('list_background_jobs', {})).jobs.length, 1);
+    assert.match((await call('read_background_job', { id: job.id })).text, /MCP_BACKGROUND_OK/);
+  } finally { await jobs.stop(); await client.close(); await server.instance.close(); }
 });

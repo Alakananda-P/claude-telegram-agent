@@ -120,6 +120,7 @@ async function main(): Promise<void> {
       { command: 'process', description: 'Process waiting photos and files' },
       { command: 'queue', description: 'Tasks, priority, pause and retry' },
       { command: 'schedules', description: 'Reminders and recurring tasks' },
+      { command: 'background', description: 'Background scripts, output and stop controls' },
       { command: 'clock', description: 'Current India time' },
       { command: 'trash', description: 'Restore deleted chats within 48 hours' },
       { command: 'backup', description: 'Encrypted export and restore' },

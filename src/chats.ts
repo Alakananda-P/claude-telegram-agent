@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { redact } from './safety.js';
 
-export interface ChatTurn { role: 'user' | 'assistant'; text: string; file?: { id: string; name: string } }
+export interface ChatTurn { role: 'user' | 'assistant'; text: string; file?: { id: string; name: string }; eventId?: string }
 export class ChatArchive {
   private writing: Promise<void> = Promise.resolve();
   constructor(private dir: string, private secrets: string[]) {}
@@ -26,6 +26,7 @@ export class ChatArchive {
   async append(id: string, turn: ChatTurn): Promise<void> {
     const task = this.writing.then(async () => {
       const turns = await this.read(id);
+      if (turn.eventId && turns.some(t => t.eventId === turn.eventId)) return;
       turns.push({ ...turn, text: redact(turn.text, this.secrets) });
       await this.write(id, turns);
     });

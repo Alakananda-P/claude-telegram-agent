@@ -445,6 +445,25 @@ test('/fresh seeds only verified successful work and waits for a new instruction
   assert.ok(old.some(t => t.text.includes('REFUSED_REQUEST'))); assert.ok(store.data.conversations!.some(c => c.id === 'source-session'));
 });
 
+test('background work remains alive after the model turn and a new chat, then notifies its source session', async () => {
+  let jobId = '';
+  const { bot, store, replies, dataDir } = await setup({ async run(request, emit) {
+    await emit({ type: 'session', id: 'background-source' });
+    await writeFile(path.join(request.cwd, 'monitor.mjs'), "setTimeout(() => console.log('BACKGROUND_AFTER_CHAT'), 600);");
+    jobId = (await request.workspace!.background!.start({ name: 'Monitor', runtime: 'node', script: 'monitor.mjs' })).id;
+    return { session: 'background-source', text: 'Monitor is running.', cumulativeCost: 0 };
+  } });
+  try {
+    await bot.handle(message('Monitor the task in the background')); await bot.idle();
+    assert.equal(bot.background.list()[0].status, 'running');
+    await bot.handle(message('/new')); assert.equal(store.data.sessions.default, undefined);
+    await bot.background.wait(jobId); await bot.background.tick();
+    assert.ok(replies.some(r => r.includes('Monitor: completed')));
+    const archive = await new ChatArchive(path.join(dataDir, 'bot/chats'), []).read('background-source');
+    assert.ok(archive.some(t => t.text.includes('BACKGROUND_AFTER_CHAT')));
+  } finally { await bot.stop(); }
+});
+
 test('new chat clears the screen; selecting an old session displays paginated saved previews', async () => {
   const { bot, replies, screens } = await setup();
   await bot.handle(message('My first question')); await bot.idle();

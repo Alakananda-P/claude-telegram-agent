@@ -11,6 +11,7 @@ import { ChatArchive } from '../src/chats.js';
 import { SessionCatalog, SESSION_TOOL_NAMES } from '../src/sessions.js';
 import { MEMORY_TOOL_NAMES } from '../src/memory-tools.js';
 import { SteeringInput } from '../src/steering.js';
+import { Automation } from '../src/automation.js';
 
 const config = loadConfig({ TELEGRAM_BOT_TOKEN: '123456:abcdefghijklmnopqrstuvw', TELEGRAM_OWNER_ID: '123', ANTHROPIC_API_KEY: 'test-only-not-real' });
 
@@ -225,6 +226,21 @@ test('only registered session and enabled memory tools receive automatic approva
       assert.equal((await options.canUseTool!(name, {}, toolOptions))?.behavior, 'deny');
     }
   }
+});
+
+test('background script execution stays available but never receives a blanket permission bypass', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'background-permission-')); const store = await StateStore.open(path.join(root, 'state.json'));
+  let options!: Options;
+  await new ClaudeRunner(config, factory([init, result], o => { options = o; })).run({ prompt: 'Monitor work', cwd: root, workspace: { root, project: 'default', automation: new Automation(store), deliver: async () => {}, backup: async () => {} } }, () => {}, new AbortController());
+  assert.ok(!options.allowedTools!.includes('mcp__workspace__start_background_job'));
+  assert.ok(options.allowedTools!.includes('mcp__workspace__read_background_job'));
+  assert.equal(options.permissionMode, 'auto');
+  const decision = await options.canUseTool!('mcp__workspace__start_background_job', { script: 'monitor.py' }, { signal: new AbortController().signal, toolUseID: 'bg', requestId: 'bg' });
+  assert.equal(decision?.behavior, 'deny'); assert.equal(options.allowDangerouslySkipPermissions, undefined);
+  await options.canUseTool!('Bash', { command: 'denied command' }, { signal: new AbortController().signal, toolUseID: 'shell', requestId: 'shell' });
+  const hook = options.hooks!.PreToolUse![0].hooks[0];
+  const denied = await hook({ hook_event_name: 'PreToolUse', tool_name: 'mcp__workspace__start_background_job', tool_input: {}, tool_use_id: 'bypass', session_id: 'session-1', transcript_path: '', cwd: root }, undefined, { signal: new AbortController().signal });
+  assert.equal((denied as { hookSpecificOutput?: { permissionDecision?: string } }).hookSpecificOutput?.permissionDecision, 'deny');
 });
 
 

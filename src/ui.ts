@@ -9,6 +9,7 @@ export const HOME: Buttons = [
   [button('📎 Files', 'files'), button('ℹ️ Status', 'status')],
   [button('📷 Photo batch', 'batch'), button('📋 Tasks & retries', 'queue')],
   [button('⏰ Schedules', 'schedules'), button('🗑 Trash', 'trash')],
+  [button('🛠 Background jobs', 'background')],
   [button('💾 Backups', 'backup'), button('🩺 Health', 'health')],
   [button('🔑 Key status', 'keys'), button('↪️ Fresh with summary', 'fresh')],
   [button('⏹ Stop task', 'stop'), button('❔ Help', 'help')],

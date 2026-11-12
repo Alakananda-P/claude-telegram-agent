@@ -193,3 +193,12 @@ test('legacy authentication history migrates only the current consecutive failur
   assert.equal(store.data.keyRecords![first.id].status, 'retired');
   assert.equal(store.data.keyRecords![second.id].status, 'rejected');
 });
+
+test('a retired primary key cannot make a legacy session resume under a different credential', async () => {
+  const { pool, store, config, advance } = await setup(); const primary = pool.list()[0].id;
+  await pool.failure(primary, 'authentication_failed'); advance(48 * HOUR); await pool.failure(primary, 'authentication_failed');
+  let resumed: string | undefined = 'not called';
+  const runner = new ResilientRunner(config, store, () => ({ async run(request) { resumed = request.session; assert.match(request.prompt, /Verified old work/); return { session: 'replacement', text: 'OK', cumulativeCost: 0 }; } }), 0, pool);
+  await runner.run({ session: 'legacy-unmapped', prompt: 'Continue', resumeContext: 'Verified old work', cwd: '.' }, () => {}, new AbortController());
+  assert.equal(resumed, undefined);
+});
