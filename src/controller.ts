@@ -38,6 +38,7 @@ export interface Messenger {
   cleanup?(chat: number, now?: number): Promise<void>;
   acknowledge?(id: string): Promise<void>;
   clear?(chat: number, includeLegacy?: boolean): Promise<boolean>;
+  queueClear?(chat: number): Promise<void>;
 }
 
 const HELP = `Your Claude assistant
@@ -153,9 +154,10 @@ export class Controller {
   private resolveChat(key: string): string { let id = key; const seen = new Set<string>(); while (this.store.data.bindings?.[id] && !seen.has(id)) { seen.add(id); id = this.store.data.bindings[id]; } return id; }
 
   private async clearScreen(): Promise<void> {
-    const cleared = await this.messenger.clear?.(this.config.owner);
     this.panelId = undefined;
-    if (cleared === false) await this.say('Some older messages could not be removed by Telegram. The selected chat will appear below.');
+    // Persist the old-view snapshot without waiting for Telegram deletions.
+    // The maintenance worker never holds up polling or the selected chat UI.
+    await this.messenger.queueClear?.(this.config.owner);
   }
 
   private async history(id: string, page?: number): Promise<void> {

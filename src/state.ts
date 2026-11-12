@@ -10,6 +10,8 @@ const projectId = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,47}$/);
 const isoDate = z.string().datetime();
 const messageContext = z.object({ beforeMessageId: z.number().int().positive().optional(), replyToMessageId: z.number().int().positive().optional() }).optional();
 const automationState = z.object({
+  pendingMessageCleanup: z.array(z.object({ chat: z.number().int().positive(), id: z.number().int().positive(), retryAt: z.number().finite().nonnegative().optional(), attempts: z.number().int().nonnegative().optional() })).optional(),
+  undeletableMessageIds: z.array(z.number().int().positive()).optional(),
   botMessages: z.array(z.object({ id: z.number().int().positive(), chat: z.number().int().positive(), sentAt: z.number().finite().nonnegative(), preview: z.string().max(1000), kind: z.string().max(32) })).max(2000).optional(),
   transcriptionUsage: z.object({ completedRequests: z.number().int().nonnegative(), seconds: z.number().nonnegative(), cachedRequests: z.number().int().nonnegative(), lastSuccessAt: isoDate.optional() }).optional(),
   keyRecords: z.record(z.string().regex(/^[a-f0-9]{16}$/), keyRecordSchema).optional(),
@@ -33,6 +35,8 @@ export interface Conversation {
   trashedAt?: string; purgeAt?: string;
 }
 export interface State {
+  pendingMessageCleanup?: { chat: number; id: number; retryAt?: number; attempts?: number }[];
+  undeletableMessageIds?: number[];
   botMessages?: { id: number; chat: number; sentAt: number; preview: string; kind: string }[];
   transcriptionUsage?: { completedRequests: number; seconds: number; cachedRequests: number; lastSuccessAt?: string };
   keyRecords?: Record<string, KeyRecord>;

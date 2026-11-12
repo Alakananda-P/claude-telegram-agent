@@ -33,6 +33,7 @@ async function setup(runner?: Runner, transcriber?: TranscriptionService) {
     async remove(_chat: number, id: number) { deleted.push(id); },
     async typing() {},
     async clear() { screens.push([...replies]); replies.length = 0; return true; },
+    async queueClear() { screens.push([...replies]); replies.length = 0; },
     async panel(_chat: number, text: string, buttons: Buttons, editId?: number) { replies.push(text); panels.push({ text, buttons, editId }); },
     async acknowledge(id: string) { acknowledgements.push(id); },
     async sendFile(_chat: number, name: string, bytes: Uint8Array) { files.push(name); replies.push(Buffer.from(bytes).toString()); },

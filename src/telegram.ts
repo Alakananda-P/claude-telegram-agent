@@ -13,7 +13,7 @@ export function createTelegramDispatcher(lookup?: LookupFunction): Agent {
 const telegramDispatcher = createTelegramDispatcher();
 
 export class TelegramError extends Error {
-  constructor(public code: number, public retryAfter = 0, public unchanged = false, public networkCode?: string, public messageMissing = false) { super(`Telegram request failed (status ${code}).`); }
+  constructor(public code: number, public retryAfter = 0, public unchanged = false, public networkCode?: string, public messageMissing = false, public deletionDenied = false) { super(`Telegram request failed (status ${code}).`); }
 }
 
 export interface MessageListOptions { limit?: number; beforeMessageId?: number; messageId?: number; includeUi?: boolean }
@@ -29,6 +29,7 @@ function networkCode(error: unknown): string {
 export class Telegram {
   timeline?: StateStore;
   private uiWork: Promise<unknown> = Promise.resolve();
+  private clearing?: Promise<void>;
   constructor(private token: string, private secrets: string[], private base = 'https://api.telegram.org', private dispatcher = telegramDispatcher) {}
 
   async call<T = unknown>(method: string, payload: Record<string, unknown> | FormData = {}, signal?: AbortSignal): Promise<T> {
@@ -67,7 +68,7 @@ export class Telegram {
         await delay(retryAfter * 1000, undefined, { signal });
         continue;
       }
-      throw new TelegramError(code, retryAfter, code === 400 && /message is not modified/i.test(body.description ?? ''), undefined, code === 400 && /message to delete not found/i.test(body.description ?? ''));
+      throw new TelegramError(code, retryAfter, code === 400 && /message is not modified/i.test(body.description ?? ''), undefined, code === 400 && /message to delete not found/i.test(body.description ?? ''), code === 400 && /message (?:can't|cannot|can not) be deleted|message is too old/i.test(body.description ?? ''));
     }
     throw new TelegramError(429);
   }
@@ -138,6 +139,9 @@ export class Telegram {
 
   async panel(chat: number, text: string, buttons: Buttons, editId?: number, scope = 'controls'): Promise<void> {
     return this.serializeUi(async () => {
+      // A callback can arrive from a panel already captured by a chat switch.
+      // Never edit that panel: the cleanup worker may be deleting it right now.
+      if (editId !== undefined && (this.timeline?.data.pendingMessageCleanup?.some(m => m.chat === chat && m.id === editId) || this.timeline?.data.undeletableMessageIds?.includes(editId))) editId = undefined;
       editId ??= this.timeline?.data.uiMessages?.findLast(m => m.chat === chat && m.kind === 'panel' && m.scope === scope)?.id;
     const payload = { chat_id: chat, text: redact(text, [this.token, ...this.secrets]),
       reply_markup: { inline_keyboard: buttons }, link_preview_options: { is_disabled: true } };
@@ -195,7 +199,12 @@ export class Telegram {
       if (!graceMs) await this.cleanupUi(chat, Date.now());
     });
   }
-  async cleanup(chat: number, now = Date.now()): Promise<void> { return this.serializeUi(() => this.cleanupUi(chat, now)); }
+  async cleanup(chat: number, now = Date.now()): Promise<void> {
+    await this.serializeUi(() => this.cleanupUi(chat, now));
+    // Deliberately outside uiWork: slow history deletion cannot block menus.
+    if (!this.clearing) this.clearing = this.cleanupOldView(chat, now).finally(() => { this.clearing = undefined; });
+    await this.clearing;
+  }
   private async cleanupUi(chat: number, now: number): Promise<void> {
     if (!this.timeline) return;
     const due = (this.timeline.data.uiMessages ?? []).filter(m => m.chat === chat && m.expiresAt <= now && (m.retryAt ?? 0) <= now).slice(0, 20);
@@ -214,6 +223,77 @@ export class Telegram {
   }
 
   async acknowledge(id: string): Promise<void> { await this.call('answerCallbackQuery', { callback_query_id: id }); }
+
+  async queueClear(chat: number): Promise<void> {
+    if (!this.timeline) return;
+    const data = this.timeline.data, retired = new Set(data.undeletableMessageIds ?? []);
+    const ids = new Set((data.visibleMessageIds ?? []).filter(id => Number.isSafeInteger(id) && id > 0));
+    const pending = data.pendingMessageCleanup ??= [];
+    const queued = new Set(pending.filter(m => m.chat === chat).map(m => m.id));
+    for (const id of ids) if (!retired.has(id) && !queued.has(id)) pending.push({ chat, id });
+    // Stop panel() reusing an old message that is about to be deleted. Messages
+    // sent after this snapshot are not part of this cleanup request.
+    data.uiMessages = data.uiMessages?.filter(m => m.chat !== chat || !ids.has(m.id));
+    await this.timeline.save();
+    console.log(JSON.stringify({ event: 'telegram_view_cleanup_queued', pending: pending.filter(m => m.chat === chat).length, retired: retired.size }));
+  }
+
+  private async cleanupOldView(chat: number, now: number): Promise<void> {
+    if (!this.timeline) return;
+    const data = this.timeline.data;
+    const selected = (data.pendingMessageCleanup ?? []).filter(m => m.chat === chat && (m.retryAt ?? 0) <= now).sort((a, b) => b.id - a.id).slice(0, 100);
+    if (!selected.length) return;
+    let deleted = 0, unavailable = 0, deferred = 0;
+    const finish = (id: number, retired = false) => {
+      data.pendingMessageCleanup = data.pendingMessageCleanup?.filter(m => m.chat !== chat || m.id !== id);
+      if (retired) {
+        const ids = data.undeletableMessageIds ??= []; if (!ids.includes(id)) ids.push(id);
+        unavailable++;
+      } else {
+        data.visibleMessageIds = data.visibleMessageIds?.filter(m => m !== id);
+        data.botMessages = data.botMessages?.filter(m => m.chat !== chat || m.id !== id);
+        deleted++;
+      }
+      data.uiMessages = data.uiMessages?.filter(m => m.chat !== chat || m.id !== id);
+    };
+    const defer = (ids: number[], error: unknown) => {
+      const chosen = new Set(ids);
+      for (const record of data.pendingMessageCleanup ?? []) if (record.chat === chat && chosen.has(record.id)) {
+        record.attempts = (record.attempts ?? 0) + 1;
+        record.retryAt = now + Math.max(Math.min(300000, 5000 * 2 ** Math.min(record.attempts, 6)), error instanceof TelegramError ? error.retryAfter * 1000 : 0);
+        deferred++;
+      }
+    };
+    // Known timestamps avoid futile API calls for already-expired bot output.
+    const expired = new Set((data.botMessages ?? []).filter(m => m.chat === chat && now - m.sentAt >= 48 * 3600000).map(m => m.id));
+    const ids = selected.filter(m => !expired.has(m.id)).map(m => m.id);
+    for (const m of selected) if (expired.has(m.id)) finish(m.id, true);
+    const signal = AbortSignal.timeout(8000);
+    try {
+      if (ids.length) try {
+        await this.call('deleteMessages', { chat_id: chat, message_ids: ids }, signal);
+        for (const id of ids) finish(id);
+      } catch (error) {
+        if (!(error instanceof TelegramError) || error.code !== 400) defer(ids, error);
+        else {
+          // Bound each maintenance pass. One permanent old-message rejection
+          // cannot lead to hundreds of sequential requests in the polling loop.
+          for (const id of ids.slice(0, 20)) {
+            if (signal.aborted) break;
+            try { await this.call('deleteMessage', { chat_id: chat, message_id: id }, signal); finish(id); }
+            catch (e) {
+              if (e instanceof TelegramError && e.messageMissing) finish(id);
+              else if (e instanceof TelegramError && e.deletionDenied) finish(id, true);
+              else { defer([id], e); break; }
+            }
+          }
+        }
+      }
+    } finally {
+      await this.timeline.save();
+      console.log(JSON.stringify({ event: 'telegram_view_cleanup', deleted, unavailable, deferred, pending: data.pendingMessageCleanup?.filter(m => m.chat === chat).length ?? 0 }));
+    }
+  }
 
   async clear(chat: number, includeLegacy = false): Promise<boolean> {
     if (!this.timeline) return false;

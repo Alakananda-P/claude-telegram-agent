@@ -280,7 +280,12 @@ single-job rule and `/stop` remain in place as execution controls, not billing c
 The Telegram API cannot create separate native private-chat tabs for a bot.
 Session switching deletes tracked visible messages and renders a compact saved
 overview with Older/Newer buttons. Telegram normally only permits deleting
-messages less than 48 hours old; older messages may remain. Pre-upgrade history
+messages less than 48 hours old; older messages may remain. Chat switching queues
+a durable snapshot of the old screen for background cleanup, so `/new`, session
+navigation and subsequent commands do not wait for deletion. New replies and the
+new control panel stay outside that snapshot. Permanent deletion rejections are
+remembered across restarts; temporary failures retry with backoff. Cleanup does
+not delete the stored conversation, shared memory or project files. Pre-upgrade history
 is recovered from main Claude transcripts where available; those archives are
 not a full Telegram export. Hidden reasoning, tool results and sidechains are
 excluded from previews. Page summaries are extractive message previews and do
