@@ -29,6 +29,20 @@ API-key setup.
 - Steering messages are saved before delivery. Stop cancels pending input and voice
   processing; interrupted tasks require explicit retry. Explicitly paused processing
   never silently queues new chat messages. Scheduled jobs retain their durable queue.
+- Background notification results cannot acknowledge an unrelated owner message.
+  If a successful turn returns an empty/“No response requested” placeholder, one
+  response correction runs in the same conversation with further tools blocked.
+  A second empty result reports the unanswered instruction instead of silently
+  completing it. API errors and safety refusals never trigger this correction.
+- Long monitors and project scripts can use `start_background_job`,
+  `list_background_jobs`, `read_background_job` and `cancel_background_job`.
+  These bot-owned processes survive model turn completion and chat switching;
+  the owner receives completion and can inspect output from `/background`.
+  At most two processes run, each with its own 1–120 minute timeout (default 60).
+  Logs are redacted, bounded to 256 KiB and paginated. Child environments exclude
+  service API credentials. A worker restart records interruption without replaying
+  commands. Script execution receives normal SDK auto-mode review; it is excluded
+  from blanket tool approval and cannot bypass a denied shell command.
 
 - Voice notes automatically become instructions: ElevenLabs Scribe v2 transcribes
   them before Claude runs. Pending photos/files accompany the spoken instruction.
@@ -73,6 +87,11 @@ API-key setup.
 - `/new chat` clears the visible conversation and starts fresh while preserving
   project files, old sessions, memory and accounting. Selecting a saved session
   clears the visible chat and shows message previews in pages of six turns.
+- `/fresh` starts a separate conversation with a visible compact summary extracted
+  from earlier successful final results. Failed/stopped requests, raw attachments
+  and tool traces are excluded. The old archive remains available, shared memory
+  is preserved, and no request runs until the owner sends a new instruction.
+  Safety-stop notices offer this action without retrying the stopped request.
 - Chats have persistent topic names in the session list and history pages.
   The active model can name or rename them, and `/rename TITLE` sets a name directly.
   Haiku 5.5 fills in missing names using a small excerpt, including for older chats;
@@ -112,8 +131,10 @@ API-key setup.
 - A clock and durable scheduler support reminders, one-time tasks, intervals and cron with timezones.
   The model can create/edit/manage owner-requested schedules. India time is the default;
   missed recurring runs coalesce and reminders do not need an AI request.
-- Generated supported files are sent automatically, up to 20 per task. Model delivery tools can
-  send a relevant image crop or a particular finished file with a brief preview.
+- Generated supported files under the project's real `output/` directory are sent
+  automatically, up to 20 per task. Working datasets and files elsewhere do not trigger
+  delivery. Model delivery tools and `/get` can still send a particular safe file or
+  image crop with a brief preview. Symlinks and credential paths are excluded.
 - Session deletion asks for confirmation, then moves the chat to Trash for 48 hours. Restore cancels
   expiry. Permanent deletion removes its archive and SDK transcript, with tombstones preventing
   import or backup restoration from resurrecting it. Memory, files and lifetime usage stay.
@@ -135,6 +156,11 @@ API-key setup.
   basic API access, not a balance or access to every model/Fast tier. `/health retry` requests checks
   without blindly enabling keys or clearing history. Recovery does not replay failed tasks or unpause
   the queue automatically; use Queue to review/retry. The monitor runs in the existing Render worker.
+  After 48 hours of consecutive observed `authentication_failed` responses, a fresh
+  authentication failure permanently retires the key from routing and further checks.
+  Success or a different error resets the streak. Retirement and redacted history
+  survive restarts; the Retired keys menu preserves inspection without reusing the key.
+  Old success timestamps alone never establish a continuous authentication failure.
 - Encrypted backups export chats, shared memory and schedules to the private Telegram chat.
   Optional project files are bounded to 12 MB; encrypted exports are limited to 19 MB so the
   20 MB incoming Telegram limit permits restore. Restore merges missing data and pauses restored
@@ -214,6 +240,7 @@ interrupting running tasks unexpectedly; deploy manually while idle.
 | `/token count` or `/tokens` | Lifetime input/output/cache tokens per model |
 | `/cost` | Lifetime estimated Claude cost, with per-model breakdown |
 | `/session` or `/session ID` | List/resume saved chats with paginated previews |
+| `/fresh` | New chat with a visible summary of earlier successful work; waits for a new instruction |
 | `/memory` | Read memory and open its controls |
 | `/memory on\|off\|clear` | Enable, disable, or clear shared memory |
 | `/memory remember TEXT` | Save a durable note without model inference |
@@ -227,6 +254,8 @@ interrupting running tasks unexpectedly; deploy manually while idle.
 | `/help` | Usage guide |
 | `/batch`, `/process` | Collect files, then process the batch |
 | `/queue` | Task history, cancel/priority, pause/resume and explicit retry |
+| `/background` | Independent script jobs, paginated output and cancellation |
+| `/keys` | Active key status and archived retirement history |
 | `/schedules`, `/clock` | Scheduled jobs, controls and current time |
 | `/trash` | Restore chats within 48 hours or delete permanently |
 | `/backup` | Encrypted export, optional daily 03:00 IST export and restore guide |
@@ -241,9 +270,12 @@ by the transfer layer; known configured credentials are refused in outgoing file
 Generic secret detection is not guaranteed—review artifacts before sharing them.
 
 `/stop` also pauses the queue. Scheduled work joins the same serial queue, so a paused queue
-delays reminders and scheduled jobs until resumed. Telegram recovery notifications are deduplicated
-per outage; a stopped worker cannot send its own outage alert. No external uptime monitor is included.
-The Health panel reports last successful events, not an API credit balance.
+delays reminders and scheduled jobs until resumed. Telegram retries use bounded backoff.
+Recovery notifications appear once for outages lasting at least a minute; notification
+failure does not discard updates already fetched. Health retains bounded outage history
+with start, end, duration and safe error categories. A stopped worker cannot send its own
+outage alert. No external uptime monitor is included. Health reports last successful
+events, not an API credit balance.
 
 Set optional `ANTHROPIC_BACKUP_KEYS` to a JSON array of up to five privately configured keys.
 Set `BACKUP_ENCRYPTION_KEY` to 32 cryptographically random bytes encoded as 64 hex characters.

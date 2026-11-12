@@ -43,12 +43,12 @@ Source: the owner's `Bot_Issues_Report.md` and request to retire keys after 48 h
 
 - [x] Add a dedicated persistent background service with validated project scripts and arguments, separate child processes, secret-free child environments, bounded concurrency/output/runtime, safe cancellation and durable redacted logs.
 - [x] Add callable start/list/read/cancel tools and completion delivery independent of the active model query. Record restart interruption without replay.
-- [x] Test a real child process outliving the submitting turn, success/failure/cancel/timeout/restart, completion exactly once, secret and symlink protection.
+- [x] Test a real child process outliving the submitting turn, success/failure/cancel/timeout/restart, normal single completion delivery, failed-delivery retry, secret and symlink protection. Delivery acknowledgment is durable, but a crash between Telegram send and acknowledgment can cause a duplicate notice.
 - [x] Update prompt/help and tests; commit.
 
 ### 5. Production verification
 
-- [ ] Run the full suite, typecheck and build. Run Linux-only filesystem/process checks as the production `node` user in the deployed image.
+- [x] Run the full suite, typecheck and build. Run Linux-only filesystem/process checks as the production `node` user in the deployed image.
 - [ ] Push reviewed commits, deploy the exact commit to the existing Render service, and verify it becomes live with the same disk and reset flags.
 - [ ] Verify active/retired key counts and fresh check classifications from safe production diagnostics. No credential values or user transcript contents in logs.
 - [ ] Verify Telegram polling recovery, memory availability and a bounded representative runtime smoke test. Record evidence and remaining limitations before claiming completion.
@@ -56,7 +56,7 @@ Source: the owner's `Bot_Issues_Report.md` and request to retire keys after 48 h
 ## Validation record
 
 - Baseline: prior `f1ae5da` verification recorded 166 tests (166 passing on Linux; Windows skips two filesystem cases), clean typecheck/build. This is a historical baseline, not verification of the new changes.
-- New changes: pending.
+- New changes: implementation, Windows and Linux/runtime verification complete; production deployment verification remains in progress below.
 
 - Key retirement: 22 key-pool/recovery tests passing; typecheck clean. Commit `a5bdc75`.
 - Output/polling: 61 targeted tests, 60 passing and one Windows file-symlink skip; typecheck clean. Linux link checks remain required. Recovery-notification failure test confirms fetched owner updates are dispatched.
@@ -65,3 +65,5 @@ Source: the owner's `Bot_Issues_Report.md` and request to retire keys after 48 h
 
 - Full local validation: 191 tests, 187 passing, four platform skips; typecheck and production build clean. Background coverage includes real process lifetime across chat switches, split-secret redaction across interleaved streams, bounded/paged logs, shutdown/start race, timeouts/cancellation, restart interruption and delivery retries. Linux process-group and filesystem cases remain required before deployment.
 - Background execution is deliberately excluded from blanket MCP approval; SDK auto mode reviews it. A native execution denial also blocks using the background path in that turn.
+- Linux acceptance: Render job `job-dbqklj0ae00c738ml61g` ran the full compiled suite as UID 1000: 191 tests passed, zero failed/cancelled/skipped, 29.7 seconds. The half-CPU acceptance worker runs test files serially; its earlier concurrent run hit responsiveness/file deadlines, while the serial run retained the one-second responsiveness assertion and passed it.
+- Real SDK acceptance against implementation commit `ccedaea5f1a3cd7ebf78df52b83a1b3b7b3d17fc`: Sonnet 5.5, high effort, normal auto mode, background start excluded from blanket approval. Claude started the managed script and returned `BACKGROUND_TOOL_STARTED`; the script was still running after query closure, then completed on a separate release marker and delivered one notification. Estimated verification cost: USD 0.0799423, outside the production bot ledger.
