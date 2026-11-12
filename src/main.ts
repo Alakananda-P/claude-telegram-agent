@@ -111,6 +111,7 @@ async function main(): Promise<void> {
       { command: 'status', description: 'Current task and execution limits' },
       { command: 'stop', description: 'Stop current task' },
       { command: 'new', description: 'Fresh conversation, keep files' },
+      { command: 'fresh', description: 'New conversation with completed-work summary' },
       { command: 'project', description: 'Create or switch project' },
       { command: 'projects', description: 'List projects' },
       { command: 'files', description: 'List project files' },

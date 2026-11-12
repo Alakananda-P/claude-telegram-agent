@@ -33,11 +33,11 @@ Source: the owner's `Bot_Issues_Report.md` and request to retire keys after 48 h
 
 ### 3. Fresh continuation and reply integrity
 
-- [ ] Add fresh-summary tests excluding failed/refused turns and raw attachments; ensure old session and memory survive.
-- [ ] Add explicit `/fresh` and a safety-error action, including a preview of the compact continuation context.
-- [ ] Add synthetic SDK notification/human-message boundary tests. Track acknowledged owner input separately from internal notifications and require a substantive answer.
-- [ ] Preserve safety stops and completed tool effects; use bounded response repair only for otherwise successful empty/notification-only completions, with no action replay.
-- [ ] Run controller/steering/runner/safety tests and typecheck; commit.
+- [x] Add fresh-summary tests excluding failed/refused turns and raw attachments; ensure old session and memory survive.
+- [x] Add explicit `/fresh` and a safety-error action, including a preview of the compact continuation context.
+- [x] Add synthetic SDK notification/human-message boundary tests. Track acknowledged owner input separately from internal notifications and require a substantive answer.
+- [x] Preserve safety stops and completed tool effects; use bounded response repair only for otherwise successful empty/notification-only completions, with no action replay.
+- [x] Run controller/steering/runner/safety tests and typecheck; commit.
 
 ### 4. Independent background execution
 
@@ -60,3 +60,5 @@ Source: the owner's `Bot_Issues_Report.md` and request to retire keys after 48 h
 
 - Key retirement: 22 key-pool/recovery tests passing; typecheck clean. Commit `a5bdc75`.
 - Output/polling: 61 targeted tests, 60 passing and one Windows file-symlink skip; typecheck clean. Linux link checks remain required. Recovery-notification failure test confirms fetched owner updates are dispatched.
+
+- Conversation fixes: 69 controller/agent/steering/recovery tests passing. Verified notification-only results do not consume human input, merged placeholders receive one tool-blocked correction, safety stops never replay, and `/fresh` excludes failed requests while retaining the source archive and memory.

@@ -61,6 +61,50 @@ test('late steering survives the first result and finishes in the same SDK conve
   assert.deepEqual(events.filter(e => e.type === 'usage').map(e => e.cost), [0.1, 0.15]);
 });
 
+test('a notification-only completion cannot finish the pending human turn', async () => {
+  const make: QueryFactory = ({ prompt }) => ({ async *[Symbol.asyncIterator]() {
+    const incoming = (prompt as AsyncIterable<import('@anthropic-ai/claude-agent-sdk').SDKUserMessage>)[Symbol.asyncIterator]();
+    const first = (await incoming.next()).value!; yield init as SDKMessage;
+    yield { ...result, origin: { kind: 'task-notification' }, result: '', user_message_uuids: ['background-only'] } as unknown as SDKMessage;
+    yield { ...result, uuid: 'human-reply', result: 'Your job is still running.', user_message_uuids: [first.uuid] } as unknown as SDKMessage;
+  }, close() {} });
+  const answer = await new ClaudeRunner(config, make).run({ prompt: 'Kam ho rha h?', cwd: '/work' }, () => {}, new AbortController());
+  assert.equal(answer.text, 'Your job is still running.');
+});
+
+test('a merged notification placeholder triggers one same-session response correction without replaying actions', async () => {
+  const steering = new SteeringInput(); const seen: AgentEvent[] = []; let options!: Options;
+  const make: QueryFactory = request => { options = request.options; return { async *[Symbol.asyncIterator]() {
+    const incoming = (request.prompt as AsyncIterable<import('@anthropic-ai/claude-agent-sdk').SDKUserMessage>)[Symbol.asyncIterator]();
+    const first = (await incoming.next()).value!; yield init as SDKMessage;
+    const owner = steering.add('Kam ho rha h?'); const sent = (await incoming.next()).value!; assert.equal(sent.uuid, owner.id);
+    yield { type: 'assistant', parent_tool_use_id: null, uuid: 'placeholder', session_id: 'session-1', message: { id: 'placeholder', model: config.model, content: [{ type: 'text', text: 'No response requested.' }] } } as unknown as SDKMessage;
+    yield { ...result, result: 'No response requested.', origin: { kind: 'task-notification' }, user_message_uuids: [first.uuid, owner.id] } as unknown as SDKMessage;
+    assert.equal(owner.answered, undefined);
+    const reminder = (await incoming.next()).value!;
+    assert.equal(reminder.isSynthetic, true); assert.equal(reminder.client_composed, true); assert.equal(reminder.origin, undefined);
+    assert.match(String(reminder.message.content), /do not repeat completed actions/i);
+    const hook = options.hooks!.PreToolUse![0].hooks[0];
+    const permission = await hook({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: {}, tool_use_id: 'unsafe', session_id: 'session-1', transcript_path: '', cwd: '/work' }, undefined, { signal: new AbortController().signal });
+    assert.equal((permission as { hookSpecificOutput?: { permissionDecision?: string } }).hookSpecificOutput?.permissionDecision, 'deny');
+    yield { ...result, uuid: 'fixed', result: 'Haan, job is running. The last check was successful.', user_message_uuids: [reminder.uuid] } as unknown as SDKMessage;
+  }, close() {} }; };
+  const answer = await new ClaudeRunner(config, make).run({ prompt: 'Monitor job', cwd: '/work', steering }, e => { seen.push(e); }, new AbortController());
+  assert.match(answer.text, /job is running/); assert.equal(steering.messages[0].answered, true);
+  assert.ok(!seen.some(e => e.type === 'commentary' && /No response requested/.test(e.text)));
+});
+
+test('repeated empty human completions fail clearly instead of silently consuming the instruction', async () => {
+  const make: QueryFactory = ({ prompt }) => ({ async *[Symbol.asyncIterator]() {
+    const incoming = (prompt as AsyncIterable<import('@anthropic-ai/claude-agent-sdk').SDKUserMessage>)[Symbol.asyncIterator]();
+    const first = (await incoming.next()).value!; yield init as SDKMessage;
+    yield { ...result, result: 'No response requested.', user_message_uuids: [first.uuid] } as unknown as SDKMessage;
+    const reminder = (await incoming.next()).value!;
+    yield { ...result, uuid: 'empty-twice', result: '', user_message_uuids: [reminder.uuid] } as unknown as SDKMessage;
+  }, close() {} });
+  await assert.rejects(new ClaudeRunner(config, make).run({ prompt: 'Please answer', cwd: '/work' }, () => {}, new AbortController()), /did not answer|unanswered/i);
+});
+
 test('a failed input preparation racing with the last result cannot leave the conversation open', async () => {
   const steering = new SteeringInput(); const settled = steering.settled.bind(steering); let raced = false;
   steering.settled = async signal => { await settled(signal); if (!raced) { raced = true; queueMicrotask(() => { const release = steering.reserve()!; setTimeout(release, 10); }); } };

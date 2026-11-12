@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { ChatArchive } from '../src/chats.js';
 import { Controller } from '../src/controller.js';
-import type { Runner, AgentRequest } from '../src/agent.js';
+import { AgentSafetyError, type Runner, type AgentRequest } from '../src/agent.js';
 import { loadConfig } from '../src/config.js';
 import { StateStore } from '../src/state.js';
 import type { Message } from '../src/safety.js';
@@ -421,6 +421,28 @@ test('/new chat archives conversations; /session resumes them and shared memory 
   await bot.handle(message('/memory off'));
   await bot.handle(message('fourth')); await bot.idle();
   assert.equal(calls[3].memoryEnabled, false);
+});
+
+test('/fresh seeds only verified successful work and waits for a new instruction without resuming the refused chat', async () => {
+  const requests: AgentRequest[] = []; let n = 0;
+  const { bot, store, panels, dataDir } = await setup({ async run(request, emit) {
+    requests.push(request); n++; await emit({ type: 'session', id: n <= 2 ? 'source-session' : 'fresh-session' });
+    if (n === 2) throw new AgentSafetyError('cyber');
+    return { session: n <= 2 ? 'source-session' : 'fresh-session', text: n === 1 ? 'Completed the invoice workbook in output/invoice.xlsx.' : 'Continuing with the totals.', cumulativeCost: 0 };
+  } });
+  await bot.handle(message('Prepare invoice')); await bot.idle();
+  await bot.handle(message('REFUSED_REQUEST_WITH_RAW_ATTACHMENT')); await bot.idle();
+  assert.ok(panels.some(p => p.buttons.flat().some(b => b.callback_data === 'fresh')));
+  await bot.handle(message('/fresh'));
+  assert.equal(n, 2); assert.equal(store.data.sessions.default, undefined);
+  assert.match(panels.at(-1)!.text, /invoice workbook/); assert.ok(!panels.at(-1)!.text.includes('REFUSED_REQUEST'));
+  const reopened = await StateStore.open(store.file); assert.ok(Object.values(reopened.data.freshContexts ?? {}).some(c => c.includes('invoice workbook')));
+  await bot.handle(message('Continue with totals')); await bot.idle();
+  assert.equal(requests[2].session, undefined); assert.match(requests[2].prompt, /invoice workbook/);
+  assert.ok(!requests[2].prompt.includes('REFUSED_REQUEST')); assert.ok(!requests[2].resumeContext?.includes('REFUSED_REQUEST'));
+  assert.equal(store.data.memoryEnabled, true); assert.equal(store.data.sessions.default, 'fresh-session');
+  const old = await new ChatArchive(path.join(dataDir, 'bot/chats'), []).read('source-session');
+  assert.ok(old.some(t => t.text.includes('REFUSED_REQUEST'))); assert.ok(store.data.conversations!.some(c => c.id === 'source-session'));
 });
 
 test('new chat clears the screen; selecting an old session displays paginated saved previews', async () => {

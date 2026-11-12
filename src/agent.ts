@@ -21,8 +21,9 @@ export interface Runner {
 export type QueryFactory = (request: { prompt: string | AsyncIterable<SDKUserMessage>; options: Options }) => AsyncIterable<SDKMessage> & { close(): void };
 
 export class AgentError extends Error {}
+function substantive(text: string): boolean { return !!text.trim() && !/^\s*[([]?\s*no (?:response|text output)(?: (?:was )?requested)?[.!]?\s*[)\]]?\s*$/i.test(text); }
 export class AgentSafetyError extends AgentError {
-  constructor(readonly category?: string) { super('Claude safety system stopped this response. No automatic retry or model switch was accepted. The saved session may repeat the stop; use /new chat for a separate conversation. Existing files and memory are kept.'); this.name = 'AgentSafetyError'; }
+  constructor(readonly category?: string) { super('Claude safety system stopped this response. No automatic retry or model switch was accepted. Use /fresh for a separate conversation with a short summary of earlier completed work, or /new chat for an empty conversation. The stopped request is not retried. Existing files, saved chats and memory are kept.'); this.name = 'AgentSafetyError'; }
 }
 export class AgentApiError extends AgentError {
   constructor(readonly kind: string, message: string) { super(message); }
@@ -86,6 +87,7 @@ export class ClaudeRunner implements Runner {
         + 'Preserve an existing meaningful name unless the topic substantially changes. These tools are an allowed exception to the service-state rule. '
         + 'Start-of-task session context (call list_sessions for the current/new session ID after initialization): ' + JSON.stringify(request.sessions.context())
       : '';
+    let repairingResponse = false;
     const allowed = [...(request.sessions ? SESSION_TOOL_NAMES : []), ...(request.memoryEnabled === false ? [] : MEMORY_TOOL_NAMES), ...(request.workspace ? WORKSPACE_TOOL_NAMES : [])];
     const options: Options = {
       cwd: request.cwd, resume: request.session,
@@ -114,6 +116,7 @@ export class ClaudeRunner implements Runner {
         ...(request.workspace ? { workspace: workspaceServer(request.workspace) } : {}),
       }, allowedTools: allowed, strictMcpConfig: true,
       persistSession: true, maxTurns: this.config.maxTurns,
+      hooks: { PreToolUse: [{ hooks: [async () => repairingResponse ? { hookSpecificOutput: { hookEventName: 'PreToolUse' as const, permissionDecision: 'deny' as const, permissionDecisionReason: 'Answer the pending owner message from existing context; this response correction cannot repeat actions or run additional tools.' } } : {}] }] },
       abortController: abort,
       env: agentEnvironment(this.config),
       canUseTool: async (tool, input) => {
@@ -137,6 +140,8 @@ export class ClaudeRunner implements Runner {
     let safetyError: AgentSafetyError | undefined;
     const steps = new Map<string, { id: string; model: string; usage: Record<string, unknown>; session: string }>();
     try {
+      let initialAnswered = false, correctionSent = false;
+      const corrections = new Map<string, string[]>();
       for await (const event of stream) {
         // Account for error/cancel results too, before throwing or discarding text.
         if (event.type === 'system' && ((event.subtype === 'model_refusal_fallback' && event.scope !== 'local') || event.subtype === 'model_refusal_no_fallback')) {
@@ -183,6 +188,7 @@ export class ClaudeRunner implements Runner {
         } else if (event.type === 'assistant' && !event.parent_tool_use_id) {
           if (event.message.stop_reason === 'refusal') safetyError = new AgentSafetyError();
           if (safetyError) continue;
+          if (!event.error && [selected.model, '<synthetic>'].includes(event.message.model) && event.message.content.length && event.message.content.every(b => b.type === 'text' && !substantive(b.text))) continue;
           if (event.error || event.message.model === '<synthetic>') {
             const detail = event.message.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
             apiError = apiFailure(event.error, detail);
@@ -194,8 +200,8 @@ export class ClaudeRunner implements Runner {
           }
           for (const block of event.message.content) {
             if (block.type === 'tool_use') await emit({ type: 'effect', tool: block.name });
-            else if (block.type === 'text') await emit({ type: 'effect' });
-            if (block.type === 'text' && block.text.trim()) {
+            else if (block.type === 'text' && substantive(block.text)) await emit({ type: 'effect' });
+            if (block.type === 'text' && substantive(block.text)) {
               const id = event.message.id + ':' + block.text;
               if (!published.has(id)) { published.add(id); lastPublished = block.text; await emit({ type: 'commentary', id: event.uuid, text: block.text }); }
             }
@@ -210,14 +216,32 @@ export class ClaudeRunner implements Runner {
           if (apiError) throw apiError;
           if (event.subtype !== 'success' || event.is_error) throw new AgentError(`Claude stopped (${event.subtype}). Check account access or retry with a smaller task; work was not automatically retried.`);
           if (!initialized) throw new AgentError('Claude returned a result without verified initialization.');
-          output = { text: event.result, session: event.session_id, cumulativeCost: event.total_cost_usd };
           if (event.permission_denials.length) await emit({ type: 'progress', text: `${event.permission_denials.length} tool request(s) were denied by the permission system.` });
           const ids = event.user_message_uuids ?? (event.user_message_uuid ? [event.user_message_uuid] : []);
-          input.acknowledge(ids); await emit({ type: 'steered', ids });
-          if (await input.complete(abort.signal)) break;
+          const answeredIds = ids.flatMap(id => corrections.get(id) ?? [id]);
+          const humanResult = answeredIds.some(id => id === input.initialId || input.messages.some(m => m.id === id)) || (!ids.length && event.origin?.kind !== 'task-notification');
+          if (!humanResult) {
+            // SDK background notifications can yield empty success results before
+            // the human turn completes. They are not acknowledgements of input.
+            if (substantive(event.result) && lastPublished !== event.result) { await emit({ type: 'commentary', id: event.uuid, text: event.result }); lastPublished = event.result; }
+            continue;
+          }
+          if (!substantive(event.result)) {
+            if (correctionSent) throw new AgentError('Claude did not answer the pending owner message. It remains saved and unanswered; completed actions were not replayed.');
+            correctionSent = true; repairingResponse = true;
+            await emit({ type: 'effect' }); // Never fail over by replaying a completed turn.
+            const pending = [...(!initialAnswered ? [input.initialId] : []), ...input.messages.filter(m => !m.answered).map(m => m.id)];
+            const correction = input.remind('The previous completion did not answer the owner messages already received in this conversation. Answer the pending owner question or provide an accurate status using existing context. Do not repeat completed actions, rerun commands, or execute additional tools for this response correction. Background notifications do not cancel an owner question. If an answer is unavailable, explain what remains unresolved.');
+            corrections.set(correction, pending); continue;
+          }
+          if (ids.some(id => corrections.has(id))) repairingResponse = false;
+          initialAnswered ||= answeredIds.includes(input.initialId) || !ids.length;
+          output = { text: event.result, session: event.session_id, cumulativeCost: event.total_cost_usd };
+          const acknowledged = input.acknowledge(answeredIds); await emit({ type: 'steered', ids: acknowledged });
+          if (initialAnswered && await input.complete(abort.signal)) break;
           // More owner input was accepted before this result, but the provider
           // has not answered it yet. Keep this SDK session and consume its result.
-          if (event.result.trim() && lastPublished !== event.result) {
+          if (substantive(event.result) && lastPublished !== event.result) {
             await emit({ type: 'commentary', id: event.uuid, text: event.result });
             lastPublished = event.result;
           }

@@ -23,6 +23,7 @@ const automationState = z.object({
   uploads: z.array(z.object({ id: identifier, project: projectId, chatKey: identifier, path: z.string().regex(/^uploads\/[a-zA-Z0-9._-]+$/), name: z.string(), photo: z.boolean(), mediaType: z.enum(['video', 'animation', 'audio', 'voice']).optional(), receivedAt: isoDate, batchId: identifier })).optional(),
   batches: z.array(z.object({ id: identifier, project: projectId, chatKey: identifier, uploadIds: z.array(identifier), status: z.enum(['collecting', 'queued', 'discarded']), updatedAt: isoDate })).optional(),
   bindings: z.record(identifier, identifier).optional(), drafts: z.record(projectId, identifier).optional(), purgedSessions: z.array(identifier).optional(), resumeDisabled: z.array(identifier).optional(),
+  freshContexts: z.record(identifier, z.string().max(3000)).optional(),
   queuePaused: z.boolean().optional(), disabledKeyIds: z.array(z.string().regex(/^[a-f0-9]{16}$/)).optional(), sessionCredentials: z.record(identifier, z.string().regex(/^[a-f0-9]{16}$/)).optional(),
 });
 
@@ -57,6 +58,7 @@ export interface State {
   tasks?: Task[]; schedules?: Schedule[]; uploads?: Upload[]; batches?: Batch[]; queuePaused?: boolean;
   bindings?: Record<string, string>; drafts?: Record<string, string>; purgedSessions?: string[];
   resumeDisabled?: string[]; sessionCredentials?: Record<string, string>; disabledKeyIds?: string[]; activeKeyId?: string;
+  freshContexts?: Record<string, string>;
   health?: { telegramAt?: string; claudeAt?: string; apiError?: string; lastAlert?: string; lastBackupAt?: string; activeCredential?: number; disabledCredentials?: number[]; telegramOutage?: Omit<TelegramOutage, 'endedAt' | 'durationMs'>; telegramOutages?: TelegramOutage[] };
 }
 

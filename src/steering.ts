@@ -7,6 +7,8 @@ export interface SteeringMessage { id: string; text: string; displayText: string
  * only pre-effect failover may replay it. Closing is atomic with accepting input. */
 export class SteeringInput {
   readonly messages: SteeringMessage[] = [];
+  readonly initialId = randomUUID();
+  private outbound: { id: string; text: string; synthetic?: boolean }[] = [];
   private open = true;
   private preparing = 0;
   private listeners = new Set<() => void>();
@@ -19,13 +21,19 @@ export class SteeringInput {
   }
   add(text: string, displayText = text, id: string = randomUUID()): SteeringMessage {
     if (!this.open) throw new Error('Conversation input has closed.');
-    const item = { id, text, displayText }; this.messages.push(item); this.changed(); return item;
+    const item = { id, text, displayText }; this.messages.push(item); this.outbound.push(item); this.changed(); return item;
+  }
+  remind(text: string): string {
+    if (!this.open) throw new Error('Conversation input has closed.');
+    const id = randomUUID(); this.outbound.push({ id, text, synthetic: true }); this.changed(); return id;
   }
   acknowledge(ids: string[]) {
     // All messages use FIFO 'next' priority. The protocol retains at most 64
     // consumed UUIDs; the latest consumed ID also acknowledges earlier inputs.
     const last = this.messages.findLastIndex(m => ids.includes(m.id));
-    this.messages.forEach((m, index) => { if (index <= last) m.answered = true; });
+    const answered: string[] = [];
+    this.messages.forEach((m, index) => { if (index <= last && !m.answered) { m.answered = true; answered.push(m.id); } });
+    return answered;
   }
   finish(): boolean {
     if (this.preparing || this.messages.some(m => !m.answered)) return false;
@@ -50,12 +58,12 @@ export class SteeringInput {
     return this.finish();
   }
   async *stream(prompt: string, signal: AbortSignal): AsyncGenerator<SDKUserMessage> {
-    const frame = (text: string, uuid: string): SDKUserMessage => ({ type: 'user', uuid: uuid as SDKUserMessage['uuid'], parent_tool_use_id: null, message: { role: 'user', content: text }, priority: 'next', origin: { kind: 'human' } });
-    yield frame(prompt, randomUUID());
+    const frame = (text: string, uuid: string, synthetic = false): SDKUserMessage => ({ type: 'user', uuid: uuid as SDKUserMessage['uuid'], parent_tool_use_id: null, message: { role: 'user', content: text }, priority: 'next', client_composed: true, ...(synthetic ? { isSynthetic: true } : { origin: { kind: 'human' as const } }) });
+    yield frame(prompt, this.initialId);
     let cursor = 0;
-    while (this.open || cursor < this.messages.length) {
+    while (this.open || cursor < this.outbound.length) {
       signal.throwIfAborted();
-      if (cursor < this.messages.length) { const message = this.messages[cursor++]; yield frame(message.text, message.id); }
+      if (cursor < this.outbound.length) { const message = this.outbound[cursor++]; yield frame(message.text, message.id, message.synthetic); }
       else await this.wait(signal);
     }
   }
