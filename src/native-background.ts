@@ -13,8 +13,16 @@ export class NativeBackground {
   private key(id: string, run?: string) { return id + ':' + (run ?? this.runs.get(id) ?? ''); }
   observe(event: SDKMessage) {
     if (event.type === 'result') {
-      for (const key of this.notified) { this.consumed.add(key); this.draining.delete(key); }
-      this.notified.clear();
+      const origin = event.origin;
+      for (const key of this.notified) {
+        // A helper can finish while a human reply is still being generated.
+        // That reply has not consumed the queued hand-back. New SDKs identify
+        // the notification run or the in-process helper that owns the result.
+        const delivered = !origin
+          || (origin.kind === 'task-notification' && (!origin.runId || key.endsWith(':' + origin.runId)))
+          || (origin.kind === 'peer' && !!origin.senderTaskId && key === this.key(origin.senderTaskId));
+        if (delivered) { this.consumed.add(key); this.draining.delete(key); this.notified.delete(key); }
+      }
     }
     if (event.type !== 'system') return;
     if (event.subtype === 'background_tasks_changed') {

@@ -87,6 +87,42 @@ for (const resultBeforeSnapshot of [false, true]) test(`background helpers survi
   assert.equal(events.filter(e => e.type === 'usage').length, 3);
 });
 
+test('a helper completion cannot be consumed by an unrelated owner reply', async () => {
+  const steering = new SteeringInput(); let handbackConsumed = false;
+  const make: QueryFactory = ({ prompt }) => ({ async *[Symbol.asyncIterator]() {
+    const incoming = (prompt as AsyncIterable<import('@anthropic-ai/claude-agent-sdk').SDKUserMessage>)[Symbol.asyncIterator]();
+    const first = (await incoming.next()).value!; yield init as SDKMessage;
+    yield { type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: 'audit', run_id: 'run-1', task_type: 'local_agent', description: 'Audit' }] } as unknown as SDKMessage;
+    yield { ...result, result: 'Helper is running.', origin: { kind: 'human' }, user_message_uuids: [first.uuid] } as unknown as SDKMessage;
+    const update = steering.add('Quote the helper result when it arrives.'); const next = (await incoming.next()).value!;
+    yield { type: 'system', subtype: 'task_notification', task_id: 'audit', run_id: 'run-1', status: 'completed', summary: 'Report delivered by SubagentHandback.' } as unknown as SDKMessage;
+    yield { type: 'system', subtype: 'background_tasks_changed', tasks: [] } as unknown as SDKMessage;
+    yield { ...result, result: 'I will quote it once its report arrives.', origin: { kind: 'human' }, user_message_uuids: [next.uuid] } as unknown as SDKMessage;
+    assert.equal(update.answered, true); assert.equal(steering.accepting, true);
+    handbackConsumed = true;
+    yield { ...result, result: 'Verified marker: VERIFY_WEEKLY_42', origin: { kind: 'peer', from: 'audit', senderTaskId: 'audit' } } as unknown as SDKMessage;
+  }, close() {} });
+  const answer = await new ClaudeRunner(config, make).run({ prompt: 'Audit', cwd: '/work', steering }, () => {}, new AbortController());
+  assert.equal(handbackConsumed, true); assert.match(answer.text, /VERIFY_WEEKLY_42/);
+});
+
+for (const kind of ['peer', 'task-notification'] as const) test(`a ${kind} completion drains only its own native helper`, async () => {
+  let delivered = 0;
+  const origin = (id: string) => kind === 'peer' ? { kind, from: id, senderTaskId: id } : { kind, runId: 'run-' + id };
+  const messages = [init,
+    { type: 'system', subtype: 'background_tasks_changed', tasks: ['a', 'b'].map(id => ({ task_id: id, run_id: 'run-' + id, task_type: 'local_agent', description: 'Audit ' + id })) },
+    { ...result, result: 'Both audits are running.', origin: { kind: 'human' } },
+    ...['a', 'b'].map(id => ({ type: 'system', subtype: 'task_notification', task_id: id, run_id: 'run-' + id, status: 'completed', summary: 'Audit done' })),
+    { type: 'system', subtype: 'background_tasks_changed', tasks: [] },
+  ];
+  const make: QueryFactory = () => ({ async *[Symbol.asyncIterator]() {
+    for (const event of messages) yield event as SDKMessage;
+    for (const id of ['a', 'b']) { delivered++; yield { ...result, result: 'Audit ' + id + ' report', origin: origin(id) } as unknown as SDKMessage; }
+  }, close() {} });
+  const answer = await new ClaudeRunner(config, make).run({ prompt: 'Run two audits', cwd: '/work' }, () => {}, new AbortController());
+  assert.equal(delivered, 2); assert.equal(answer.text, 'Audit b report');
+});
+
 test('ambient watchers never hold the owner turn open and a dropped helper stream is not reported complete', async () => {
   const ambient = { type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: 'watcher', task_type: 'local_bash', description: 'Watcher', ambient: true }] };
   assert.equal((await new ClaudeRunner(config, factory([init, ambient, result])).run({ prompt: 'Hello', cwd: '/work' }, () => {}, new AbortController())).text, result.result);
