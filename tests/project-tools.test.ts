@@ -7,14 +7,13 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { ProjectCatalog } from '../src/projects.js';
 import { StateStore } from '../src/state.js';
-const module = await import('../src/' + 'project-tools.js').catch(error => { if (error.code === 'ERR_MODULE_NOT_FOUND') return {}; throw error; });
+import { projectServer, PROJECT_TOOL_NAMES } from '../src/project-tools.js';
 
 test('twelve project tools are callable through MCP with real catalog effects and host-owned switching/deletion', async () => {
-  assert.equal(typeof module.projectServer, 'function', 'Project MCP tools are missing');
   const dir = await mkdtemp(path.join(tmpdir(), 'tg-project-tools-')), store = await StateStore.open(path.join(dir, 'bot/state.json'));
   const catalog = new ProjectCatalog(dir, store, ['private-fixture-key']); await catalog.initialize();
   const changes: unknown[] = [], confirmations: string[] = [];
-  const server = module.projectServer({ catalog, currentProject: 'default', pending: () => false,
+  const server = projectServer({ catalog, currentProject: 'default', pending: () => false,
     requestSwitch: async (id: string, remaining?: string) => { changes.push([id, remaining]); return { pending: true }; },
     cancelSwitch: async () => ({ cancelled: true }),
     requestClose: async (id: string, action: string) => action === 'archive' ? catalog.archive(id) : catalog.trash(id),
@@ -24,7 +23,7 @@ test('twelve project tools are callable through MCP with real catalog effects an
   try {
     await server.instance.connect(b); await client.connect(a);
     const tools = (await client.listTools()).tools;
-    assert.equal(tools.length, 12); assert.equal(module.PROJECT_TOOL_NAMES.length, 12);
+    assert.equal(tools.length, 12); assert.equal(PROJECT_TOOL_NAMES.length, 12);
     assert.equal(tools.find(t => t.name === 'list_projects')!.annotations!.readOnlyHint, true);
     const deletion = tools.find(t => t.name === 'request_permanent_project_delete')!;
     assert.equal(deletion.annotations!.destructiveHint, true);

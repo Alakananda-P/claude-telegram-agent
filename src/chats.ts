@@ -48,6 +48,32 @@ export class ChatArchive {
     this.writing = task.catch(() => {}); await task;
   }
   async resetDraft(project: string): Promise<void> { await this.writing; await unlink(this.file('draft-' + project)).catch(e => { if (e.code !== 'ENOENT') throw e; }); }
+  /** Find interrupted SDK turns which never reached the session-binding step. */
+  async projectTranscripts(workspace: string, transcriptRoot: string): Promise<string[]> {
+    const info = await lstat(transcriptRoot).catch(e => { if (e.code === 'ENOENT') return undefined; throw e; });
+    if (!info) return [];
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('Invalid SDK transcript root.');
+    const normalize = (value: string) => process.platform === 'win32' ? path.resolve(value).toLowerCase() : path.resolve(value);
+    const expected = normalize(workspace), found = new Set<string>();
+    for (const directory of await readdir(transcriptRoot, { withFileTypes: true })) {
+      if (!directory.isDirectory() || directory.isSymbolicLink()) continue;
+      const folder = path.join(transcriptRoot, directory.name);
+      for (const file of await readdir(folder, { withFileTypes: true })) {
+        if (!file.isFile() || !/^[a-zA-Z0-9_-]{1,100}\.jsonl$/.test(file.name)) continue;
+        const lines = createInterface({ input: createReadStream(path.join(folder, file.name)), crlfDelay: Infinity });
+        try {
+          for await (const line of lines) {
+            let row: unknown; try { row = JSON.parse(line); } catch { continue; }
+            if (!row || typeof row !== 'object' || !('cwd' in row) || typeof row.cwd !== 'string') continue;
+            if (normalize(row.cwd) === expected) found.add(file.name.slice(0, -6));
+            // Query cwd is immutable; its first recorded cwd identifies it.
+            break;
+          }
+        } finally { lines.close(); }
+      }
+    }
+    return [...found];
+  }
   async purge(id: string, transcriptRoot?: string): Promise<void> {
     if (!/^[a-zA-Z0-9_-]+$/.test(id)) throw new Error('Invalid session ID.');
     await this.writing;

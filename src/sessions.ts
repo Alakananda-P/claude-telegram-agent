@@ -19,6 +19,9 @@ export class SessionCatalog {
     return record;
   }
   private title(record: Conversation) { return redact(sessionTitle(record), this.secrets); }
+  private assertProjectAvailable(record: Conversation) {
+    if (!projectVisible(this.store.data, record.project)) throw new ProjectError('This chat belongs to a project in Trash or permanently deleted. Restore the project before reading or editing its chats.');
+  }
   /** Follow only persisted, same-project links. Old SDK transcripts remain versions. */
   resolve(id: string, project?: string): string {
     const records = new Map((this.store.data.conversations ?? []).map(s => [s.id, s]));
@@ -95,10 +98,11 @@ export class SessionCatalog {
     await this.store.save();
   }
   private group(id: string) { this.find(id); return this.groups().find(g => g.record.id === this.resolve(id))!.versions; }
-  trashList() { return this.groups().filter(g => g.trashed).map(g => ({ id: g.record.id, title: this.title(g.record),
+  trashList(includeHiddenProjects = false) { return this.groups().filter(g => g.trashed && (includeHiddenProjects || projectVisible(this.store.data, g.record.project))).map(g => ({ id: g.record.id, title: this.title(g.record),
     trashedAt: g.versions.find(s => s.trashedAt)?.trashedAt, purgeAt: g.versions.find(s => s.purgeAt)?.purgeAt })); }
   async requestDelete(id: string) {
     const record = this.find(this.resolve(id));
+    this.assertProjectAvailable(record);
     if (!this.onDeleteRequest) throw new SessionAccessError('Use the Telegram Sessions menu to delete a chat.');
     await this.onDeleteRequest(record.id, this.title(record));
     return { confirmationSent: true, title: this.title(record) };
@@ -118,6 +122,7 @@ export class SessionCatalog {
   }
   async restore(id: string, now = new Date()): Promise<void> {
     const group = this.group(id);
+    this.assertProjectAvailable(group[0]);
     if (group.some(s => this.store.data.purgedSessions?.includes(s.id))) throw new SessionAccessError('Permanent deletion has already started for this chat.');
     if (group.some(s => s.purgeAt && Date.parse(s.purgeAt) <= +now)) throw new SessionAccessError('This chat has passed its 48-hour restore deadline.');
     for (const record of group) { delete record.trashedAt; delete record.purgeAt; } await this.store.save();
@@ -143,12 +148,13 @@ export class SessionCatalog {
     return related;
   }
   async purgeExpired(now = new Date()): Promise<number> {
-    const expired = this.trashList().filter(s => s.purgeAt && Date.parse(s.purgeAt) <= +now);
+    const expired = this.trashList(true).filter(s => s.purgeAt && Date.parse(s.purgeAt) <= +now);
     for (const s of expired) await this.purge(s.id);
     return expired.length;
   }
   async rename(id: string, title: string, source: 'model' | 'manual' = 'model') {
     const record = this.find(this.resolve(id));
+    this.assertProjectAvailable(record);
     const safe = titleText(redact(title, this.secrets));
     if (!safe || safe.includes('[REDACTED]') || title.length > 96) throw new SessionAccessError('Use a short descriptive title without credentials (up to 64 characters).');
     record.title = safe;
@@ -175,6 +181,7 @@ export class SessionCatalog {
   }
   async read(id: string, startTurn = 0, offset = 0) {
     const record = this.find(id);
+    this.assertProjectAvailable(record);
     if (this.group(id).some(s => s.trashedAt)) throw new SessionAccessError('This session is in Trash. Restore it before reading.');
     if (![startTurn, offset].every(n => Number.isSafeInteger(n) && n >= 0)) throw new SessionAccessError('Invalid chat page cursor.');
     const source = await this.chats.read(id);

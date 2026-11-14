@@ -11,12 +11,48 @@ import { ChatArchive } from '../src/chats.js';
 import { SharedMemory } from '../src/memory.js';
 import { Automation } from '../src/automation.js';
 import { SessionCatalog } from '../src/sessions.js';
+import { ProjectCatalog } from '../src/projects.js';
 const key = 'af'.repeat(32);
 async function setup(secret = key) {
   const dir = await mkdtemp(path.join(tmpdir(), 'tg-backup-')); const store = await StateStore.open(path.join(dir, 'bot', 'state.json'));
   const chats = new ChatArchive(path.join(dir, 'bot', 'chats'), ['private-secret']); const memory = new SharedMemory(dir, ['private-secret']);
   return { dir, store, chats, memory, backups: new Backups(dir, secret, store, chats, memory, ['private-secret']) };
 }
+
+test('project names and archived state survive encrypted export without restoring Trash or overwriting existing metadata', async () => {
+  const source = await setup(), projects = new ProjectCatalog(source.dir, source.store);
+  await projects.create({ id: 'office', name: 'Office Invoices', description: 'Monthly supplier work' });
+  await writeFile(path.join(await projects.workspace('office'), 'main.txt'), 'archive me');
+  await projects.archive('office');
+  await projects.create({ id: 'discard', name: 'Discard' }); await projects.trash('discard');
+  await writeFile(path.join(source.dir, 'workspaces/discard/private.txt'), 'not exported');
+  const bytes = await source.backups.export(true), decoded = source.backups.decode(bytes) as any;
+  assert.equal(decoded.projects.find((p: any) => p.id === 'office').name, 'Office Invoices');
+  assert.ok(!decoded.projects.some((p: any) => p.id === 'discard'));
+  assert.ok(!decoded.files.some((f: any) => f.project === 'discard'));
+  const target = await setup(); await target.backups.restore(bytes);
+  const targetProjects = new ProjectCatalog(target.dir, target.store);
+  assert.equal((await targetProjects.get('office')).status, 'archived');
+  assert.equal((await targetProjects.get('office')).description, 'Monthly supplier work');
+  await targetProjects.rename('office', 'Owner updated name'); await target.backups.restore(bytes);
+  assert.equal((await targetProjects.get('office')).name, 'Owner updated name');
+  assert.equal(await readFile(path.join(target.dir, 'workspaces/office/main.txt'), 'utf8'), 'archive me');
+});
+
+test('a backup cannot resurrect a trashed or purged project or partially merge memory first', async () => {
+  const source = await setup(), sourceProjects = new ProjectCatalog(source.dir, source.store);
+  await sourceProjects.create({ id: 'removed', name: 'Removed' });
+  await source.memory.remember('Backup-only memory');
+  await writeFile(path.join(await sourceProjects.workspace('removed'), 'private.txt'), 'old contents');
+  const bytes = await source.backups.export(true), target = await setup(), targetProjects = new ProjectCatalog(target.dir, target.store);
+  await targetProjects.create({ id: 'removed', name: 'Removed' }); await targetProjects.trash('removed');
+  await assert.rejects(target.backups.restore(bytes), /project|Trash|restore/i);
+  assert.ok(!(await target.memory.read()).includes('Backup-only memory'));
+  await targetProjects.purge('removed');
+  await assert.rejects(target.backups.restore(bytes), /project|deleted|purged/i);
+  assert.equal((await targetProjects.get('removed')).status, 'purged');
+  await assert.rejects(readFile(path.join(target.dir, 'workspaces/removed/private.txt')), { code: 'ENOENT' });
+});
 
 test('encrypted backup preserves known session versions when restored into a fresh store', async () => {
   const source = await setup(), now = new Date().toISOString();

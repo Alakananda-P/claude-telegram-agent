@@ -2,7 +2,7 @@ import { z } from 'zod';
 
 export const projectRecordSchema = z.object({
   id: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,47}$/),
-  name: z.string().min(1).max(80), description: z.string().max(4000).default(''),
+  name: z.string().min(1).max(80), description: z.string().max(4000),
   status: z.enum(['active', 'archived', 'trashed', 'purging', 'purged']),
   createdAt: z.string().datetime(), updatedAt: z.string().datetime(),
   archivedAt: z.string().datetime().optional(), trashedAt: z.string().datetime().optional(),

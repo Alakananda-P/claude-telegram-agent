@@ -13,7 +13,7 @@ const isoDate = z.string().datetime();
 const messageContext = z.object({ beforeMessageId: z.number().int().positive().optional(), replyToMessageId: z.number().int().positive().optional() }).optional();
 const outage = z.object({ startedAt: isoDate, failures: z.number().int().positive(), reason: z.string().max(64) });
 const automationState = z.object({
-  projects: z.array(projectRecordSchema).optional(),
+  projects: z.array(projectRecordSchema).refine(records => new Set(records.map(p => p.id)).size === records.length).optional(),
   backgroundJobs: z.array(backgroundJobSchema).optional(),
   health: z.object({ telegramOutage: outage.optional(), telegramOutages: z.array(outage.extend({ endedAt: isoDate, durationMs: z.number().finite().nonnegative() })).max(50).optional() }).passthrough().optional(),
   pendingMessageCleanup: z.array(z.object({ chat: z.number().int().positive(), id: z.number().int().positive(), retryAt: z.number().finite().nonnegative().optional(), attempts: z.number().int().nonnegative().optional() })).optional(),

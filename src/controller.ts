@@ -24,6 +24,7 @@ import { BackgroundJobs } from './background.js';
 import { ProjectCatalog, ProjectError } from './projects.js';
 import { projectAcceptsWork } from './project-state.js';
 import type { ProjectToolContext } from './project-tools.js';
+import { ProjectUI, type ProjectTab } from './project-ui.js';
 
 interface ProjectChange { action: 'switch' | 'archive' | 'trash'; project: string; continueTask?: string }
 
@@ -65,7 +66,7 @@ Send a task in plain text, or upload a document with instructions in its caption
 /stop — cancel the running task (does not undo edits)
 /new — fresh conversation, keep project files
 /project NAME — create/switch project while idle
-/projects — list project folders
+/projects — named projects, archive and 48-hour Trash
 /files — list files in current project
 /get PATH — download a project file (up to 49 MB)
 /help — this guide
@@ -135,6 +136,8 @@ export class Controller {
       if (await this.sessions.autoName(record.id, turns => this.titles!.generate(turns, signal))) named++;
     }
     console.log(`Session catalog ready: chats=${this.sessions.context().total}; generatedNames=${named}; tools=list,read,rename,search,memory.`);
+    const projects = this.store.data.projects!;
+    console.log(`Project catalog ready: active=${projects.filter(p => p.status === 'active').length}; archived=${projects.filter(p => p.status === 'archived').length}; trashed=${projects.filter(p => p.status === 'trashed').length}; tools=12.`);
   }
 
   private get settings(): AgentSettings { return this.store.data.settings ?? { model: this.config.model, effort: this.config.effort, fast: this.config.fast }; }
@@ -148,14 +151,16 @@ export class Controller {
   }
 
   async menu(): Promise<void> {
-    await this.panel(`Claude · Your workspace\n\n${settingsLabel(this.settings)}\nProject: ${this.store.data.project}\nMemory: ${this.store.data.memoryEnabled !== false ? 'ON · shared across chats' : 'OFF'}\n${this.running ? 'Working on your task…' : 'Ready for your next task.'}\n\nSend a message or choose a control below.`, HOME);
+    const project = await this.projects.get(this.store.data.project);
+    await this.panel(`Claude · Your workspace\n\n${settingsLabel(this.settings)}\nProject: ${project.name}\nMemory: ${this.store.data.memoryEnabled !== false ? 'ON · shared across chats' : 'OFF'}\n${this.running ? 'Working on your task…' : 'Ready for your next task.'}\n\nSend a message or choose a control below.`, HOME);
   }
 
   async callback(callback: Callback): Promise<void> {
     if (!callback.message || !authorized({ ...callback.message, from: callback.from }, this.config.owner)) return;
     await this.messenger.acknowledge?.(callback.id).catch(() => {});
     const data = callback.data ?? '';
-    if (!/^(menu|help|status|stop|rename|new chat|fresh|model(?: (?:fable|opus|sonnet))?|efforts(?: (?:low|medium|high|xhigh|max))?|fast(?: (?:on|off))?|token count|cost|memory(?: (?:on|off|confirm-clear|clear))?|session(?: [a-zA-Z0-9_-]+)?|sessionpage \d+|history [a-zA-Z0-9_-]+ \d+|projects|project [a-zA-Z0-9_-]+|files|batch|process(?: [a-zA-Z0-9_-]+)?|discard [a-zA-Z0-9_-]+|queue(?: (?:pause|resume))?|task(?:cancel|first|retry|confirm) [a-zA-Z0-9_-]+|schedules|schedule(?:pause|resume|delete) [a-zA-Z0-9_-]+|trash|(?:delete|trashmove|restore|purge|purgeconfirm) [a-zA-Z0-9_-]+|backup(?: (?:export|files|daily|off))?|restorebackup confirm|health(?: retry)?|keys(?: retired)?|keyhistory [a-f0-9]{16} \d+|background(?: \d+)?|backgroundlog [a-f0-9]{16} \d+|backgroundcancel [a-f0-9]{16}|clock)$/.test(data)) return;
+    const projectCallback = /^(pnew|ppage (?:active|archived|trashed) \d+|(?:pinfo|pedit|parchive|parchok|ptrash|ptrashok|prestore|ppurge) [a-zA-Z0-9][a-zA-Z0-9_-]{0,47}|pfiles [a-zA-Z0-9][a-zA-Z0-9_-]{0,47} \d+|ppurgeok [a-f0-9]{8})$/.test(data);
+    if (!/^(menu|help|status|stop|rename|new chat|fresh|model(?: (?:fable|opus|sonnet))?|efforts(?: (?:low|medium|high|xhigh|max))?|fast(?: (?:on|off))?|token count|cost|memory(?: (?:on|off|confirm-clear|clear))?|session(?: [a-zA-Z0-9_-]+)?|sessionpage \d+|history [a-zA-Z0-9_-]+ \d+|projects|project [a-zA-Z0-9_-]+|files|batch|process(?: [a-zA-Z0-9_-]+)?|discard [a-zA-Z0-9_-]+|queue(?: (?:pause|resume))?|task(?:cancel|first|retry|confirm) [a-zA-Z0-9_-]+|schedules|schedule(?:pause|resume|delete) [a-zA-Z0-9_-]+|trash|(?:delete|trashmove|restore|purge|purgeconfirm) [a-zA-Z0-9_-]+|backup(?: (?:export|files|daily|off))?|restorebackup confirm|health(?: retry)?|keys(?: retired)?|keyhistory [a-f0-9]{16} \d+|background(?: \d+)?|backgroundlog [a-f0-9]{16} \d+|backgroundcancel [a-f0-9]{16}|clock)$/.test(data) && !projectCallback) return;
     this.panelId = callback.message.message_id;
     try {
       if (data === 'memory confirm-clear') {
@@ -312,7 +317,7 @@ export class Controller {
     if (command === 'start' || command === 'menu') return this.menu();
     if (command === 'help') return this.panel(HELP);
     try { if (await this.extraCommand(command, argument, messageContext)) return; }
-    catch { return this.say('Could not complete that action. Check the selected item, storage and command. Existing data is kept.'); }
+    catch (error) { return this.say(error instanceof ProjectError ? error.message : 'Could not complete that action. Check the selected item, storage and command. Existing data is kept.'); }
     if (command === 'rename' && !argument) return this.panel('Send /rename followed by the new title, or ask Claude to rename this chat.');
     if (command === 'sessionpage') return this.controls('session', Math.max(0, Math.floor(Number(argument) || 0)));
     if (command === 'history') {
@@ -409,14 +414,8 @@ export class Controller {
         const name = projectName(argument);
         await this.projects.workspace(name, true);
         await this.dismiss('uploads');
-        this.store.data.project = name;
-        await this.store.save();
-        return this.panel(`Active project: ${name}. Its saved conversation will resume.`, HOME);
-      }
-      if (command === 'projects') {
-        const entries = await readdir(path.dirname(root), { withFileTypes: true });
-        const names = entries.filter(e => e.isDirectory() && !e.isSymbolicLink()).map(e => e.name).slice(0, 20);
-        return this.panel('Projects\n\nChoose a project below. To create one, send /project NAME.', [...names.map(name => [button((name === this.store.data.project ? '✓ ' : '') + name, 'project ' + name)]), ...BACK]);
+        const selected = await this.projects.select(name);
+        return this.panel(`Active project: ${selected.name}. Its saved conversation will resume.`, HOME);
       }
       if (command === 'files') return this.say((await this.listFiles(root)).join('\n') || 'No files yet.');
       if (command === 'get') {
@@ -824,6 +823,38 @@ export class Controller {
     await this.say('Encrypted backup sent. Keep the private BACKUP_ENCRYPTION_KEY from your environment to restore it on another server. Restore by uploading this .ctab file. Secrets and lifetime usage are not imported or reset.');
   }
   private async extraCommand(command: string | undefined, argument: string, messageContext?: TelegramMessageContext): Promise<boolean> {
+    const projectUI = new ProjectUI(this.projects, configSecrets(this.config));
+    const show = async (view: { text: string; buttons: Buttons }) => this.panel(view.text, view.buttons);
+    if (command === 'projects' || command === 'ppage') {
+      const [status, page] = argument.split(' ');
+      await show(await projectUI.page((status || 'active') as ProjectTab, page ? Number(page) : 0)); return true;
+    }
+    if (command === 'pnew') { await this.panel('Tell Claude what to build: “Create a project called Office Bills and build an invoice tracker.”\n\nFor an empty project, /project office-bills creates and opens that ID. Names and descriptions can be edited later.', [[button('Projects', 'projects')], ...BACK]); return true; }
+    if (command === 'pinfo') { await show(await projectUI.detail(argument)); return true; }
+    if (command === 'pfiles') { const [id, offset] = argument.split(' '); await show(await projectUI.files(id, Number(offset || 0))); return true; }
+    if (command === 'pedit') {
+      const p = await this.projects.get(argument);
+      await this.panel(`${p.name}\n\nAsk naturally:\n“Rename project ${p.id} to Office Bills”\n“Set the description of project ${p.id} to …”\n\nRenaming keeps its files and chats attached.`, [[button('Project', 'pinfo ' + p.id)], ...BACK]); return true;
+    }
+    if (command === 'parchive' || command === 'ptrash') {
+      const p = await this.projects.get(argument), trash = command === 'ptrash';
+      await this.panel(`${trash ? 'Move' : 'Archive'} "${p.name}"${trash ? ' to Trash' : ''}?\n\n${trash ? 'Files and chats are kept for 48 hours, then permanently deleted.' : 'Files and chats are kept until you restore it.'}\nSchedules pause; queued tasks are cancelled. Shared memory and lifetime usage stay.`,
+        [[button(trash ? 'Move project to Trash' : 'Archive project', (trash ? 'ptrashok ' : 'parchok ') + p.id)], [button('Back to project', 'pinfo ' + p.id)], ...BACK]); return true;
+    }
+    if (['parchok', 'ptrashok', 'prestore'].includes(command ?? '')) {
+      if (command === 'parchok') await this.projects.archive(argument);
+      else if (command === 'ptrashok') await this.projects.trash(argument);
+      else await this.projects.restore(argument);
+      await this.dismiss('uploads'); await show(await projectUI.detail(argument)); return true;
+    }
+    if (command === 'ppurge') { await this.requestProjectPurge(argument); return true; }
+    if (command === 'ppurgeok') {
+      const pending = this.projectPurgeRequests.get(argument);
+      if (!pending || pending.expires <= Date.now()) throw new ProjectError('This project deletion confirmation expired. Open the project in Trash and request a new one.');
+      this.projectPurgeRequests.delete(argument);
+      await this.projects.purge(pending.id); await this.dismiss('project-purge-' + pending.id);
+      await show(await projectUI.page('trashed')); return true;
+    }
     if (command === 'background') {
       const page = /^\d+$/.test(argument) ? Number(argument) : 0, jobs = this.background.list(page * 10, 10);
       const rows = jobs.map(j => `${j.name} · ${j.status.replaceAll('_', ' ')}\nProject: ${j.project}`).join('\n\n') || 'No background jobs yet.';

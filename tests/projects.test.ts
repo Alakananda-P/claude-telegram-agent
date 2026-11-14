@@ -7,17 +7,11 @@ import { StateStore } from '../src/state.js';
 import { Automation } from '../src/automation.js';
 import { SessionCatalog } from '../src/sessions.js';
 import { ChatArchive } from '../src/chats.js';
-import type { ProjectCatalog } from '../src/projects.js';
-
-const module = await import('../src/' + 'projects.js').catch(error => {
-  if (error.code === 'ERR_MODULE_NOT_FOUND') return {};
-  throw error;
-});
+import { ProjectCatalog } from '../src/projects.js';
 async function setup() {
-  assert.equal(typeof module.ProjectCatalog, 'function', 'Project lifecycle catalog is not implemented');
   const dir = await mkdtemp(path.join(tmpdir(), 'tg-projects-'));
   const store = await StateStore.open(path.join(dir, 'bot/state.json'));
-  const catalog: ProjectCatalog = new module.ProjectCatalog(dir, store, ['private-fixture-key']);
+  const catalog: ProjectCatalog = new ProjectCatalog(dir, store, ['private-fixture-key']);
   return { dir, store, catalog };
 }
 
@@ -38,7 +32,7 @@ test('legacy project discovery and display-name edits preserve files, sessions a
   assert.equal(await readFile(path.join(original, 'bill.txt'), 'utf8'), 'Original bill');
   assert.equal(store.data.sessions['tally-bills'], 'saved-chat');
   assert.equal(store.data.conversations![0].project, 'tally-bills');
-  const reopened = new module.ProjectCatalog(dir, await StateStore.open(store.file), []);
+  const reopened = new ProjectCatalog(dir, await StateStore.open(store.file), []);
   assert.equal((await reopened.get('tally-bills')).name, 'Office Bills 2026');
   assert.equal((await reopened.list({ query: 'supplier' })).total, 1);
 });
@@ -71,10 +65,22 @@ test('project Trash hides its chats and restore does not extend an individually 
   await catalog.trash('bills', now);
   assert.equal((await catalog.list()).projects.some(p => p.id === 'bills'), false);
   assert.equal(chats.list().sessions.length, 0);
+  await assert.rejects(chats.read('chat-a'), /project.*Trash|restore.*project/i);
+  assert.equal(chats.trashList().length, 0);
   assert.equal((await catalog.get('bills')).purgeAt, new Date(+now + 48 * 3600000).toISOString());
   await catalog.restore('bills', new Date(+now + 1000));
   assert.equal(chats.list().sessions.length, 1);
   assert.equal(store.data.conversations![1].purgeAt, new Date(+now + 60000).toISOString());
+});
+
+test('individual chat expiry still runs while its parent project is in Trash', async () => {
+  const { dir, store, catalog } = await setup(); await catalog.create({ id: 'hidden', name: 'Hidden' });
+  const now = new Date();
+  store.data.conversations!.push({ id: 'old-chat', project: 'hidden', updatedAt: now.toISOString(), trashedAt: new Date(+now - 48 * 3600000).toISOString(), purgeAt: new Date(+now + 1000).toISOString() });
+  const chats = new SessionCatalog(store, new ChatArchive(path.join(dir, 'bot/chats'), []), []);
+  await catalog.trash('hidden', now);
+  assert.equal(await chats.purgeExpired(new Date(+now + 2000)), 1);
+  assert.equal(store.data.conversations!.length, 0); assert.equal((await catalog.get('hidden')).status, 'trashed');
 });
 
 test('purge removes only its project and linked content while keeping memory, usage and tombstones', async () => {
@@ -127,12 +133,40 @@ test('project purge also removes unbound drafts and fresh summaries after a fail
   assert.ok(store.data.purgedSessions!.includes('draft-private'));
 });
 
+test('permanent project purge discovers orphan SDK transcripts and their helper files without touching another project', async () => {
+  const { dir, catalog, store } = await setup(); await catalog.create({ id: 'private-app', name: 'Private App' });
+  const root = await catalog.workspace('private-app'), sdk = path.join(dir, 'claude/projects/sdk-folder');
+  await mkdir(path.join(sdk, 'orphan-session/subagents'), { recursive: true });
+  await writeFile(path.join(sdk, 'orphan-session.jsonl'), JSON.stringify({ type: 'user', cwd: root, message: { role: 'user', content: 'Unbound private turn' } }) + '\n');
+  await writeFile(path.join(sdk, 'orphan-session/subagents/helper.jsonl'), 'private helper trace');
+  await writeFile(path.join(sdk, 'other-session.jsonl'), JSON.stringify({ cwd: path.join(dir, 'workspaces/default') }) + '\n');
+  await catalog.trash('private-app'); await catalog.purge('private-app');
+  await assert.rejects(lstat(path.join(sdk, 'orphan-session.jsonl')), { code: 'ENOENT' });
+  await assert.rejects(lstat(path.join(sdk, 'orphan-session')), { code: 'ENOENT' });
+  assert.ok(store.data.purgedSessions!.includes('orphan-session'));
+  assert.ok((await lstat(path.join(sdk, 'other-session.jsonl'))).isFile());
+});
+
+test('an interrupted project purge can be retried without reusing its ID or deleting siblings', async () => {
+  const { dir, catalog, store } = await setup(); await catalog.create({ id: 'retry-purge', name: 'Retry' });
+  await writeFile(path.join(await catalog.workspace('default'), 'sentinel.txt'), 'keep');
+  await catalog.trash('retry-purge');
+  const save = store.save.bind(store); let failed = false;
+  store.save = async () => {
+    if (!failed && store.data.projects!.some(p => p.id === 'retry-purge' && p.status === 'purging')) { failed = true; throw new Error('disk fixture failure'); }
+    return save();
+  };
+  await assert.rejects(catalog.purge('retry-purge'), /disk fixture/);
+  await catalog.purgeExpired(); assert.equal((await catalog.get('retry-purge')).status, 'purged');
+  assert.equal(await readFile(path.join(dir, 'workspaces/default/sentinel.txt'), 'utf8'), 'keep');
+});
+
 test('serialized project updates and duplicate creation survive restart without losing metadata', async () => {
   const { dir, store, catalog } = await setup(); await catalog.create({ name: 'App', id: 'app' });
   await Promise.all([catalog.rename('app', 'Invoice App'), catalog.update('app', { description: 'Saved description' })]);
   const results = await Promise.allSettled([catalog.create({ name: 'Second', id: 'second' }), catalog.create({ name: 'Second', id: 'second' })]);
   assert.equal(results.filter(r => r.status === 'fulfilled').length, 1);
-  const reopened: ProjectCatalog = new module.ProjectCatalog(dir, await StateStore.open(store.file), []);
+  const reopened: ProjectCatalog = new ProjectCatalog(dir, await StateStore.open(store.file), []);
   assert.equal((await reopened.get('app')).name, 'Invoice App');
   assert.equal((await reopened.get('app')).description, 'Saved description');
 });

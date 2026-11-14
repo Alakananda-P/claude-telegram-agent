@@ -113,7 +113,7 @@ async function main(): Promise<void> {
       { command: 'new', description: 'Fresh conversation, keep files' },
       { command: 'fresh', description: 'New conversation with completed-work summary' },
       { command: 'project', description: 'Create or switch project' },
-      { command: 'projects', description: 'List projects' },
+      { command: 'projects', description: 'Projects, archive, restore and Trash' },
       { command: 'files', description: 'List project files' },
       { command: 'get', description: 'Download a project file' },
       { command: 'batch', description: 'Collect photos and files in a batch' },

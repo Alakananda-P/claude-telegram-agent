@@ -46,6 +46,40 @@ async function setup(runner?: Runner, transcriber?: TranscriptionService) {
 }
 
 const voice = (): Message => ({ ...message(''), voice: { file_id: 'voice-original', duration: 3, mime_type: 'audio/ogg' } });
+
+test('Projects menus paginate named projects and provide archive, Trash, restore and owner-only permanent deletion', async () => {
+  const { bot, panels, store, dataDir } = await setup();
+  for (let i = 0; i < 10; i++) await bot.projects.create({ id: 'project-' + i, name: 'Office ' + i, description: 'Supplier invoices' });
+  await bot.handle(message('/projects'));
+  assert.match(panels.at(-1)!.text, /11/); assert.ok(panels.at(-1)!.buttons.flat().some(b => /Next/.test(b.text)));
+  const callback = async (data: string, owner = 123) => bot.callback({ id: 'project-callback', from: { id: owner }, message: { ...message(''), message_id: 800 }, data });
+  const next = panels.at(-1)!.buttons.flat().find(b => /Next/.test(b.text))!;
+  await callback(next.callback_data); assert.match(panels.at(-1)!.text, /Page 2/);
+  await callback('pinfo project-0'); assert.match(panels.at(-1)!.text, /Office 0/);
+  assert.ok(panels.at(-1)!.buttons.flat().some(b => /Archive/.test(b.text)));
+  await callback('parchive project-0'); await callback('parchok project-0');
+  assert.equal((await bot.projects.get('project-0')).status, 'archived');
+  await callback('prestore project-0'); assert.equal((await bot.projects.get('project-0')).status, 'active');
+  await callback('ptrash project-0'); await callback('ptrashok project-0');
+  assert.equal((await bot.projects.get('project-0')).status, 'trashed');
+  await writeFile(path.join(dataDir, 'workspaces/project-0/proof.txt'), 'preserved until owner confirms');
+  await callback('ppurge project-0');
+  const confirm = panels.at(-1)!.buttons.flat().find(b => b.callback_data.startsWith('ppurgeok ')); assert.ok(confirm);
+  await callback(confirm.callback_data, 999); assert.equal((await bot.projects.get('project-0')).status, 'trashed');
+  await callback('ppurgeok deadbeef'); assert.equal((await bot.projects.get('project-0')).status, 'trashed');
+  await callback(confirm.callback_data); assert.equal((await bot.projects.get('project-0')).status, 'purged');
+  await assert.rejects(readFile(path.join(dataDir, 'workspaces/project-0/proof.txt')), { code: 'ENOENT' });
+  assert.equal(store.data.memoryEnabled, true);
+  assert.ok(panels.flatMap(p => p.buttons.flat()).every(b => Buffer.byteLength(b.callback_data) <= 64));
+});
+
+test('project buttons redact full legacy metadata before truncation', async () => {
+  const { bot, store, config, panels } = await setup(); await bot.projects.create({ id: 'legacy', name: 'Legacy' });
+  store.data.projects!.find(p => p.id === 'legacy')!.name = 'Q'.repeat(30) + config.apiKey;
+  await bot.handle(message('/projects'));
+  assert.ok(!JSON.stringify(panels.at(-1)!.buttons).includes(config.apiKey.slice(0, 4)));
+});
+
 const speech = { text: 'Please read the attached bill', language: 'eng', durationSeconds: 3, provider: 'ElevenLabs' as const, model: 'scribe_v2' as const, cached: false, hasSpeech: true, transcriptFile: 'transcripts/voice.txt', metadataFile: 'transcripts/voice.json' };
 
 test('queue previews mask complete credentials before truncation and schedule buttons mask private names', async () => {

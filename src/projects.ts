@@ -188,7 +188,9 @@ export class ProjectCatalog {
       if (info && (info.isSymbolicLink() || !info.isDirectory())) throw new ProjectError('Refusing permanent deletion through a symlink or invalid project directory.');
       p.status = 'purging'; await this.store.save();
       const d = this.store.data;
+      const archive = new ChatArchive(path.join(this.dataDir, 'bot/chats'), this.secrets);
       const owned = new Set([
+        ...await archive.projectTranscripts(target, path.join(this.dataDir, 'claude/projects')),
         ...d.conversations!.filter(c => c.project === id).map(c => c.id),
         ...d.tasks!.filter(t => t.project === id).map(t => t.chatKey),
         ...d.uploads!.filter(u => u.project === id).map(u => u.chatKey),
@@ -202,7 +204,6 @@ export class ProjectCatalog {
         if (!this.store.data.conversations!.some(c => c.id === chat.id)) continue;
         await this.sessions.trash(chat.id); await this.sessions.purge(chat.id);
       }
-      const archive = new ChatArchive(path.join(this.dataDir, 'bot/chats'), this.secrets);
       for (const key of owned) {
         await archive.purge(key, path.join(this.dataDir, 'claude/projects'));
         if (d.freshContexts) delete d.freshContexts[key];
@@ -219,6 +220,9 @@ export class ProjectCatalog {
       }
       // target is a verified direct workspace child. rm removes nested links,
       // rather than traversing their targets; Linux sentinel tests cover this.
+      if (path.dirname(target) !== await this.directoryBase()) throw new ProjectError('The workspace root changed during deletion. Review storage before retrying.');
+      const finalInfo = await lstat(target).catch(error => { if (missing(error)) return undefined; throw error; });
+      if (finalInfo && (finalInfo.isSymbolicLink() || !finalInfo.isDirectory())) throw new ProjectError('The project deletion target changed. Symlinks are refused.');
       await rm(target, { recursive: true, force: true, maxRetries: 3 });
       for (const t of d.tasks ?? []) if (t.project === id) { t.prompt = '[Deleted project]'; delete t.displayPrompt; delete t.steers; delete t.voiceInput; delete t.attachedFiles; delete t.messageContext; }
       d.schedules = d.schedules?.filter(s => s.project !== id); d.uploads = d.uploads?.filter(u => u.project !== id); d.batches = d.batches?.filter(b => b.project !== id);

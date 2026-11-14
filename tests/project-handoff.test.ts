@@ -20,7 +20,7 @@ async function setup(run: Runner['run']) {
   return { bot, store, dir, replies, config };
 }
 function projects(request: AgentRequest): ProjectToolContext {
-  const context = (request as AgentRequest & { projects?: ProjectToolContext }).projects;
+  const context = request.projects;
   assert.ok(context, 'Claude has no project lifecycle tools'); return context;
 }
 
@@ -32,14 +32,14 @@ test('a successful switch continues only remaining work in the real destination 
       await context.catalog.create({ id: 'invoice-app', name: 'Invoice App' });
       fixture.store.data.conversations!.push({ id: 'existing-invoice-chat', project: 'invoice-app', updatedAt: new Date().toISOString() });
       fixture.store.data.sessions['invoice-app'] = 'existing-invoice-chat';
-      deadline = (fixture.store.data.tasks![0] as any).deadlineAt; assert.ok(deadline);
+      deadline = fixture.store.data.tasks![0].deadlineAt; assert.ok(deadline);
       await context.requestSwitch('invoice-app', 'Create marker.txt containing PROJECT_HANDOFF_OK.');
       assert.equal(context.pending(), true); assert.equal(fixture.store.data.project, 'default');
     } else {
       assert.equal(request.cwd, path.join(fixture.dir, 'workspaces/invoice-app'));
       assert.equal(request.session, 'existing-invoice-chat');
       assert.match(request.prompt, /Create marker.txt/); assert.ok(!request.prompt.includes('DO_NOT_REPLAY_ORIGINAL'));
-      assert.equal((fixture.store.data.tasks![1] as any).deadlineAt, deadline);
+      assert.equal(fixture.store.data.tasks![1].deadlineAt, deadline);
       await writeFile(path.join(request.cwd, 'marker.txt'), 'PROJECT_HANDOFF_OK');
     }
     const session = calls.length === 1 ? 'source-chat' : 'existing-invoice-chat';

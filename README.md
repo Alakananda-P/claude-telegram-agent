@@ -69,6 +69,14 @@ API-key setup.
   user ID may issue work. Groups and other senders are ignored.
 - Saves a separate conversation for each named project. Files and transcripts
   survive redeploys when the `/data` disk is attached.
+- Claude can create, inspect, rename, describe, switch, archive, restore and delete
+  projects with twelve callable tools. `/projects` has named, paginated controls
+  for Active, Archived and 48-hour Trash. A requested switch continues remaining
+  work in the actual destination folder and saved chat, retaining the original
+  deadline. Project names can change without moving folders or breaking history.
+  Permanent deletion keeps global memory and accounting, requires an owner
+  confirmation when immediate, and prevents deleted ID reuse. Encrypted backups
+  preserve project metadata. See [project tools](docs/project-tools.md).
 - Supports one task at a time, a single disappearing activity indicator, cancellation,
   uploads, downloads, and redacted result files for recovery after delivery errors.
 - Telegram control panel: model, effort, speed, shared memory, saved sessions,
