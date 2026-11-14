@@ -40,7 +40,7 @@ Files: background service, `agent.ts`, `controller.ts`, `workspace-tools.ts`, `s
 - [x] Keep the native SDK query/input open after the parent's answer while non-ambient helpers run; consume completion results before closing. This replaces a second helper service because the pinned SDK already supplies task lifecycle and steering. Helpers share the existing task timeout/cancellation/restart boundaries and are not advertised as restart-durable.
 - [x] Forward sanitized task progress to the activity indicator and preserve ordinary parent updates. Publish helper outcomes without hidden reasoning; provide a read-only audit agent and retain normal auto permission checks.
 - [x] Record timeout, cancellation, refusal, API failure and restart reasons distinctly; preserve configured limits and no-replay behavior.
-- [ ] Test lifetime, progress, cancellation, timeout, usage and restart; verify a real SDK path in Linux and commit.
+- [x] Test lifetime, progress, cancellation, timeout, usage and restart; verify a real SDK path in Linux and commit. Real testing also reproduced SDK cleanup cancelling the owner task after a rejected credential; provider-attempt controllers now isolate cleanup while owner Stop still propagates. A second regression proves that an overlapping human reply or another helper cannot consume an undelivered hand-back.
 
 ## 4. Telegram formatting: H-21
 
@@ -62,10 +62,10 @@ Files: `artifacts.ts`, `safety.ts`, workspace/memory tools, background service, 
 
 ## 6. Verify and deploy
 
-- [x] Run typecheck, build and full serial tests. Review each report item as fixed, already implemented, unproven or separate roadmap work. Windows: 215 tests, 211 pass, four platform skips, no failures/cancellations; see `docs/weekly-report-fixes.md` for scope and evidence boundaries.
-- [ ] Check the patch for private values; push reviewed changes and run Linux tests as production UID 1000 plus bounded real SDK/Telegram acceptance without a second poller.
-- [ ] Integrate and deploy the tested revision to the existing Render worker. Verify the same disk/environment/reset flags and preserved memory/session/accounting readiness.
-- [ ] Save private evidence and refresh the source archive; report measured results and evidence gaps.
+- [x] Run typecheck, build and full serial tests. Review each report item as fixed, already implemented, unproven or separate roadmap work. Windows: 220 tests, 216 pass, four platform skips, no failures/cancellations; see `docs/weekly-report-fixes.md` for scope and evidence boundaries.
+- [x] Check the patch for private values; push reviewed changes and run Linux tests as production UID 1000 plus bounded real SDK/Telegram acceptance without a second poller. Linux: 220/220 passed; native helper interim reply, owner steering, completed file marker, and real Telegram HTML send/delete all verified at code revision `74ed456941a648412bcdbba91d85e2a927bd418e`.
+- [x] Integrate and deploy the tested revision to the existing Render worker. Revision `74ed456941a648412bcdbba91d85e2a927bd418e` is live as `dep-dbsa2ml6e07s739956m0`; the same disk and inspected settings are retained, reset and upgrade inference stay false, and memory/session/accounting startup and Telegram polling were verified. Historical partial accounting is reported without claiming complete billing reconciliation.
+- [x] Save private evidence and refresh the source archive; report measured results and evidence gaps. Saved `data/weekly-report-verification.md`, its JSON companion, safe metadata snapshots and test/startup logs. Documentation-only release notes are committed after the tested runtime revision; archive generation verifies code equivalence.
 
 ## Baseline
 
