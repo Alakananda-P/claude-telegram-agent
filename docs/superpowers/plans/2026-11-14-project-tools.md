@@ -53,10 +53,13 @@
 
 ## Task 4: Verify and release
 
-- [ ] Run typecheck, build, diff/credential checks and the full Windows suite. Review the patch for lifecycle and path regressions.
-- [ ] Push the candidate; run full serial Linux tests as production UID plus a bounded real Claude MCP create/switch/write/read acceptance in temporary data, with no second Telegram poller.
-- [ ] Integrate without overwriting remote history and deploy the verified code to the existing Render worker. Compare disk/settings/reset flags and verify polling and retained memory/chat/accounting startup.
-- [ ] Save private verification artifacts, update release documentation and refresh the tracked-source ZIP.
+- [x] Run typecheck, build, diff/credential checks and the full Windows suite. Review the patch for lifecycle and path regressions.
+- [x] Push the candidate; run full serial Linux tests as production UID plus a bounded real Claude MCP create/switch/write/read acceptance in temporary data, with no second Telegram poller.
+- [x] Integrate without overwriting remote history and deploy the verified code to the existing Render worker. Compare disk/settings/reset flags and verify polling and retained memory/chat/accounting startup.
+- [x] Save private verification artifacts, update release documentation and refresh the tracked-source ZIP.
+
+Release evidence: `docs/project-tools-release-2026-11-15.md`; private deployment
+snapshots and measured probe results: `data/project-tools-verification.json`.
 
 ## Baseline
 
