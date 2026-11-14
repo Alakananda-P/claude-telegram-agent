@@ -101,6 +101,24 @@ test('background output is bounded and readable in pages', async () => {
   } finally { await jobs.stop(); }
 });
 
+test('completion previews use the log tail and notification times follow a concurrent job completion', async () => {
+  let release!: () => void, entered!: () => void;
+  const gate = new Promise<void>(r => { release = r; }), entry = new Promise<void>(r => { entered = r; });
+  let count = 0;
+  const { jobs, start, script, store } = await setup(async () => { if (++count === 1) { entered(); await gate; } });
+  try {
+    const file = await script('ending.mjs', "process.stdout.write('HEAD' + 'x'.repeat(3000) + '\\nFINAL_SUMMARY');");
+    const first = await start(file); await jobs.wait(first.id); await entry;
+    await delay(20);
+    const second = await start(file); await jobs.wait(second.id);
+    const tail = await jobs.readTail(second.id, 100);
+    assert.ok(tail.text.endsWith('FINAL_SUMMARY')); assert.ok(!tail.text.includes('HEAD'));
+    release(); await jobs.tick();
+    const saved = store.data.backgroundJobs!.find(j => j.id === second.id)!;
+    assert.ok(Date.parse(saved.notifiedAt!) >= Date.parse(saved.finishedAt!));
+  } finally { release(); await jobs.stop(); }
+});
+
 test('Linux cancellation stops descendants in the owned process group', { skip: process.platform === 'win32' }, async () => {
   const { jobs, root, start, script } = await setup(); const marker = path.join(root, 'orphan.txt');
   try {

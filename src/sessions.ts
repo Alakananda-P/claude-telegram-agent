@@ -2,7 +2,7 @@ import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import { StateStore, type Conversation } from './state.js';
 import { ChatArchive, type ChatTurn } from './chats.js';
-import { redact, safeJson } from './safety.js';
+import { redact, safeJson, PathAccessError } from './safety.js';
 import { randomUUID } from 'node:crypto';
 
 const titleText = (text: string): string => text.replace(/[\p{Cc}\p{Cf}]/gu, ' ').replace(/\s+/g, ' ').trim().slice(0, 64);
@@ -219,7 +219,7 @@ export class SessionCatalog {
 export async function toolResult(action: () => unknown | Promise<unknown>, secrets: string[] = []) {
   try { return { content: [{ type: 'text' as const, text: safeJson(await action(), secrets) }] }; }
   catch (error) { return { isError: true, content: [{ type: 'text' as const,
-    text: error instanceof SessionAccessError ? error.message : 'Saved data could not be accessed. No raw service details are exposed.' }] }; }
+    text: error instanceof SessionAccessError || error instanceof PathAccessError ? error.message : 'Saved data could not be accessed. No raw service details are exposed.' }] }; }
 }
 export const SESSION_TOOL_NAMES = ['list_sessions', 'read_session', 'rename_session', 'search_sessions', 'request_delete_session', 'restore_session', 'list_trash'].map(name => `mcp__sessions__${name}`);
 export function sessionTools(catalog: SessionCatalog) {

@@ -36,33 +36,33 @@ Files: `sessions.ts`, `controller.ts`, `chats.ts`, `state.ts`, session/controlle
 
 Files: background service, `agent.ts`, `controller.ts`, `workspace-tools.ts`, `state.ts`, focused tests.
 
-- [ ] Inspect pinned SDK task events and reproduce an outstanding helper at parent-turn completion.
-- [ ] Keep the native SDK query/input open after the parent's answer while non-ambient helpers run; consume completion results before closing. This replaces a second helper service because the pinned SDK already supplies task lifecycle and steering. Helpers share the existing task timeout/cancellation/restart boundaries and are not advertised as restart-durable.
-- [ ] Forward sanitized task progress to the activity indicator and preserve ordinary parent updates. Publish helper outcomes without hidden reasoning; provide a read-only audit agent and retain normal auto permission checks.
-- [ ] Record timeout, cancellation, refusal, API failure and restart reasons distinctly; preserve configured limits and no-replay behavior.
+- [x] Inspect pinned SDK task events and reproduce an outstanding helper at parent-turn completion.
+- [x] Keep the native SDK query/input open after the parent's answer while non-ambient helpers run; consume completion results before closing. This replaces a second helper service because the pinned SDK already supplies task lifecycle and steering. Helpers share the existing task timeout/cancellation/restart boundaries and are not advertised as restart-durable.
+- [x] Forward sanitized task progress to the activity indicator and preserve ordinary parent updates. Publish helper outcomes without hidden reasoning; provide a read-only audit agent and retain normal auto permission checks.
+- [x] Record timeout, cancellation, refusal, API failure and restart reasons distinctly; preserve configured limits and no-replay behavior.
 - [ ] Test lifetime, progress, cancellation, timeout, usage and restart; verify a real SDK path in Linux and commit.
 
 ## 4. Telegram formatting: H-21
 
 Files: `formatting.ts`, `telegram.ts`, formatting/Telegram tests.
 
-- [ ] Reproduce raw Markdown, tables and unsafe HTML/code chunking.
-- [ ] Render escaped chunk-safe Telegram HTML, readable monospaced tables, headings, links and code. Retry plain text only on an explicit formatting rejection, never ambiguous delivery failures.
-- [ ] Verify request payloads and message tracking; commit.
+- [x] Reproduce raw Markdown, tables and unsafe HTML/code chunking.
+- [x] Render escaped chunk-safe Telegram HTML, readable monospaced tables, headings, links and code. Retry plain text only on an explicit formatting rejection, never ambiguous delivery failures.
+- [x] Verify request payloads and message tracking; commit.
 
 ## 5. Delivery and tool usability: H-06/H-08/H-09/R-06
 
 Files: `artifacts.ts`, `safety.ts`, workspace/memory tools, background service, controller, focused tests.
 
-- [ ] Reproduce missing `.md` delivery, sensitive-document auto-delivery, hidden path errors, missing empty-topic deletion and log-head notifications.
-- [ ] Include Markdown outputs, skip clear identity/credential paths in automatic delivery, preserve explicit safe retrieval.
-- [ ] Expose safe typed path errors. Add serialized empty-topic deletion that refuses nonempty/core topics and symlinks.
-- [ ] Show final log lines and record notification timestamps after completion/send, retaining durable retries.
-- [ ] Run regressions and commit.
+- [x] Reproduce missing `.md` delivery, sensitive-document auto-delivery, hidden path errors, missing empty-topic deletion and log-head notifications.
+- [x] Include Markdown outputs, skip clear identity/credential paths in automatic delivery, preserve explicit safe retrieval.
+- [x] Expose safe typed path errors. Add serialized empty-topic deletion that refuses nonempty/core topics and symlinks.
+- [x] Show final log lines and record notification timestamps after completion/send, retaining durable retries.
+- [x] Run regressions and commit. Also preserve version bindings in backward-compatible encrypted backups. A 300 KB log test exposed a new quadratic URL-scheme masking path; bounded scheme matching fixes it (3.4 ms regression run).
 
 ## 6. Verify and deploy
 
-- [ ] Run typecheck, build and full serial tests. Review each report item as fixed, already implemented, unproven or separate roadmap work.
+- [x] Run typecheck, build and full serial tests. Review each report item as fixed, already implemented, unproven or separate roadmap work. Windows: 215 tests, 211 pass, four platform skips, no failures/cancellations; see `docs/weekly-report-fixes.md` for scope and evidence boundaries.
 - [ ] Check the patch for private values; push reviewed changes and run Linux tests as production UID 1000 plus bounded real SDK/Telegram acceptance without a second poller.
 - [ ] Integrate and deploy the tested revision to the existing Render worker. Verify the same disk/environment/reset flags and preserved memory/session/accounting readiness.
 - [ ] Save private evidence and refresh the source archive; report measured results and evidence gaps.

@@ -381,6 +381,8 @@ test('timeout still aborts bounded work without a spending cap', async () => {
   await bot.handle(message('work')); await bot.idle();
   assert.equal(store.data.lastJob?.status, 'cancelled');
   assert.ok(replies.some(r => r.includes('time limit')));
+  assert.equal(store.data.tasks![0].failureKind, 'timeout');
+  assert.equal((await StateStore.open(store.file)).data.tasks![0].failureKind, 'timeout');
 });
 
 test('model controls persist across restarts, validate choices, and reach each job', async () => {

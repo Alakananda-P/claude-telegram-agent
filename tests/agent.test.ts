@@ -46,6 +46,43 @@ function factory(messages: unknown[], capture: (o: Options) => void = () => {}):
   };
 }
 
+for (const resultBeforeSnapshot of [false, true]) test(`background helpers survive the parent reply and accept steering (completion result before snapshot: ${resultBeforeSnapshot})`, async () => {
+  const steering = new SteeringInput(), events: AgentEvent[] = []; let closed = 0, completed = false;
+  const make: QueryFactory = ({ prompt, options }) => {
+    assert.equal(options.agentProgressSummaries, true);
+    assert.deepEqual(options.agents!['workspace-audit'].tools, ['Read', 'Glob', 'Grep']);
+    return { async *[Symbol.asyncIterator]() {
+      const incoming = (prompt as AsyncIterable<import('@anthropic-ai/claude-agent-sdk').SDKUserMessage>)[Symbol.asyncIterator]();
+      const first = (await incoming.next()).value!; yield init as SDKMessage;
+      yield { type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: 'helper', run_id: 'run-1', task_type: 'local_agent', description: 'Audit files' }] } as unknown as SDKMessage;
+      yield { ...result, result: 'Audit is running.', user_message_uuids: [first.uuid] } as unknown as SDKMessage;
+      assert.equal(closed, 0); assert.equal(steering.accepting, true);
+      const update = steering.add('Also check dates'); const next = (await incoming.next()).value!;
+      yield { ...result, result: 'Checking dates too.', user_message_uuids: [next.uuid] } as unknown as SDKMessage;
+      assert.equal(update.answered, true);
+      yield { type: 'system', subtype: 'task_progress', task_id: 'helper', run_id: 'run-1', description: 'Audit files', summary: 'Checked dates; password: "do not show this"', usage: { total_tokens: 12, tool_uses: 1, duration_ms: 100 } } as unknown as SDKMessage;
+      yield { type: 'system', subtype: 'task_notification', task_id: 'helper', run_id: 'run-1', status: 'completed', summary: 'Audit complete' } as unknown as SDKMessage;
+      const empty = { type: 'system', subtype: 'background_tasks_changed', tasks: [] } as unknown as SDKMessage;
+      if (!resultBeforeSnapshot) yield empty;
+      completed = true;
+      yield { ...result, result: 'Audit complete: dates verified.', origin: { kind: 'task-notification', runId: 'run-1' }, user_message_uuids: ['notification'] } as unknown as SDKMessage;
+      if (resultBeforeSnapshot) yield empty;
+    }, close() { closed++; } };
+  };
+  const answer = await new ClaudeRunner(config, make).run({ prompt: 'Audit files', cwd: '/work', steering }, e => { events.push(e); }, new AbortController());
+  assert.equal(completed, true); assert.equal(closed, 1); assert.match(answer.text, /dates verified/);
+  assert.ok(JSON.stringify(events).includes('Checked dates'));
+  assert.ok(!JSON.stringify(events).includes('do not show this'));
+  assert.equal(events.filter(e => e.type === 'usage').length, 3);
+});
+
+test('ambient watchers never hold the owner turn open and a dropped helper stream is not reported complete', async () => {
+  const ambient = { type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: 'watcher', task_type: 'local_bash', description: 'Watcher', ambient: true }] };
+  assert.equal((await new ClaudeRunner(config, factory([init, ambient, result])).run({ prompt: 'Hello', cwd: '/work' }, () => {}, new AbortController())).text, result.result);
+  const active = { ...ambient, tasks: [{ task_id: 'audit', task_type: 'local_agent', description: 'Audit' }] };
+  await assert.rejects(new ClaudeRunner(config, factory([init, active, result])).run({ prompt: 'Audit', cwd: '/work' }, () => {}, new AbortController()), /background work.*ended|ended.*background work/i);
+});
+
 test('late steering survives the first result and finishes in the same SDK conversation', async () => {
   const steering = new SteeringInput(); let sends = 0; let closed = 0; const events: AgentEvent[] = [];
   const make: QueryFactory = ({ prompt }) => ({ async *[Symbol.asyncIterator]() {

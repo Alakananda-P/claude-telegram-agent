@@ -8,7 +8,7 @@ import path from 'node:path';
 import { StateStore } from '../src/state.js';
 import { HOME } from '../src/ui.js';
 
-test('Telegram transport sends plain redacted chunks and disables link previews', async t => {
+test('Telegram transport sends escaped redacted HTML chunks and disables link previews', async t => {
   const received: { url: string; body: any }[] = [];
   const server = createServer(async (req, res) => {
     let data = ''; for await (const part of req) data += part;
@@ -24,9 +24,25 @@ test('Telegram transport sends plain redacted chunks and disables link previews'
   assert.equal(received.length, 2);
   assert.equal(received[0].url, '/bottest-token/sendMessage');
   assert.equal(received[0].body.chat_id, 123);
-  assert.ok(received[0].body.text.startsWith('<b>[REDACTED]</b>'));
-  assert.equal(received[0].body.parse_mode, undefined);
+  assert.ok(received[0].body.text.startsWith('&lt;b&gt;[REDACTED]&lt;/b&gt;'));
+  assert.equal(received[0].body.parse_mode, 'HTML');
   assert.deepEqual(received[0].body.link_preview_options, { is_disabled: true });
+});
+
+test('formatting falls back only on a definite Telegram entity rejection, without retrying ambiguous sends', async t => {
+  const received: any[] = []; let responseMode = 'format';
+  const server = createServer(async (req, res) => {
+    let raw = ''; for await (const c of req) raw += c;
+    const body = JSON.parse(raw); received.push(body); res.setHeader('Content-Type', 'application/json');
+    if (body.parse_mode) { res.statusCode = 400; res.end(JSON.stringify({ ok: false, error_code: 400, description: responseMode === 'format' ? "Bad Request: can't parse entities: invalid tag" : 'Bad Request: chat not found' })); }
+    else res.end(JSON.stringify({ ok: true, result: { message_id: 9 } }));
+  });
+  await new Promise<void>(r => server.listen(0, '127.0.0.1', r)); t.after(() => server.close());
+  const tg = new Telegram('test-token', [], `http://127.0.0.1:${(server.address() as { port: number }).port}`);
+  await tg.send(123, '**Ready**'); assert.equal(received.length, 2);
+  assert.equal(received[1].parse_mode, undefined); assert.equal(received[1].text, 'Ready');
+  responseMode = 'other';
+  await assert.rejects(tg.send(123, '**Another**'), TelegramError); assert.equal(received.length, 3);
 });
 
 test('panels, activity and chat clearing use Telegram contracts and persist visible IDs', async t => {

@@ -11,6 +11,21 @@ import { StateStore } from '../src/state.js';
 import { BackgroundJobs } from '../src/background.js';
 import { loadConfig } from '../src/config.js';
 import { mkdir, writeFile } from 'node:fs/promises';
+import { safeFile } from '../src/safety.js';
+
+test('MCP file tools return safe actionable path errors instead of generic failures', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'tg-path-errors-')), store = await StateStore.open(path.join(root, 'state.json'));
+  const server = workspaceServer({ root, project: 'default', automation: new Automation(store), deliver: async file => { await safeFile(root, file); }, backup: async () => {} });
+  const client = new Client({ name: 'path-test', version: '1' }), [a, b] = InMemoryTransport.createLinkedPair();
+  try {
+    await server.instance.connect(b); await client.connect(a);
+    for (const [file, message] of [['../outside.pdf', /inside the current project|not allowed/i], ['missing.pdf', /not found/i]]) {
+      const result = await client.callTool({ name: 'deliver_file', arguments: { file } });
+      assert.equal(result.isError, true); assert.match(JSON.stringify(result.content), message as RegExp);
+      assert.ok(!JSON.stringify(result.content).includes(root));
+    }
+  } finally { await client.close(); await server.instance.close(); }
+});
 
 test('workspace MCP transport exposes valid schemas and manages real schedules, clock and bill validation', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'tg-mcp-')); const store = await StateStore.open(path.join(root, 'state.json'));

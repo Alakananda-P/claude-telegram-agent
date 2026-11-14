@@ -19,6 +19,7 @@ test('queue survives restart; running work is interrupted, never blindly repeate
   assert.equal(first?.prompt, 'first');
   const reopened = await StateStore.open(store.file);
   assert.equal(reopened.data.tasks![0].status, 'interrupted');
+  assert.equal(reopened.data.tasks![0].failureKind, 'worker_restart');
   assert.equal((await new Automation(reopened).claim())?.id, next.id);
 });
 test('cron respects IST, claims a due run once and coalesces missed occurrences', async () => {

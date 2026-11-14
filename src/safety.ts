@@ -34,7 +34,7 @@ export function redact(text: string, secrets: string[] = []): string {
     .replace(/\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|KGAT_[A-Za-z0-9_-]{16,}|AIza[A-Za-z0-9_-]{25,}|sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,})\b/g, '[REDACTED]')
     .replace(/\b(bot)?\d{6,14}:[A-Za-z0-9_-]{20,}/g, (_all, bot) => (bot ?? '') + '[REDACTED]')
     .replace(/(\bBearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi, '$1[REDACTED]')
-    .replace(/([a-z][a-z0-9+.-]*:\/\/[^\s/:@]+:)[^\s/@]+(@)/gi, '$1[REDACTED]$2');
+    .replace(/(\b[a-z][a-z0-9+.-]{0,31}:\/\/[^\s/:@]+:)[^\s/@]+(@)/gi, '$1[REDACTED]$2');
   result = result.replace(/(\b(?:[a-z][a-z0-9_]*_)?(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|authorization|password|passwd|secret|token|kaggle[_ -]?key)\b["']?\s*[:=]\s*)("(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|[^\s&;,<>{}"']+)/gi, (all, label, value) => {
     if (/^(?:["']?(?:process\.env\.|os\.environ|your_|replace_|<[^>]+>|\[REDACTED\]))/i.test(value)) return all;
     const quote = /^["']/.test(value) ? value[0] : '';
@@ -77,19 +77,27 @@ export function secretPath(relative: string): boolean {
     || /\.(pem|key|p12|pfx)$/i.test(part));
 }
 
+export class PathAccessError extends Error { constructor(message: string, readonly code?: string) { super(message); } }
 export async function safeFile(root: string, relative: string): Promise<string> {
-  if (!relative || path.isAbsolute(relative) || /^[a-z]:/i.test(relative) || relative.includes('\\') || secretPath(relative)) throw new Error('File path is not allowed.');
+  if (!relative || path.isAbsolute(relative) || /^[a-z]:/i.test(relative) || relative.includes('\\') || secretPath(relative)) throw new PathAccessError('File path is not allowed. Use a relative file inside the current project.');
   const parts = relative.split('/');
-  if (parts.some(p => p === '..' || p === '.' || !p)) throw new Error('File path is not allowed.');
-  const base = await realpath(root);
-  let target = base;
-  for (const part of parts) {
-    target = path.join(target, part);
-    const info = await lstat(target);
-    if (info.isSymbolicLink()) throw new Error('Symlink transfers are not allowed.');
+  if (parts.some(p => p === '..' || p === '.' || !p)) throw new PathAccessError('File path is not allowed. Use a relative file inside the current project.');
+  try {
+    const base = await realpath(root);
+    let target = base;
+    for (const part of parts) {
+      target = path.join(target, part);
+      const info = await lstat(target);
+      if (info.isSymbolicLink()) throw new PathAccessError('Symlink transfers are not allowed. Choose a regular project file.');
+    }
+    if (!(await lstat(target)).isFile()) throw new PathAccessError('Choose a regular file, not a directory.');
+    const resolved = await realpath(target);
+    if (!resolved.startsWith(base + path.sep)) throw new PathAccessError('File path is outside the project.');
+    return resolved;
+  } catch (error) {
+    if (error instanceof PathAccessError) throw error;
+    const code = (error as NodeJS.ErrnoException).code;
+    throw new PathAccessError(code === 'ENOENT' || code === 'ENOTDIR' ? 'File not found in the current project. Check its relative path.'
+      : code === 'EACCES' || code === 'EPERM' ? 'File access was denied by storage permissions.' : 'Project file storage is unavailable. Check storage and try again.', code);
   }
-  if (!(await lstat(target)).isFile()) throw new Error('Choose a regular file.');
-  const resolved = await realpath(target);
-  if (!resolved.startsWith(base + path.sep)) throw new Error('File path is outside the project.');
-  return resolved;
 }

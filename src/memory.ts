@@ -111,6 +111,18 @@ export class SharedMemory {
   async replace(oldText: string, newText: string, topic = 'core'): Promise<void> {
     await this.mutate(topic, current => { if (!oldText || current.split(oldText).length !== 2) throw new MemoryError('Memory excerpt missing or ambiguous; read the topic again first.'); return current.replace(oldText, () => this.safe(newText)); });
   }
+  async deleteEmptyTopic(topic: string): Promise<{ deleted: boolean; topic: string }> {
+    this.name(topic);
+    if (topic === 'core') throw new MemoryError('Core memory cannot be deleted as a topic.');
+    return this.serialized(async () => {
+      const file = await this.ensure(topic, false);
+      const text = await readFile(file, 'utf8').catch(e => { if (e.code === 'ENOENT') return undefined; throw e; });
+      if (text === undefined) return { deleted: false, topic };
+      if (text.replace(/^\s*[-*+]\s*$/gm, '').trim()) throw new MemoryError('This topic is not empty. Read it and deliberately remove its facts before deleting the empty topic.');
+      await unlink(file);
+      return { deleted: true, topic };
+    });
+  }
   private async mutate(topic: string, change: (current: string) => string): Promise<void> {
     await this.serialized(async () => { const file = await this.ensure(topic); const current = await readFile(file,'utf8'); await this.commit(file, this.safe(change(current))); });
   }

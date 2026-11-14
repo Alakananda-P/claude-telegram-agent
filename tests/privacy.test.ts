@@ -70,6 +70,12 @@ test('shared redaction covers recognizable tokens and labelled credentials witho
   assert.equal(redact('API_KEY="<YOUR_API_KEY>"'), 'API_KEY="<YOUR_API_KEY>"');
 });
 
+test('large unbroken process output remains usable during secret masking', { timeout: 3000 }, () => {
+  const log = 'x'.repeat(300000);
+  assert.equal(redact(log), log);
+  assert.equal(redact('https://user:private-value@example.org/path'), 'https://user:[REDACTED]@example.org/path');
+});
+
 test('legacy chat reads redact before paging and search excerpts can expose credential fragments', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'tg-private-history-')), dir = path.join(root, 'chats'); await mkdir(dir);
   const secret = 'LegacyConfiguredCredential_' + 'Z'.repeat(80), id = 'legacy';

@@ -30,3 +30,10 @@ test('automatic delivery refuses an output directory symlink and linked files', 
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'EPERM' && process.platform === 'win32') { t.skip('Windows file symlink privilege unavailable; directory junction verified'); return; } throw error; }
   assert.deepEqual(Object.keys(await artifactSnapshot(regular)), []);
 });
+
+test('Markdown deliverables are sent automatically while identifiable private documents require explicit retrieval', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'tg-private-artifacts-')); await mkdir(path.join(root, 'output'));
+  for (const file of ['weekly-report.md', 'aadhaar_front.jpg', 'PAN-card.pdf', 'passport_scan.png', 'api_keys.txt', 'panorama.jpg']) await writeFile(path.join(root, 'output', file), 'test fixture');
+  assert.deepEqual(Object.keys(await artifactSnapshot(root)).sort(), ['output/panorama.jpg', 'output/weekly-report.md']);
+  assert.equal(await safeFile(root, 'output/aadhaar_front.jpg'), path.join(root, 'output/aadhaar_front.jpg'));
+});

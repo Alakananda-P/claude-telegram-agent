@@ -10,12 +10,25 @@ import { StateStore } from '../src/state.js';
 import { ChatArchive } from '../src/chats.js';
 import { SharedMemory } from '../src/memory.js';
 import { Automation } from '../src/automation.js';
+import { SessionCatalog } from '../src/sessions.js';
 const key = 'af'.repeat(32);
 async function setup(secret = key) {
   const dir = await mkdtemp(path.join(tmpdir(), 'tg-backup-')); const store = await StateStore.open(path.join(dir, 'bot', 'state.json'));
   const chats = new ChatArchive(path.join(dir, 'bot', 'chats'), ['private-secret']); const memory = new SharedMemory(dir, ['private-secret']);
   return { dir, store, chats, memory, backups: new Backups(dir, secret, store, chats, memory, ['private-secret']) };
 }
+
+test('encrypted backup preserves known session versions when restored into a fresh store', async () => {
+  const source = await setup(), now = new Date().toISOString();
+  source.store.data.conversations!.push({ id: 'first', project: 'default', updatedAt: now }, { id: 'recovered', project: 'default', updatedAt: now });
+  source.store.data.bindings = { first: 'recovered' };
+  await source.chats.append('first', { role: 'user', text: 'Original instruction' });
+  await source.chats.bind('first', 'recovered');
+  const target = await setup(); await target.backups.restore(await source.backups.export());
+  const catalog = new SessionCatalog(target.store, target.chats, []);
+  assert.equal(catalog.list().total, 1); assert.equal(catalog.resolve('first'), 'recovered');
+  assert.equal((await catalog.read('first')).turns[0].text, 'Original instruction');
+});
 test('encrypted backup restores chats, memory, paused schedules and files while preserving live offsets and current data', async () => {
   const source = await setup();
   source.store.data.conversations!.push({ id: 'saved-chat', project: 'default', title: 'Bills', updatedAt: new Date().toISOString() });

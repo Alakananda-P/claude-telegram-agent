@@ -2,7 +2,9 @@ import { readdir, lstat } from 'node:fs/promises';
 import path from 'node:path';
 import { secretPath } from './safety.js';
 
-const deliverable = /\.(xlsx?|csv|pdf|png|jpe?g|webp|docx|pptx|zip|txt|json|html)$/i;
+const deliverable = /\.(xlsx?|csv|pdf|png|jpe?g|webp|docx|pptx|zip|txt|md|json|html)$/i;
+// Filename screening for automatic delivery only, not a content classifier.
+const privateDocument = (name: string) => name.split('/').some(part => /(?:^|[._ -])(?:aadhaar|aadhar|adhaar|passport|pan(?:[_ -]?card)?|voter[_ -]?id|driving[_ -]?licen[cs]e|identity|id[_ -]?proof|api[_ -]?keys?|access[_ -]?tokens?|passwords?|secrets?)(?:[._ -]|$)/i.test(part));
 export async function artifactSnapshot(root: string): Promise<Record<string, string>> {
   const out: Record<string, string> = Object.create(null);
   let visited = 0;
@@ -11,7 +13,7 @@ export async function artifactSnapshot(root: string): Promise<Record<string, str
     for (const entry of await readdir(path.join(root, relative), { withFileTypes: true })) {
       if (++visited > 10000) return;
       const name = relative ? relative + '/' + entry.name : entry.name;
-      if (entry.isSymbolicLink() || secretPath(name) || ['node_modules', '.venv', 'venv', 'uploads', 'transcripts', '.cache', 'backups'].includes(entry.name)) continue;
+      if (entry.isSymbolicLink() || secretPath(name) || privateDocument(name) || ['node_modules', '.venv', 'venv', 'uploads', 'transcripts', '.cache', 'backups'].includes(entry.name)) continue;
       if (entry.isDirectory()) await walk(name, depth + 1);
       else if (entry.isFile() && deliverable.test(entry.name) && !/^result-[a-z0-9-]+\.txt$/i.test(entry.name)) {
         const s = await lstat(path.join(root, name));

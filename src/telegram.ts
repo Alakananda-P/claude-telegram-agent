@@ -4,6 +4,7 @@ import type { Buttons } from './ui.js';
 import type { StateStore } from './state.js';
 import { Agent, fetch, FormData } from 'undici';
 import type { LookupFunction } from 'node:net';
+import { telegramChunks } from './formatting.js';
 
 export function createTelegramDispatcher(lookup?: LookupFunction): Agent {
   // Render's dual-stack fetch attempted an unreachable IPv6 path after the
@@ -13,7 +14,7 @@ export function createTelegramDispatcher(lookup?: LookupFunction): Agent {
 const telegramDispatcher = createTelegramDispatcher();
 
 export class TelegramError extends Error {
-  constructor(public code: number, public retryAfter = 0, public unchanged = false, public networkCode?: string, public messageMissing = false, public deletionDenied = false) { super(`Telegram request failed (status ${code}).`); }
+  constructor(public code: number, public retryAfter = 0, public unchanged = false, public networkCode?: string, public messageMissing = false, public deletionDenied = false, public formatRejected = false) { super(`Telegram request failed (status ${code}).`); }
 }
 
 export interface MessageListOptions { limit?: number; beforeMessageId?: number; messageId?: number; includeUi?: boolean }
@@ -68,15 +69,20 @@ export class Telegram {
         await delay(retryAfter * 1000, undefined, { signal });
         continue;
       }
-      throw new TelegramError(code, retryAfter, code === 400 && /message is not modified/i.test(body.description ?? ''), undefined, code === 400 && /message to delete not found/i.test(body.description ?? ''), code === 400 && /message (?:can't|cannot|can not) be deleted|message is too old/i.test(body.description ?? ''));
+      throw new TelegramError(code, retryAfter, code === 400 && /message is not modified/i.test(body.description ?? ''), undefined, code === 400 && /message to delete not found/i.test(body.description ?? ''), code === 400 && /message (?:can't|cannot|can not) be deleted|message is too old/i.test(body.description ?? ''), code === 400 && /can't parse entities|cannot parse entities|unsupported start tag|can't find end tag/i.test(body.description ?? ''));
     }
     throw new TelegramError(429);
   }
 
   async send(chat: number, text: string): Promise<void> {
-    const parts = chunks(redact(text, [this.token, ...this.secrets]));
+    const parts = telegramChunks(redact(text, [this.token, ...this.secrets]));
     for (let i = 0; i < parts.length; i++) {
-      await this.call('sendMessage', { chat_id: chat, text: parts[i], link_preview_options: { is_disabled: true } });
+      const payload = { chat_id: chat, link_preview_options: { is_disabled: true } };
+      try { await this.call('sendMessage', { ...payload, text: parts[i].html, parse_mode: 'HTML' }); }
+      catch (error) {
+        if (!(error instanceof TelegramError) || !error.formatRejected) throw error;
+        await this.call('sendMessage', { ...payload, text: parts[i].plain });
+      }
       if (i < parts.length - 1) await delay(1100);
     }
   }

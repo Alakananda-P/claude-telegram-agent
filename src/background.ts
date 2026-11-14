@@ -132,12 +132,14 @@ export class BackgroundJobs {
     if (!this.closing) await this.tick();
   }
   async wait(id: string): Promise<void> { this.job(id); await this.live.get(id)?.done; }
-  async read(id: string, offset = 0, limit = 6000) {
+  async readTail(id: string, limit = 900) { return this.read(id, 0, limit, true); }
+  async read(id: string, offset = 0, limit = 6000, tail = false) {
     const job = this.job(id), live = this.live.get(id);
     if (live) await this.flush(job, live);
     let text: string;
     try { await this.logDirectory(); text = redact(await readFile(await safeFile(this.dir, id + '.log'), 'utf8'), this.secrets); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new BackgroundError('Background output could not be read.'); text = ''; }
-    const start = Math.max(0, Math.floor(offset)), end = start + Math.min(12000, Math.max(1, Math.floor(limit)));
+    const size = Math.min(12000, Math.max(1, Math.floor(limit)));
+    const start = tail ? Math.max(0, text.length - size) : Math.max(0, Math.floor(offset)), end = start + size;
     return { job: { ...job, args: [...job.args] }, text: text.slice(start, end), nextOffset: end < text.length ? end : undefined, totalCharacters: text.length };
   }
   async cancel(id: string) { const job = this.job(id), live = this.live.get(id); if (live && !live.finishing) { live.reason ??= 'cancelled'; this.terminate(live); await live.done; } return { ...job, args: [...job.args] }; }
@@ -150,8 +152,8 @@ export class BackgroundJobs {
     for (const job of this.store.data.backgroundJobs!) {
       if (!terminal(job) || job.notifiedAt || (job.notifyAfter && Date.parse(job.notifyAfter) > now)) continue;
       job.notificationAttempts = (job.notificationAttempts ?? 0) + 1;
-      try { await this.notify({ ...job, args: [...job.args] }); job.notifiedAt = new Date(now).toISOString(); delete job.notifyAfter; }
-      catch { job.notifyAfter = new Date(now + 30_000).toISOString(); console.warn('Background completion delivery deferred; saved output is available.'); }
+      try { await this.notify({ ...job, args: [...job.args] }); job.notifiedAt = new Date(Math.max(Date.now(), Date.parse(job.finishedAt ?? job.createdAt))).toISOString(); delete job.notifyAfter; }
+      catch { job.notifyAfter = new Date(Math.max(now, Date.now()) + 30_000).toISOString(); console.warn('Background completion delivery deferred; saved output is available.'); }
       await this.store.save();
     }
   }

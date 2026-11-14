@@ -10,6 +10,21 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 
 async function setup() { const dir = await mkdtemp(path.join(tmpdir(), 'tg-memory-v2-')); return { dir, memory: new SharedMemory(dir, ['private-secret']) }; }
 
+test('empty topic deletion removes the topic and refuses core, facts, traversal and symlinks', async () => {
+  const { dir, memory } = await setup(); await memory.remember('Confirmed fact', 'office');
+  await assert.rejects(memory.deleteEmptyTopic('office'), /not empty/i);
+  await assert.rejects(memory.deleteEmptyTopic('core'), /core/i);
+  await assert.rejects(memory.deleteEmptyTopic('../office'), /topic/i);
+  await memory.replace('Confirmed fact', '', 'office');
+  await memory.deleteEmptyTopic('office');
+  assert.ok(!(await memory.list()).topics.some(t => t.topic === 'office'));
+  assert.deepEqual(await memory.deleteEmptyTopic('office'), { deleted: false, topic: 'office' });
+  const link = path.join(dir, 'memory/topics/linked.md');
+  await symlink(dir, link, process.platform === 'win32' ? 'junction' : 'dir');
+  await assert.rejects(memory.deleteEmptyTopic('linked'), /symlink|regular file/i);
+  await memory.remember('Stable core'); assert.match(await memory.read(), /Stable core/);
+});
+
 test('legacy core and topic memory grow past old limits without truncation or loss', async () => {
   const { dir, memory } = await setup(); await mkdir(path.dirname(memory.file), { recursive: true });
   const legacy = 'पुरानी जानकारी '.repeat(10000); await writeFile(memory.file, legacy);
@@ -50,6 +65,9 @@ test('memory tools expose useful errors and support topic, list and search throu
     const search = await call('search_memory', { query: 'Useful' }); assert.match(JSON.stringify(search), /office/);
     const bad = await call('edit_memory', { topic: 'office', old_text: 'missing', new_text: 'x' }); assert.equal(bad.isError, true); assert.match(JSON.stringify(bad), /missing or ambiguous/); assert.doesNotMatch(JSON.stringify(bad), /Saved data could not/);
     const secret = await call('remember', { text: 'private-secret', topic: 'office' }); assert.equal(secret.isError, true); assert.match(JSON.stringify(secret), /credentials/);
+    const protectedTopic = await call('delete_memory_topic', { topic: 'office' }); assert.equal(protectedTopic.isError, true);
+    await writeFile(path.join(memory.directory, 'topics/empty.md'), '');
+    const removed = await call('delete_memory_topic', { topic: 'empty' }); assert.ok(!removed.isError); assert.match(JSON.stringify(removed), /deleted/);
     await assert.rejects(memory.remember('escape', '../outside'), /topic/);
   } finally { await client.close(); await server.instance.close(); }
 });

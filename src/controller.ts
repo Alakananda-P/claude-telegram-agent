@@ -4,7 +4,7 @@ import { mkdir, lstat, readdir, readFile, writeFile, statfs } from 'node:fs/prom
 import { configSecrets, type Config } from './config.js';
 import { AgentError, AgentApiError, AgentSafetyError, type Runner } from './agent.js';
 import { StateStore } from './state.js';
-import { authorized, projectName, redact, privatePreview, safeFile, secretPath, type Message, type Callback } from './safety.js';
+import { authorized, projectName, redact, privatePreview, safeFile, secretPath, PathAccessError, type Message, type Callback } from './safety.js';
 import { MODELS, EFFORTS, effectiveSettings, settingsLabel, modelLabel, type AgentSettings, type Effort } from './settings.js';
 import { UsageLedger } from './usage.js';
 import { SharedMemory } from './memory.js';
@@ -109,7 +109,7 @@ export class Controller {
     this.background = new BackgroundJobs(config, store, async job => {
       const source = this.resolveChat(job.chatKey);
       const record = store.data.conversations?.find(c => c.id === source && !c.trashedAt);
-      const output = await this.background.read(job.id, 0, 900);
+      const output = await this.background.readTail(job.id, 900);
       const text = redact(`${job.status === 'completed' ? '✅' : 'ℹ️'} ${job.name}: ${job.status.replaceAll('_', ' ')}.\n${record ? 'Chat: ' + sessionTitle(record) : 'Project: ' + job.project}${output.text ? '\n\n' + output.text : ''}\n\nFull output is in /background.`, configSecrets(config));
       if (record && !store.data.purgedSessions?.includes(source)) await this.chats.append(source, { role: 'assistant', text, eventId: 'background-' + job.id });
       await messenger.send(config.owner, text);
@@ -313,7 +313,7 @@ export class Controller {
       const d = this.store.data;
       return this.panel(`Project: ${d.project}\n${settingsLabel(this.settings)} · Permissions: auto\n` +
         `State: ${this.running ? 'running' : 'idle'}\nMemory: ${d.memoryEnabled !== false ? 'ON' : 'OFF'}\nLast reported speed: ${d.lastSpeed ?? 'not observed yet'}\n` +
-        `Last job: ${d.lastJob?.status ?? 'none'}\nSpending cap: none (no bot-enforced billing limit).\n` +
+        `Last job: ${d.lastJob?.status ?? 'none'}${d.lastJob?.endReason ? ' · ' + d.lastJob.endReason.replace(/_/g, ' ') : ''}\nSpending cap: none (no bot-enforced billing limit).\n` +
         `Execution limits: ${this.config.maxTurns} turns; ${this.config.timeoutMs / 60_000} minutes per task.`);
     }
     if (['model', 'efforts', 'effort', 'fast', 'session', 'memory'].includes(command ?? '') && !argument) {
@@ -417,8 +417,8 @@ export class Controller {
       const pending = this.pendingBatches();
       if (pending.length) await this.processBatches(pending, prompt, undefined, messageContext);
       else await this.launch(prompt, root, prompt, undefined, undefined, messageContext);
-    } catch {
-      await this.say('Could not process this request. Check the command, file path/size and storage. No automatic retry was performed.');
+    } catch (error) {
+      await this.say(error instanceof PathAccessError ? error.message : 'Could not process this request. Check the command, file path/size and storage. No automatic retry was performed.');
     }
   }
 
@@ -526,6 +526,7 @@ export class Controller {
     };
     let progress = task.voiceInput ? 'Transcribing voice…' : 'Thinking…';
     let timedOut = false;
+    let pendingHelpers = 0;
     const timeout = setTimeout(() => { timedOut = true; abort.abort(); }, this.config.timeoutMs);
     let indicator: number | undefined;
     let lastProgress = progress;
@@ -604,7 +605,8 @@ export class Controller {
             else await this.ledger?.recordStep(event.session, event.id, event.model, event.usage, event.complete);
           } catch { this.persistenceFailed = true; abort.abort(); throw new AgentError('Usage storage failed. Work stopped to protect your records.'); }
         } else if (event.type === 'speed') this.store.data.lastSpeed = event.state;
-        else if (event.type === 'progress') progress = event.text;
+        else if (event.type === 'progress') progress = redact(event.text, configSecrets(this.config));
+        else if (event.type === 'helpers') pendingHelpers = event.count;
       }, abort);
       abort.signal.throwIfAborted();
       await bind(result.session);
@@ -625,21 +627,27 @@ export class Controller {
       console.log(`Claude task completed: ${selected.model}; effort=${selected.effort}; requestedFast=${selected.fast}; reportedSpeed=${this.store.data.lastSpeed ?? 'unknown'}.`);
     } catch (error) {
       if (error instanceof TitleAccountingError) this.persistenceFailed = true;
+      task.failureKind = timedOut ? 'timeout' : this.persistenceFailed ? 'storage_failure'
+        : abort.signal.aborted ? (this.shuttingDown ? 'shutdown' : 'owner_cancelled')
+        : error instanceof AgentSafetyError ? 'safety_refusal' : error instanceof AgentApiError ? 'api_failure'
+        : error instanceof TranscriptionError ? 'transcription_failed' : 'sdk_error';
       if (error instanceof AgentSafetyError) { task.failureKind = 'safety_refusal'; console.warn(JSON.stringify({ event: 'claude_safety_stop', task: task.id, session: archiveKey, model: task.settings?.model ?? this.config.model, category: error.category ?? 'unreported', time: new Date().toISOString() })); }
       if (error instanceof AgentApiError) { (this.store.data.health ??= {}).apiError = error.kind; console.warn(`Claude task API failure: ${error.kind}.`); await this.automation.setPaused(true); }
       status = abort.signal.aborted ? 'cancelled' : 'failed';
       await finishIndicator();
-      await this.say(timedOut ? 'This task reached its time limit and was stopped.'
+      console.warn(JSON.stringify({ event: 'task_ended', task: task.id, reason: task.failureKind, elapsedMs: Date.now() - Date.parse(task.startedAt!), pendingHelpers }));
+      const notice = timedOut ? `This task reached its time limit (${this.config.timeoutMs / 60000} minutes) and was stopped.`
         : this.persistenceFailed ? 'Usage storage failed. New tasks are paused until storage is restored.'
         : abort.signal.aborted ? 'Task stopped.'
-        : error instanceof AgentError || error instanceof TranscriptionError ? error.message : 'The task could not finish. Check API access and storage, or try a smaller task.');
+        : error instanceof AgentError || error instanceof TranscriptionError ? error.message : 'The task could not finish. Check API access and storage, or try a smaller task.';
+      await this.say(notice + (pendingHelpers ? '\nPending SDK helpers stopped with this task; their completion is unconfirmed. No work was replayed.' : ''));
       if (error instanceof AgentSafetyError) await this.panel('Start a separate conversation when ready. A fresh summary includes only earlier completed work; the stopped request is not retried.', [[button('Continue fresh with summary', 'fresh'), button('Empty new chat', 'new chat')], ...BACK]);
     } finally {
       ready(); active.input.close(); await active.serial;
       if (this.conversation === active) this.conversation = undefined;
       clearTimeout(timeout); clearInterval(heartbeat);
       await finishIndicator();
-      this.store.data.lastJob = { ...job, status, finishedAt: new Date().toISOString() };
+      this.store.data.lastJob = { ...job, status, endReason: task.failureKind, finishedAt: new Date().toISOString() };
       this.store.data.active = null;
       try { await this.automation.finish(task.id, this.shuttingDown && status === 'cancelled' ? 'interrupted' : status); }
       catch { this.persistenceFailed = true; console.error('Job state persistence failed; new jobs disabled.'); }
