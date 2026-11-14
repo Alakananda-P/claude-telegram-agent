@@ -91,6 +91,9 @@ export class ClaudeRunner implements Runner {
         + 'Start-of-task session context (call list_sessions for the current/new session ID after initialization): ' + JSON.stringify(request.sessions.context())
       : '';
     let repairingResponse = false, executionDenied = false;
+    // Query.close() aborts its controller. An attempt must never abort the
+    // owner's task controller, which also governs steering and key recovery.
+    const attempt = new AbortController();
     const allowed = [...(request.sessions ? SESSION_TOOL_NAMES : []), ...(request.memoryEnabled === false ? [] : MEMORY_TOOL_NAMES), ...(request.workspace ? AUTO_WORKSPACE_TOOL_NAMES : [])];
     const options: Options = {
       cwd: request.cwd, resume: request.session,
@@ -127,7 +130,7 @@ export class ClaudeRunner implements Runner {
         const blockedBackground = executionDenied && event.hook_event_name === 'PreToolUse' && event.tool_name === 'mcp__workspace__start_background_job';
         return repairingResponse || blockedBackground ? { hookSpecificOutput: { hookEventName: 'PreToolUse' as const, permissionDecision: 'deny' as const, permissionDecisionReason: repairingResponse ? 'Answer the pending owner message from existing context; this response correction cannot repeat actions or run additional tools.' : 'Native execution was denied. Background execution cannot be used to bypass that denial.' } } : {};
       }] }] },
-      abortController: abort,
+      abortController: attempt,
       env: agentEnvironment(this.config),
       canUseTool: async (tool, input) => {
         if (allowed.includes(tool)) { await emit({ type: 'effect', tool }); return { behavior: 'allow', updatedInput: input }; }
@@ -139,10 +142,11 @@ export class ClaudeRunner implements Runner {
       stderr: () => {},
     };
     abort.signal.throwIfAborted();
+    const cancelAttempt = () => attempt.abort(abort.signal.reason);
+    abort.signal.addEventListener('abort', cancelAttempt, { once: true });
     const input = request.steering ?? new SteeringInput();
-    const attempt = new AbortController();
     const signal = AbortSignal.any([abort.signal, attempt.signal]);
-    const stream = this.makeQuery({ prompt: input.stream(request.prompt, signal), options });
+    let stream: ReturnType<QueryFactory> | undefined;
     const published = new Set<string>();
     let lastPublished = '';
     let initialized = false;
@@ -152,6 +156,7 @@ export class ClaudeRunner implements Runner {
     const steps = new Map<string, { id: string; model: string; usage: Record<string, unknown>; session: string }>();
     const background = new NativeBackground();
     try {
+      stream = this.makeQuery({ prompt: input.stream(request.prompt, signal), options });
       let initialAnswered = false, correctionSent = false;
       const corrections = new Map<string, string[]>();
       for await (const event of stream) {
@@ -285,8 +290,9 @@ export class ClaudeRunner implements Runner {
       if (apiError && !(error instanceof AgentError)) throw apiError;
       throw error;
     } finally {
+      abort.signal.removeEventListener('abort', cancelAttempt);
       attempt.abort();
-      stream.close();
+      stream?.close();
     }
   }
 }

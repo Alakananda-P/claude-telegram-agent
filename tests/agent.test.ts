@@ -23,6 +23,17 @@ test('runner uses an open input stream for conversational steering', async () =>
   await new ClaudeRunner(config, make).run({ prompt: 'Hello', cwd: '/work' }, () => {}, new AbortController());
 });
 
+test('owner cancellation still reaches the isolated SDK attempt', async () => {
+  const owner = new AbortController(); let cancelled = false;
+  const make: QueryFactory = ({ options }) => ({ async *[Symbol.asyncIterator]() {
+    yield init as SDKMessage;
+    owner.abort(); cancelled = options.abortController!.signal.aborted;
+    yield result as unknown as SDKMessage;
+  }, close() { options.abortController!.abort(); } });
+  await assert.rejects(new ClaudeRunner(config, make).run({ prompt: 'Work', cwd: '/work' }, () => {}, owner));
+  assert.equal(cancelled, true);
+});
+
 test('ordinary assistant progress is emitted while raw reasoning and subagent text stay private', async () => {
   const events: AgentEvent[] = [];
   const assistant = { type: 'assistant', uuid: 'msg-1', session_id: 'session-1', parent_tool_use_id: null, message: { id: 'msg-1', model: config.model, content: [{ type: 'thinking', thinking: 'PRIVATE REASONING' }, { type: 'text', text: 'I found the totals; checking the dates next.' }, { type: 'tool_use', name: 'Read', id: 'tool-1', input: {} }] } };

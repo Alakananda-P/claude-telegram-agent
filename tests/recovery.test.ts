@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { ResilientRunner } from '../src/recovery.js';
-import { AgentApiError, type AgentRequest, type Runner } from '../src/agent.js';
+import { AgentApiError, ClaudeRunner, type AgentRequest, type Runner } from '../src/agent.js';
+import type { SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 import { loadConfig } from '../src/config.js';
 import { StateStore } from '../src/state.js';
 import { SteeringInput } from '../src/steering.js';
@@ -16,6 +17,23 @@ async function setup(factory: (key: string) => Runner) {
   const config = loadConfig({ TELEGRAM_BOT_TOKEN: '123456:abcdefghijklmnopqrstuvw', TELEGRAM_OWNER_ID: '123', ANTHROPIC_API_KEY: 'sk-ant-primary', ANTHROPIC_BACKUP_KEYS: '["sk-ant-backup"]', DATA_DIR: dir });
   return { store, runner: new ResilientRunner(config, store, c => factory(c.apiKey), 1) };
 }
+
+test('SDK teardown aborts only its attempt, so an authentication failure still reaches the approved backup', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'tg-real-teardown-')), store = await StateStore.open(path.join(dir, 'state.json'));
+  const config = loadConfig({ TELEGRAM_BOT_TOKEN: '123456:abcdefghijklmnopqrstuvw', TELEGRAM_OWNER_ID: '123', ANTHROPIC_API_KEY: 'sk-ant-primary', ANTHROPIC_BACKUP_KEYS: '["sk-ant-backup"]', DATA_DIR: dir });
+  const used: string[] = [], owner = new AbortController();
+  const runner = new ResilientRunner(config, store, c => new ClaudeRunner(c, ({ options }) => {
+    used.push(c.apiKey); const failed = c.apiKey.endsWith('primary');
+    return { async *[Symbol.asyncIterator]() {
+      yield { type: 'system', subtype: 'init', session_id: 'sdk-' + used.length, model: c.model, permissionMode: 'auto', effort: c.effort } as unknown as SDKMessage;
+      if (failed) yield { type: 'assistant', error: 'authentication_failed', parent_tool_use_id: null, message: { model: '<synthetic>', content: [{ type: 'text', text: 'Rejected' }] } } as unknown as SDKMessage;
+      yield { type: 'result', subtype: 'success', is_error: false, session_id: 'sdk-' + used.length, uuid: 'result-' + used.length, result: failed ? 'Rejected' : 'Backup answered', modelUsage: {}, total_cost_usd: 0, permission_denials: [] } as unknown as SDKMessage;
+    }, close() { options.abortController!.abort(); } };
+  }), 0);
+  const result = await runner.run({ prompt: 'Hello', cwd: dir, memoryEnabled: false }, () => {}, owner);
+  assert.equal(result.text, 'Backup answered'); assert.deepEqual(used, ['sk-ant-primary', 'sk-ant-backup']);
+  assert.equal(owner.signal.aborted, false); assert.equal(store.data.disabledKeyIds!.length, 1);
+});
 test('credit failure switches approved key before actions, drops signed resume and persists selection', async () => {
   const calls: { key: string; request: AgentRequest }[] = [];
   const { runner, store } = await setup(key => ({ async run(request, emit) {
