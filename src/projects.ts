@@ -154,10 +154,11 @@ export class ProjectCatalog {
     if ((d.active?.project === id && d.active.id !== exceptTaskId) || d.tasks?.some(t => t.project === id && t.status === 'running' && t.id !== exceptTaskId)) throw new ProjectError('This project has a running task. Stop or finish that task first.');
     if (d.backgroundJobs?.some(j => j.project === id && ['starting', 'running'].includes(j.status))) throw new ProjectError('This project has a running background job. Finish or cancel it before closing the project.');
   }
-  private async retire(id: string, action: 'archived' | 'trashed', now: Date) {
+  private async retire(id: string, action: 'archived' | 'trashed', now: Date, beforeCommit?: () => void) {
     const p = this.find(id); this.idle(id);
     if (p.status === action) return this.view(p);
     if (!['active', 'archived'].includes(p.status)) throw new ProjectError('Restore the project from Trash before changing its status.');
+    beforeCommit?.();
     p.status = action; p.updatedAt = now.toISOString();
     if (action === 'archived') p.archivedAt = now.toISOString();
     else { p.trashedAt = now.toISOString(); p.purgeAt = new Date(+now + 48 * 3600000).toISOString(); }
@@ -165,8 +166,8 @@ export class ProjectCatalog {
     for (const t of this.store.data.tasks ?? []) if (t.project === id && t.status === 'queued') { t.status = 'cancelled'; t.finishedAt = now.toISOString(); }
     await this.fallback(); await this.store.save(); return this.view(p);
   }
-  async archive(id: string, now = new Date()) { await this.initialize(); return this.lock(() => this.retire(id, 'archived', now)); }
-  async trash(id: string, now = new Date()) { await this.initialize(); return this.lock(() => this.retire(id, 'trashed', now)); }
+  async archive(id: string, now = new Date(), beforeCommit?: () => void) { await this.initialize(); return this.lock(() => this.retire(id, 'archived', now, beforeCommit)); }
+  async trash(id: string, now = new Date(), beforeCommit?: () => void) { await this.initialize(); return this.lock(() => this.retire(id, 'trashed', now, beforeCommit)); }
   async restore(id: string, now = new Date()) {
     await this.initialize(); return this.lock(async () => {
       const p = this.find(id);
@@ -236,8 +237,8 @@ export class ProjectCatalog {
     const ids = this.store.data.projects!.filter(p => p.status === 'purging' || (p.status === 'trashed' && !!p.purgeAt && Date.parse(p.purgeAt) <= +now)).map(p => p.id);
     for (const id of ids) await this.purge(id); return ids.length;
   }
-  async select(id: string) {
-    await this.workspace(id); return this.lock(async () => { assertProjectWork(this.store.data, id); this.store.data.project = id; await this.store.save(); return this.view(this.find(id)); });
+  async select(id: string, beforeCommit?: () => void) {
+    await this.workspace(id); return this.lock(async () => { assertProjectWork(this.store.data, id); beforeCommit?.(); this.store.data.project = id; await this.store.save(); return this.view(this.find(id)); });
   }
   async listFiles(id: string, query: { path?: string; offset?: number; limit?: number } = {}) {
     await this.initialize(); return this.lock(async () => {

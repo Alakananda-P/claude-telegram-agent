@@ -89,8 +89,9 @@ function withMessageContext(text: string, context?: TelegramMessageContext): str
 }
 
 export class Controller {
-  private conversation?: { messageContext?: TelegramMessageContext; task: Task; input: SteeringInput; abort: AbortController; cwd: string; ready: Promise<void>; serial: Promise<void>; projectChange?: ProjectChange };
-  private running?: { abort: AbortController; done: Promise<void> };
+  private conversation?: { messageContext?: TelegramMessageContext; task: Task; input: SteeringInput; abort: AbortController; cwd: string; ready: Promise<void>; serial: Promise<void>; projectChange?: ProjectChange; changeCancelledByOwner?: boolean };
+  private running?: { abort: AbortController; done: Promise<void>; task: Task };
+  private projectTransition?: Promise<void>;
   private shuttingDown = false;
   private persistenceFailed = false;
   private panelId?: number;
@@ -304,16 +305,25 @@ export class Controller {
 
   async handle(message: Message): Promise<void> {
     if (!authorized(message, this.config.owner) || this.shuttingDown) return;
+    const text = message.text?.trim() ?? '';
+    const match = /^\/(\w+)(?:@\w+)?(?:\s+([\s\S]*))?$/.exec(text);
+    const command = match?.[1]?.toLowerCase();
+    const argument = match?.[2]?.trim() ?? '';
+    const stopping = command === 'stop' && !!this.running;
+    const ownerWork = (!command && !!text) || !!message.voice || command === 'run' || command === 'stop';
+    if (ownerWork && this.conversation?.projectChange) {
+      delete this.conversation.projectChange; this.conversation.changeCancelledByOwner = true;
+    }
+    if (stopping) { this.store.data.queuePaused = true; this.running!.abort.abort(); }
+    // A newer instruction invalidates pending work immediately, including after
+    // the SDK inbox closes. Read its workspace only after any selection rollback.
+    if (ownerWork && this.projectTransition) await this.projectTransition;
     if (message.message_id !== undefined) {
       const ids = this.store.data.visibleMessageIds ??= [];
       if (!ids.includes(message.message_id)) { ids.push(message.message_id); await this.store.save(); }
     }
     const messageContext: TelegramMessageContext = { beforeMessageId: message.message_id };
     if (message.reply_to_message && await this.messenger.rememberBotReply?.(this.config.owner, message.reply_to_message)) messageContext.replyToMessageId = message.reply_to_message.message_id;
-    const text = message.text?.trim() ?? '';
-    const match = /^\/(\w+)(?:@\w+)?(?:\s+([\s\S]*))?$/.exec(text);
-    const command = match?.[1]?.toLowerCase();
-    const argument = match?.[2]?.trim() ?? '';
     if (command === 'start' || command === 'menu') return this.menu();
     if (command === 'help') return this.panel(HELP);
     try { if (await this.extraCommand(command, argument, messageContext)) return; }
@@ -340,9 +350,9 @@ export class Controller {
       return this.controls(command!);
     }
     if (command === 'stop') {
-      if (!this.running) return this.say('No task is running.');
+      if (!this.running && !stopping) return this.say('No task is running.');
       await this.automation.setPaused(true);
-      this.running.abort.abort();
+      this.running?.abort.abort();
       return this.say('Stop requested; queue paused. File edits already made are kept; external effects are not undone. Resume queued work from /queue.');
     }
     if (this.pump && command && !['run', 'get', 'files'].includes(command)) return this.say('Busy with your current task. New messages steer it; switch chats or settings after it finishes.');
@@ -440,7 +450,7 @@ export class Controller {
     await this.dismiss('controls');
     // claim() persists before execute() opens its inbox. Wait only for that small
     // startup window so rapid consecutive messages join the very first task.
-    while (this.pump && !this.conversation && !this.running && !this.store.data.queuePaused) await new Promise(r => setTimeout(r, 5));
+    while (this.pump && !this.conversation && (!this.running || this.running.task.kind === 'agent') && !this.store.data.queuePaused) await new Promise(r => setTimeout(r, 5));
     const active = this.conversation;
     if (active?.input.accepting && !active.abort.signal.aborted) {
       if (active.task.project !== this.store.data.project || this.resolveChat(active.task.chatKey) !== this.resolveChat(this.chatKey())) return this.say('Another saved chat is running. Stop it before starting work in this chat. Your message was not queued.');
@@ -475,7 +485,8 @@ export class Controller {
       }
       await this.store.save();
       active.messageContext = record.messageContext;
-      const hadProjectChange = !!active.projectChange;
+      const hadProjectChange = active.changeCancelledByOwner || !!active.projectChange;
+      delete active.changeCancelledByOwner;
       if (hadProjectChange) delete active.projectChange;
       const instruction = withMessageContext(record.text, record.messageContext) + (hadProjectChange ? '\n\n[Host notice: the pending project change was cancelled when this newer owner instruction arrived. Re-evaluate it with this instruction; request the appropriate project change again only if still needed.]' : '');
       active.input.add(instruction, record.displayText, record.id);
@@ -496,7 +507,7 @@ export class Controller {
   private async runQueue(): Promise<void> {
     while (!this.shuttingDown && !this.persistenceFailed) {
       const task = await this.automation.claim(); if (!task) break;
-      const abort = new AbortController(); const running = { abort, done: Promise.resolve() }; this.running = running;
+      const abort = new AbortController(); const running = { abort, task, done: Promise.resolve() }; this.running = running;
       running.done = (async () => {
         if (task.kind === 'agent') {
           let cwd: string;
@@ -691,7 +702,6 @@ export class Controller {
       if (error instanceof AgentSafetyError) await this.panel('Start a separate conversation when ready. A fresh summary includes only earlier completed work; the stopped request is not retried.', [[button('Continue fresh with summary', 'fresh'), button('Empty new chat', 'new chat')], ...BACK]);
     } finally {
       ready(); active.input.close(); await active.serial;
-      if (this.conversation === active) this.conversation = undefined;
       clearTimeout(timeout); clearInterval(heartbeat);
       await finishIndicator();
       this.store.data.lastJob = { ...job, status, endReason: task.failureKind, finishedAt: new Date().toISOString() };
@@ -701,31 +711,50 @@ export class Controller {
       await this.dismiss('task-' + task.id);
     }
     const change = active.projectChange;
-    if (change && status === 'completed' && !abort.signal.aborted && !this.shuttingDown && !this.persistenceFailed) {
-      try {
-        if (change.action === 'switch') {
-          await this.projects.workspace(change.project);
-          if (abort.signal.aborted || this.shuttingDown) throw new ProjectError('The pending project change was cancelled when the task stopped.');
-          if (change.continueTask && Date.now() >= Date.parse(task.deadlineAt)) throw new ProjectError('The original task time limit ended before project continuation. Send a new instruction when ready.');
-          const target = await this.projects.select(change.project);
-          await this.dismiss('uploads');
-          if (change.continueTask) {
-            if (abort.signal.aborted || this.shuttingDown) return;
-            const continuation = await this.automation.enqueue({ kind: 'agent', project: target.id, chatKey: this.chatKey(),
-              prompt: 'Continue the remaining owner-authorized work after a completed project switch. The earlier turn is finished; do not replay its completed actions. Work in the current project.\n\nRemaining work:\n' + change.continueTask,
-              displayPrompt: change.continueTask, settings: task.settings, interactive: task.interactive, deadlineAt: task.deadlineAt, handoffFrom: task.id });
-            await this.automation.prioritize(continuation.id);
-            if (abort.signal.aborted || this.shuttingDown) { await this.automation.cancelTask(continuation.id); return; }
-          }
-          await this.say(`Project switched to ${target.name}.`, false, 'project-change');
-        } else {
-          const target = change.action === 'archive' ? await this.projects.archive(change.project) : await this.projects.trash(change.project);
-          await this.say(`Project ${target.name}: ${change.action === 'archive' ? 'archived' : 'moved to 48-hour Trash'}.`, false, 'project-change');
+    if (!change || status !== 'completed' || abort.signal.aborted || this.shuttingDown || this.persistenceFailed) {
+      if (this.conversation === active) this.conversation = undefined;
+      return;
+    }
+    let release!: () => void;
+    const transition = new Promise<void>(resolve => { release = resolve; }); this.projectTransition = transition;
+    const previousProject = this.store.data.project;
+    let selected = false, continuation: Task | undefined;
+    const assertPending = () => {
+      if (active.projectChange !== change || abort.signal.aborted || this.shuttingDown) throw new ProjectError('The pending project change was cancelled by a newer instruction or Stop.');
+    };
+    try {
+      if (change.action === 'switch') {
+        await this.projects.workspace(change.project);
+        assertPending();
+        if (change.continueTask && Date.now() >= Date.parse(task.deadlineAt)) throw new ProjectError('The original task time limit ended before project continuation. Send a new instruction when ready.');
+        const target = await this.projects.select(change.project, assertPending); selected = true;
+        assertPending();
+        await this.dismiss('uploads');
+        if (change.continueTask) {
+          assertPending();
+          continuation = await this.automation.enqueue({ kind: 'agent', project: target.id, chatKey: this.chatKey(),
+            prompt: 'Continue the remaining owner-authorized work after a completed project switch. The earlier turn is finished; do not replay its completed actions. Work in the current project.\n\nRemaining work:\n' + change.continueTask,
+            displayPrompt: change.continueTask, settings: task.settings, interactive: task.interactive, deadlineAt: task.deadlineAt, handoffFrom: task.id });
+          await this.automation.prioritize(continuation.id);
         }
-      } catch (error) {
-        if (!(error instanceof ProjectError)) { this.persistenceFailed = true; console.error('Project change storage failed; new tasks paused.'); }
-        await this.say(error instanceof ProjectError ? error.message : 'The project change could not finish. Check storage before continuing; no work was replayed.');
+        assertPending(); delete active.projectChange;
+        await this.say(`Project switched to ${target.name}.`, false, 'project-change');
+      } else {
+        const commit = () => { assertPending(); delete active.projectChange; };
+        const target = change.action === 'archive' ? await this.projects.archive(change.project, new Date(), commit) : await this.projects.trash(change.project, new Date(), commit);
+        await this.say(`Project ${target.name}: ${change.action === 'archive' ? 'archived' : 'moved to 48-hour Trash'}.`, false, 'project-change');
       }
+    } catch (error) {
+      try {
+        if (continuation?.status === 'queued') await this.automation.cancelTask(continuation.id);
+        if (selected && this.store.data.project === change.project) await this.projects.select(previousProject);
+      } catch { this.persistenceFailed = true; console.error('Project selection recovery failed; new tasks paused.'); }
+      if (!(error instanceof ProjectError)) { this.persistenceFailed = true; console.error('Project change storage failed; new tasks paused.'); }
+      await this.say(error instanceof ProjectError ? error.message : 'The project change could not finish. Check storage before continuing; no work was replayed.');
+    } finally {
+      if (this.conversation === active) this.conversation = undefined;
+      if (this.projectTransition === transition) this.projectTransition = undefined;
+      release();
     }
   }
 
@@ -823,6 +852,7 @@ export class Controller {
     await this.say('Encrypted backup sent. Keep the private BACKUP_ENCRYPTION_KEY from your environment to restore it on another server. Restore by uploading this .ctab file. Secrets and lifetime usage are not imported or reset.');
   }
   private async extraCommand(command: string | undefined, argument: string, messageContext?: TelegramMessageContext): Promise<boolean> {
+    if (this.pump && ['parchok', 'ptrashok', 'prestore', 'ppurgeok'].includes(command ?? '')) throw new ProjectError('Finish or stop the current task before changing projects from the menu. Claude can request a deferred project change while working.');
     const projectUI = new ProjectUI(this.projects, configSecrets(this.config));
     const show = async (view: { text: string; buttons: Buttons }) => this.panel(view.text, view.buttons);
     if (command === 'projects' || command === 'ppage') {

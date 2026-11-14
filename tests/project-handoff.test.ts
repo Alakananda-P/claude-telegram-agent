@@ -17,7 +17,7 @@ async function setup(run: Runner['run']) {
   const sender: Messenger = { async send(_id, text) { replies.push(text); }, async sendFile() {}, async download() { return Buffer.alloc(0); },
     async temporary() { return 5; }, async edit() {}, async remove() {}, async typing() {} };
   const bot = new Controller(config, store, sender, { run });
-  return { bot, store, dir, replies, config };
+  return { bot, store, dir, replies, config, sender };
 }
 function projects(request: AgentRequest): ProjectToolContext {
   const context = request.projects;
@@ -124,4 +124,63 @@ test('an expired inherited deadline cannot launch a continuation in another proj
   await fixture.bot.handle(message('Switch and continue')); await fixture.bot.idle();
   assert.equal(calls, 1); assert.equal(fixture.store.data.project, 'default');
   assert.match(fixture.replies.join('\n'), /time limit/);
+});
+
+for (const action of ['switch', 'archive', 'trash'] as const) test(`a new instruction after the SDK inbox closes cancels pending ${action} during final delivery`, async () => {
+  const calls: AgentRequest[] = []; let release!: () => void, delivering!: () => void;
+  const gate = new Promise<void>(r => { release = r; }), ready = new Promise<void>(r => { delivering = r; });
+  const fixture = await setup(async request => {
+    calls.push(request);
+    if (calls.length === 1) {
+      const context = projects(request);
+      if (action === 'switch') { await context.catalog.create({ id: 'target', name: 'Target' }); await context.requestSwitch('target', 'OLD_REMAINING_WORK'); }
+      else await context.requestClose('default', action);
+      assert.equal(request.steering!.finish(), true);
+    }
+    return { text: calls.length === 1 ? 'Source final answer' : 'New instruction handled', session: 'source-chat', cumulativeCost: 0 };
+  });
+  fixture.sender.send = async (_id, text) => { fixture.replies.push(text); if (text === 'Source final answer') { delivering(); await gate; } };
+  await fixture.bot.handle(message('Start the project change')); await ready;
+  await fixture.bot.handle({ ...message('Stay here; cancel the pending project change and handle this new instruction'), message_id: 200 });
+  release(); await fixture.bot.idle();
+  assert.equal(calls.length, 2); assert.match(calls[1].prompt, /Stay here/); assert.ok(!calls[1].prompt.includes('OLD_REMAINING_WORK'));
+  assert.equal(calls[1].cwd, path.join(fixture.dir, 'workspaces/default'));
+  assert.equal(fixture.store.data.project, 'default'); assert.equal((await fixture.bot.projects.get('default')).status, 'active');
+  assert.ok(fixture.store.data.tasks!.every(t => t.status === 'completed'));
+});
+
+test('owner input during persisted selection cancels the pending continuation and restores the source before handling it', async () => {
+  const calls: AgentRequest[] = []; let release!: () => void, selected!: () => void;
+  const gate = new Promise<void>(r => { release = r; }), ready = new Promise<void>(r => { selected = r; });
+  const fixture = await setup(async request => {
+    calls.push(request);
+    if (calls.length === 1) { const context = projects(request); await context.catalog.create({ id: 'target', name: 'Target' }); await context.requestSwitch('target', 'OLD_REMAINING_WORK'); request.steering!.finish(); }
+    return { text: 'Done', session: 'source-chat', cumulativeCost: 0 };
+  });
+  const save = fixture.store.save.bind(fixture.store); let held = false;
+  fixture.store.save = async () => { if (!held && fixture.store.data.project === 'target') { held = true; selected(); await gate; } return save(); };
+  await fixture.bot.handle(message('Switch and continue')); await ready;
+  const incoming = fixture.bot.handle({ ...message('Stay here; cancel the switch'), message_id: 201 });
+  release(); await incoming; await fixture.bot.idle();
+  assert.equal(calls.length, 2); assert.match(calls[1].prompt, /Stay here/);
+  assert.equal(calls[1].cwd, path.join(fixture.dir, 'workspaces/default')); assert.equal(fixture.store.data.project, 'default');
+  assert.ok(!fixture.store.data.tasks!.some(t => t.handoffFrom && t.status === 'completed'));
+});
+
+for (const action of ['archive', 'trash'] as const) test(`an owner correction before the ${action} commit leaves project work available`, async () => {
+  let calls = 0, release!: () => void, closing!: () => void;
+  const gate = new Promise<void>(r => { release = r; }), ready = new Promise<void>(r => { closing = r; });
+  const fixture = await setup(async request => {
+    calls++;
+    if (calls === 1) { await projects(request).requestClose('default', action); request.steering!.finish(); }
+    return { text: 'Done', session: 'source-chat', cumulativeCost: 0 };
+  });
+  const original = fixture.bot.projects[action].bind(fixture.bot.projects);
+  fixture.bot.projects[action] = async (id: string, now?: Date, beforeCommit?: () => void) => { closing(); await gate; return original(id, now, beforeCommit); };
+  await fixture.bot.handle(message('Close this project')); await ready;
+  const incoming = fixture.bot.handle(message('Cancel closing; keep working here'));
+  release(); await incoming; await fixture.bot.idle();
+  assert.equal(calls, 2); assert.equal(fixture.store.data.project, 'default');
+  assert.equal((await fixture.bot.projects.get('default')).status, 'active');
+  assert.ok(fixture.store.data.tasks!.every(t => t.status === 'completed'));
 });
