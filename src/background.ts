@@ -102,6 +102,7 @@ export class BackgroundJobs {
     // Reserve synchronously after all validation awaits, so concurrent starts
     // cannot both observe the same free slot.
     if (this.closing || this.storageFailed) throw new BackgroundError('Background execution is stopped or its storage needs attention.');
+    assertProjectWork(this.store.data, input.project);
     if (this.store.data.backgroundJobs!.filter(j => !terminal(j)).length >= 2) throw new BackgroundError('At most two background jobs may run at once.');
     this.store.data.backgroundJobs!.push(job);
     try { await this.store.save(); } catch { this.storageFailed = true; job.status = 'failed'; throw new BackgroundError('Background state could not be saved; no process was started.'); }

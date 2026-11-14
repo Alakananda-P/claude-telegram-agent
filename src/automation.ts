@@ -18,6 +18,7 @@ export interface Task {
   interactive?: boolean; settings?: AgentSettings; displayPrompt?: string;
   voiceInput?: string; attachedFiles?: string[];
   steers?: SteerRecord[];
+  deadlineAt?: string; handoffFrom?: string;
 }
 export interface Schedule {
   id: string; name: string; kind: Task['kind']; prompt: string; project: string; timezone: string;

@@ -44,6 +44,17 @@ test('archived and trashed projects cannot start a new background process', asyn
   } finally { await jobs.stop(); }
 });
 
+test('a project closed during asynchronous background validation cannot start late', async () => {
+  const { jobs, store, start, script } = await setup();
+  try {
+    const file = await script('never-run.mjs', "console.log('must not run');");
+    const stamp = new Date().toISOString();
+    store.data.projects = [{ id: 'default', name: 'Default', description: '', status: 'active', createdAt: stamp, updatedAt: stamp }];
+    const pending = start(file); store.data.projects[0].status = 'archived';
+    await assert.rejects(pending, /archived/i); assert.equal(jobs.list().length, 0);
+  } finally { await jobs.stop(); }
+});
+
 test('background stderr and split credentials are redacted and child processes inherit no service secrets', async () => {
   const { jobs, config, store, start, script } = await setup();
   const old = process.env.TELEGRAM_BOT_TOKEN; process.env.TELEGRAM_BOT_TOKEN = config.token;

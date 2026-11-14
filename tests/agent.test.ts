@@ -12,6 +12,8 @@ import { SessionCatalog, SESSION_TOOL_NAMES } from '../src/sessions.js';
 import { MEMORY_TOOL_NAMES } from '../src/memory-tools.js';
 import { SteeringInput } from '../src/steering.js';
 import { Automation } from '../src/automation.js';
+import { ProjectCatalog } from '../src/projects.js';
+import { PROJECT_TOOL_NAMES, type ProjectToolContext } from '../src/project-tools.js';
 
 const config = loadConfig({ TELEGRAM_BOT_TOKEN: '123456:abcdefghijklmnopqrstuvw', TELEGRAM_OWNER_ID: '123', ANTHROPIC_API_KEY: 'test-only-not-real' });
 
@@ -56,6 +58,22 @@ function factory(messages: unknown[], capture: (o: Options) => void = () => {}):
     return { async *[Symbol.asyncIterator]() { for (const m of messages) yield m as SDKMessage; }, close() {} };
   };
 }
+
+test('project tools use normal auto permissions and pause execution while a real folder change is pending', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'tg-agent-projects-')), store = await StateStore.open(path.join(dir, 'bot/state.json'));
+  const catalog = new ProjectCatalog(dir, store); let pending = true, options!: Options;
+  const projects: ProjectToolContext = { catalog, currentProject: 'default', pending: () => pending,
+    requestSwitch: async () => {}, cancelSwitch: async () => {}, requestClose: async () => {}, requestPermanentDelete: async () => {} };
+  await new ClaudeRunner({ ...config, dataDir: dir }, factory([init, result], o => { options = o; })).run({ prompt: 'Manage projects', cwd: '/work', projects }, () => {}, new AbortController());
+  assert.ok(options.mcpServers!.projects); assert.ok(PROJECT_TOOL_NAMES.every(name => options.allowedTools!.includes(name)));
+  const hook = options.hooks!.PreToolUse![0].hooks[0];
+  const check = (tool_name: string) => hook({ hook_event_name: 'PreToolUse', tool_name, tool_input: {}, tool_use_id: 'change', session_id: 'session-1', transcript_path: '', cwd: '/work' }, undefined, { signal: new AbortController().signal });
+  for (const name of ['Bash', 'Write', 'Edit', 'Agent', 'mcp__workspace__start_background_job', 'mcp__projects__create_project']) {
+    const denied = await check(name); assert.equal((denied as any).hookSpecificOutput?.permissionDecision, 'deny');
+  }
+  for (const name of ['Read', 'mcp__projects__get_project', 'mcp__projects__list_project_files', 'mcp__projects__cancel_project_switch']) assert.deepEqual(await check(name), {});
+  pending = false; assert.deepEqual(await check('Write'), {});
+});
 
 for (const resultBeforeSnapshot of [false, true]) test(`background helpers survive the parent reply and accept steering (completion result before snapshot: ${resultBeforeSnapshot})`, async () => {
   const steering = new SteeringInput(), events: AgentEvent[] = []; let closed = 0, completed = false;
