@@ -114,7 +114,7 @@ export class ClaudeRunner implements Runner {
       settingSources: [], skills: [], mcpServers: {
         ...(request.sessions ? { sessions: sessionServer(request.sessions) } : {}),
         ...(request.memoryEnabled === false ? {} : { memory: memoryServer(memory) }),
-        ...(request.workspace ? { workspace: workspaceServer(request.workspace) } : {}),
+        ...(request.workspace ? { workspace: workspaceServer({ ...request.workspace, secrets: configSecrets(this.config) }) } : {}),
       }, allowedTools: allowed, strictMcpConfig: true,
       persistSession: true, maxTurns: this.config.maxTurns,
       hooks: { PreToolUse: [{ hooks: [async event => {

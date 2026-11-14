@@ -48,6 +48,21 @@ async function setup(runner?: Runner, transcriber?: TranscriptionService) {
 const voice = (): Message => ({ ...message(''), voice: { file_id: 'voice-original', duration: 3, mime_type: 'audio/ogg' } });
 const speech = { text: 'Please read the attached bill', language: 'eng', durationSeconds: 3, provider: 'ElevenLabs' as const, model: 'scribe_v2' as const, cached: false, hasSpeech: true, transcriptFile: 'transcripts/voice.txt', metadataFile: 'transcripts/voice.json' };
 
+test('queue previews mask complete credentials before truncation and schedule buttons mask private names', async () => {
+  const { bot, config, panels } = await setup(); await bot.automation.setPaused(true);
+  await bot.automation.enqueue({ kind: 'agent', project: 'default', chatKey: 'chat', prompt: 'Q'.repeat(96) + config.apiKey + ' rest' });
+  await bot.handle(message('/queue'));
+  assert.match(panels.at(-1)!.text, /REDACTED/);
+  assert.ok(!panels.at(-1)!.text.includes('Q'.repeat(96) + config.apiKey.slice(0, 4)));
+  await bot.automation.createSchedule({ name: 'password: "private button words"', kind: 'reminder', project: 'default', prompt: 'Review invoices', intervalMinutes: 60 });
+  await bot.handle(message('/schedules'));
+  assert.ok(!JSON.stringify(panels.at(-1)).includes('private button words'));
+  assert.ok(!JSON.stringify(panels.at(-1)!.buttons).includes('private but'));
+  await bot.automation.createSchedule({ name: 'ghp_' + 'A'.repeat(36), kind: 'reminder', project: 'default', prompt: 'Review invoices', intervalMinutes: 60 });
+  await bot.handle(message('/schedules'));
+  assert.ok(!JSON.stringify(panels.at(-1)!.buttons).includes('ghp_'));
+});
+
 test('voice executes spoken instructions immediately, consumes pending photos and persists actual text', async () => {
   let transcriptions = 0;
   const { bot, downloads, calls, store, indicators, dataDir } = await setup(undefined, { async transcribe(_root, file) { transcriptions++; assert.match(file, /voice\.ogg$/); return speech; } });
@@ -421,6 +436,26 @@ test('/new chat archives conversations; /session resumes them and shared memory 
   await bot.handle(message('/memory off'));
   await bot.handle(message('fourth')); await bot.idle();
   assert.equal(calls[3].memoryEnabled, false);
+});
+
+test('fallback SDK versions appear once in the menu and selecting an old ID resumes the latest version', async () => {
+  let count = 0; const requests: AgentRequest[] = [];
+  const { bot, panels, store } = await setup({ async run(request, emit) {
+    requests.push(request); count++;
+    if (count === 1) { await emit({ type: 'session', id: 'original' }); await request.sessions!.rename('original', 'Invoice review', 'manual'); }
+    await emit({ type: 'session', id: 'recovered' });
+    return { session: 'recovered', text: 'Ready', cumulativeCost: 0 };
+  } });
+  await bot.handle(message('Review invoice')); await bot.idle();
+  await bot.handle(message('/session'));
+  assert.match(panels.at(-1)!.text, /1 chats/);
+  assert.equal(panels.at(-1)!.buttons.flat().filter(b => b.callback_data.startsWith('session ')).length, 1);
+  assert.match(panels.at(-1)!.text, /Invoice review/);
+  await bot.handle(message('/new chat'));
+  await bot.handle(message('/session original'));
+  assert.equal(store.data.sessions.default, 'recovered');
+  await bot.handle(message('Continue')); await bot.idle();
+  assert.equal(requests[1].session, 'recovered');
 });
 
 test('/fresh seeds only verified successful work and waits for a new instruction without resuming the refused chat', async () => {

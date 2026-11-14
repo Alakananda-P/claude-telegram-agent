@@ -22,7 +22,7 @@ export class Backups {
   private cipherKey(): Buffer { if (!this.key || !/^[a-f0-9]{64}$/i.test(this.key)) throw new Error('Backup encryption key is not configured.'); return Buffer.from(this.key, 'hex'); }
   async export(includeFiles = false): Promise<Buffer> {
     const chats = [];
-    for (const s of this.store.data.conversations ?? []) if (!s.trashedAt) chats.push({ id: s.id, project: s.project, updatedAt: s.updatedAt, title: s.title, turns: (await this.chats.read(s.id)).map(t => ({ role: t.role, text: t.text })) });
+    for (const s of this.store.data.conversations ?? []) if (!s.trashedAt) chats.push({ id: s.id, project: s.project, updatedAt: s.updatedAt, title: s.title, turns: (await this.chats.snapshot(s.id)).map(t => ({ role: t.role, text: t.text })) });
     const files: { project: string; path: string; base64: string }[] = []; let total = 0;
     if (includeFiles) {
       const base = path.join(this.root, 'workspaces');

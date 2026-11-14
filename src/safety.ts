@@ -26,11 +26,33 @@ export function authorized(message: Message, owner: number): boolean {
   return message.from?.id === owner && message.chat.type === 'private' && message.chat.id === owner;
 }
 
-export function redact(text: string, secrets: string[]): string {
+export function redact(text: string, secrets: string[] = []): string {
   let result = text;
   for (const secret of secrets.filter(Boolean).sort((a, b) => b.length - a.length)) result = result.split(secret).join('[REDACTED]');
-  return result.replace(/sk-ant-[A-Za-z0-9_-]+/g, '[REDACTED]')
-    .replace(/bot\d+:[A-Za-z0-9_-]+/g, 'bot[REDACTED]');
+  result = result.replace(/sk-ant-[A-Za-z0-9_-]+/g, '[REDACTED]')
+    .replace(/\bbot\d+:[A-Za-z0-9_-]+/g, 'bot[REDACTED]')
+    .replace(/\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|KGAT_[A-Za-z0-9_-]{16,}|AIza[A-Za-z0-9_-]{25,}|sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,})\b/g, '[REDACTED]')
+    .replace(/\b(bot)?\d{6,14}:[A-Za-z0-9_-]{20,}/g, (_all, bot) => (bot ?? '') + '[REDACTED]')
+    .replace(/(\bBearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi, '$1[REDACTED]')
+    .replace(/([a-z][a-z0-9+.-]*:\/\/[^\s/:@]+:)[^\s/@]+(@)/gi, '$1[REDACTED]$2');
+  result = result.replace(/(\b(?:[a-z][a-z0-9_]*_)?(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|authorization|password|passwd|secret|token|kaggle[_ -]?key)\b["']?\s*[:=]\s*)("(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|[^\s&;,<>{}"']+)/gi, (all, label, value) => {
+    if (/^(?:["']?(?:process\.env\.|os\.environ|your_|replace_|<[^>]+>|\[REDACTED\]))/i.test(value)) return all;
+    const quote = /^["']/.test(value) ? value[0] : '';
+    return label + quote + '[REDACTED]' + quote;
+  });
+  return result.replace(/(\b(?:aadhaar|aadhar|adhaar|uidai)(?:\s*(?:number|no\.?))?\s*[:=]\s*)(?:\d[ -]?){11}\d\b/gi, '$1[REDACTED]')
+    .replace(/(\bpan(?:\s*(?:card|number|no\.?))?\s*[:=]\s*)[A-Z]{5}\d{4}[A-Z]\b/gi, '$1[REDACTED]');
+}
+
+export function privatePreview(text: string, secrets: string[], limit: number): string {
+  const safe = redact(text, secrets), marker = safe.lastIndexOf('[REDACTED]', limit);
+  return safe.slice(0, marker >= 0 && marker + 10 > limit ? marker + 10 : limit);
+}
+
+/** Sanitize values before JSON escaping so quoting cannot break masking or JSON. */
+export function safeJson(value: unknown, secrets: string[] = []): string {
+  return JSON.stringify(value, (key, item) => typeof item !== 'string' ? item
+    : /^(?:[\w-]+[_-])?(?:password|passwd|token|api[_-]?key|client[_-]?secret|private[_-]?key)$/i.test(key) ? '[REDACTED]' : redact(item, secrets));
 }
 
 export function chunks(text: string, limit = 3500): string[] {

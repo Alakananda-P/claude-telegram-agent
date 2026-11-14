@@ -144,7 +144,7 @@ export class Telegram {
       if (editId !== undefined && (this.timeline?.data.pendingMessageCleanup?.some(m => m.chat === chat && m.id === editId) || this.timeline?.data.undeletableMessageIds?.includes(editId))) editId = undefined;
       editId ??= this.timeline?.data.uiMessages?.findLast(m => m.chat === chat && m.kind === 'panel' && m.scope === scope)?.id;
     const payload = { chat_id: chat, text: redact(text, [this.token, ...this.secrets]),
-      reply_markup: { inline_keyboard: buttons }, link_preview_options: { is_disabled: true } };
+      reply_markup: { inline_keyboard: buttons.map(row => row.map(b => ({ ...b, text: redact(b.text, [this.token, ...this.secrets]) }))) }, link_preview_options: { is_disabled: true } };
     let id = editId;
     if (editId !== undefined) {
       try { await this.call('editMessageText', { ...payload, message_id: editId }); }

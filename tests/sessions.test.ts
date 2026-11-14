@@ -23,6 +23,49 @@ async function setup() {
   return { catalog, store, archive };
 }
 
+test('proven fallback bindings show one conversation, preserve titles and expose older versions', async () => {
+  const { catalog, store, archive } = await setup();
+  await catalog.rename('active-id', 'Owner topic', 'manual');
+  await archive.append('active-id', { role: 'user', text: 'Original instruction' });
+  await catalog.bind('active-id', 'replacement-1', 'default');
+  await archive.append('replacement-1', { role: 'assistant', text: 'First recovery answer' });
+  await catalog.bind('replacement-1', 'replacement-2', 'default');
+  store.data.sessions.default = 'active-id';
+  assert.equal(catalog.resolve('active-id'), 'replacement-2');
+  assert.equal(catalog.context().currentSession, 'replacement-2');
+  assert.equal(catalog.list().total, 2);
+  const current = catalog.list().sessions.find(s => s.id === 'replacement-2')!;
+  assert.equal(current.title, 'Owner topic');
+  assert.deepEqual(current.versions, ['active-id', 'replacement-1', 'replacement-2']);
+  assert.equal((await catalog.read('active-id')).turns.length, 1);
+  assert.equal((await catalog.read('replacement-2')).turns.length, 2);
+  await catalog.rename('replacement-1', 'Renamed current conversation');
+  assert.equal(catalog.list().sessions.find(s => s.id === 'replacement-2')!.title, 'Renamed current conversation');
+  await catalog.trash('active-id');
+  assert.equal(catalog.list().total, 1);
+  assert.equal(catalog.trashList().length, 1);
+  assert.equal(store.data.sessions.default, undefined);
+  await assert.rejects(catalog.read('replacement-1'), /Trash/);
+  await catalog.restore('replacement-2');
+  assert.equal(catalog.list().total, 2);
+  await catalog.trash('replacement-1');
+  await catalog.purge('replacement-2');
+  assert.ok(['active-id', 'replacement-1', 'replacement-2'].every(id => store.data.purgedSessions!.includes(id)));
+  assert.equal(store.data.conversations!.length, 1);
+  assert.equal((await archive.read('active-id')).length, 0);
+  assert.ok((await archive.read('old-id')).length > 0);
+});
+
+test('binding cycles resolve consistently and unrelated projects never merge', async () => {
+  const { catalog, store } = await setup();
+  store.data.conversations!.push({ id: 'other-version', project: 'default', updatedAt: '2026-11-14' });
+  store.data.bindings = { 'active-id': 'other-version', 'other-version': 'active-id', 'old-id': 'other-version' };
+  assert.equal(catalog.resolve('active-id'), catalog.resolve('other-version'));
+  assert.equal(catalog.resolve('old-id'), 'old-id');
+  assert.equal(catalog.list().total, 2);
+  await assert.rejects(catalog.bind('old-id', 'other-version', 'bills'), /project/i);
+});
+
 test('old sessions get persistent topic names and model renames survive backfill', async () => {
   const { catalog, store } = await setup();
   await catalog.backfill();

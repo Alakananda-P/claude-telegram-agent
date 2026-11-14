@@ -4,7 +4,7 @@ import { mkdir, lstat, readdir, readFile, writeFile, statfs } from 'node:fs/prom
 import { configSecrets, type Config } from './config.js';
 import { AgentError, AgentApiError, AgentSafetyError, type Runner } from './agent.js';
 import { StateStore } from './state.js';
-import { authorized, projectName, redact, safeFile, secretPath, type Message, type Callback } from './safety.js';
+import { authorized, projectName, redact, privatePreview, safeFile, secretPath, type Message, type Callback } from './safety.js';
 import { MODELS, EFFORTS, effectiveSettings, settingsLabel, modelLabel, type AgentSettings, type Effort } from './settings.js';
 import { UsageLedger } from './usage.js';
 import { SharedMemory } from './memory.js';
@@ -120,7 +120,7 @@ export class Controller {
   async prepareSessions(signal: AbortSignal): Promise<void> {
     await this.sessions.backfill();
     let named = 0;
-    if (this.titles) for (const record of this.store.data.conversations ?? []) {
+    if (this.titles) for (const record of this.sessions.records()) {
       if (signal.aborted) break;
       if (record.trashedAt) continue;
       if (await this.sessions.autoName(record.id, turns => this.titles!.generate(turns, signal))) named++;
@@ -131,6 +131,8 @@ export class Controller {
   private get settings(): AgentSettings { return this.store.data.settings ?? { model: this.config.model, effort: this.config.effort, fast: this.config.fast }; }
 
   private async panel(text: string, buttons: Buttons = BACK, scope = 'controls'): Promise<void> {
+    const secrets = configSecrets(this.config);
+    text = redact(text, secrets); buttons = buttons.map(row => row.map(b => ({ ...b, text: redact(b.text, secrets) })));
     if (!this.messenger.panel) return this.say(text);
     try { await this.messenger.panel(this.config.owner, text, buttons, this.panelId, scope); }
     catch { await this.say(text); }
@@ -164,7 +166,7 @@ export class Controller {
   }
 
   private chatKey(): string { const d = this.store.data; return d.sessions[d.project] ?? d.drafts?.[d.project] ?? 'draft-' + d.project; }
-  private resolveChat(key: string): string { let id = key; const seen = new Set<string>(); while (this.store.data.bindings?.[id] && !seen.has(id)) { seen.add(id); id = this.store.data.bindings[id]; } return id; }
+  private resolveChat(key: string): string { return this.sessions.resolve(key); }
 
   private async clearScreen(): Promise<void> {
     this.panelId = undefined;
@@ -174,8 +176,9 @@ export class Controller {
   }
 
   private async history(id: string, page?: number): Promise<void> {
-    if (!this.store.data.conversations?.some(s => s.id === id && !s.trashedAt)) return this.panel('Saved chat not found.');
-    if (this.store.data.sessions[this.store.data.project] !== id) return this.panel('Resume this saved chat before viewing its messages.', [[button('Resume chat', 'session ' + id)], ...BACK]);
+    id = this.sessions.resolve(id);
+    if (!this.sessions.records().some(s => s.id === id)) return this.panel('Saved chat not found.');
+    if (this.sessions.resolve(this.store.data.sessions[this.store.data.project] ?? '') !== id) return this.panel('Resume this saved chat before viewing its messages.', [[button('Resume chat', 'session ' + id)], ...BACK]);
     const turns = await this.chats.read(id);
     const pages = Math.max(1, Math.ceil(turns.length / 6));
     const current = Math.min(pages - 1, Math.max(0, page ?? pages - 1));
@@ -192,6 +195,7 @@ export class Controller {
   }
 
   private async session(id: string, project: string): Promise<void> {
+    id = this.sessions.resolve(id, project);
     this.store.data.sessions[project] = id;
     const list = this.store.data.conversations ??= [];
     const record = list.find(s => s.id === id);
@@ -263,8 +267,8 @@ export class Controller {
       return this.panel(`Shared memory · ${this.store.data.memoryEnabled !== false ? 'ON' : 'OFF'}\n\n${content.slice(0, 2400) || 'Nothing saved yet. Tell me what to remember, or use /memory remember TEXT.'}${memoryPage.nextOffset !== null ? '\n…Ask me to show or tidy the rest.' : ''}\n\nTopics: ${memoryStats.totalTopics} · Stored: ${memoryStats.totalBytes.toLocaleString()} bytes · No fixed memory storage cap.\n${memoryStats.topics.map(t => t.topic).join(', ')}\nAsk naturally to search, read or update a topic.\n\nShared across every project and new chat. Turning it off does not erase old conversation history.`, [
         [button('Memory ON', 'memory on'), button('Memory OFF', 'memory off')], [button('Clear saved memory', 'memory confirm-clear')], ...BACK]);
     }
-    const list = [...(this.store.data.conversations ?? [])].filter(s => !s.trashedAt).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-    const active = this.store.data.sessions[this.store.data.project];
+    const list = this.sessions.records();
+    const active = this.sessions.context().currentSession;
     const pages = Math.max(1, Math.ceil(list.length / 8));
     const current = Math.min(pages - 1, Math.max(0, page));
     const slice = list.slice(current * 8, current * 8 + 8);
@@ -358,7 +362,9 @@ export class Controller {
         return this.controls('memory');
       }
       if (command === 'session') {
-        const found = this.store.data.conversations?.filter(s => !s.trashedAt && (s.id === argument || s.id.startsWith(argument)));
+        const exact = this.store.data.conversations?.find(s => s.id === argument);
+        const canonical = exact ? this.sessions.resolve(exact.id) : argument;
+        const found = this.sessions.records().filter(s => s.id === canonical || s.id.startsWith(argument));
         if (!found || found.length !== 1) return this.panel('Session not found or ID is ambiguous. Choose one from /session.');
         await this.workspace(found[0].project);
         this.store.data.project = found[0].project;
@@ -509,9 +515,8 @@ export class Controller {
     const bind = async (id: string) => {
       const active = task.interactive && (this.chatKey() === archiveKey || this.resolveChat(this.chatKey()) === archiveKey);
       const previous = archiveKey;
-      if (archiveKey !== id) (this.store.data.bindings ??= {})[archiveKey] = id;
-      this.store.data.bindings![task.chatKey] = id; archiveKey = id;
-      await this.chats.bind(previous, id);
+      await this.sessions.bind(previous, id, project);
+      (this.store.data.bindings ??= {})[task.chatKey] = id; archiveKey = id;
       if (this.store.data.freshContexts) delete this.store.data.freshContexts[previous];
       if (active) await this.session(id, project);
       else {
@@ -769,7 +774,7 @@ export class Controller {
       if (argument === 'pause' || argument === 'resume') { await this.automation.setPaused(argument === 'pause'); if (argument === 'resume') this.kick(); }
       const waiting = d.tasks!.filter(t => ['queued', 'running'].includes(t.status)); const recent = d.tasks!.filter(t => !['queued', 'running'].includes(t.status)).slice(-6).reverse();
       const shown = [...waiting.slice(0, 8), ...recent];
-      await this.panel(`Tasks · ${d.queuePaused ? 'PAUSED' : 'ON'} · ${waiting.filter(t => t.status === 'queued').length} waiting\n\n${shown.map(t => `${t.status} · ${t.id} · ${t.project}\n${(t.displayPrompt ?? t.prompt).replace(/\s+/g, ' ').slice(0, 100)}`).join('\n\n') || 'No tasks yet.'}`, [
+      await this.panel(`Tasks · ${d.queuePaused ? 'PAUSED' : 'ON'} · ${waiting.filter(t => t.status === 'queued').length} waiting\n\n${shown.map(t => `${t.status} · ${t.id} · ${t.project}\n${privatePreview(t.displayPrompt ?? t.prompt, configSecrets(this.config), 100).replace(/\s+/g, ' ')}`).join('\n\n') || 'No tasks yet.'}`, [
         [button(d.queuePaused ? 'Resume queue' : 'Pause queue', 'queue ' + (d.queuePaused ? 'resume' : 'pause'))],
         ...waiting.filter(t => t.status === 'queued').slice(0, 8).map(t => [button('First ' + t.id, 'taskfirst ' + t.id), button('Cancel ' + t.id, 'taskcancel ' + t.id)]),
         ...recent.filter(t => ['failed', 'interrupted', 'cancelled'].includes(t.status)).map(t => [button('Retry ' + t.id, 'taskretry ' + t.id)]), ...BACK]);
@@ -778,7 +783,7 @@ export class Controller {
     else if (command === 'taskconfirm') { await this.automation.retryTask(argument); this.kick(); await this.extraCommand('queue', ''); }
     else if (command === 'schedules') {
       await this.panel(`Schedules · ${d.schedules!.length}\nIndia time by default. Ask Claude to create/edit reminders or recurring jobs.\n\n${d.schedules!.slice(0, 12).map(s => `${s.enabled ? 'ON' : 'PAUSED'} · ${s.name}\nNext: ${new Date(s.nextRun).toLocaleString('en-GB', { timeZone: s.timezone })} (${s.timezone})\nLast: ${s.lastStatus ?? 'not run'}`).join('\n\n') || 'No schedules yet.'}`, [
-        ...d.schedules!.slice(0, 12).map(s => [button((s.enabled ? 'Pause ' : 'Resume ') + s.name.slice(0, 22), 'schedule' + (s.enabled ? 'pause ' : 'resume ') + s.id), button('Delete', 'scheduledelete ' + s.id)]), [button('Clock', 'clock')], ...BACK]);
+        ...d.schedules!.slice(0, 12).map(s => [button((s.enabled ? 'Pause ' : 'Resume ') + privatePreview(s.name, configSecrets(this.config), 22), 'schedule' + (s.enabled ? 'pause ' : 'resume ') + s.id), button('Delete', 'scheduledelete ' + s.id)]), [button('Clock', 'clock')], ...BACK]);
     } else if (['schedulepause', 'scheduleresume', 'scheduledelete'].includes(command ?? '')) { await this.automation.changeSchedule(argument, command!.slice(8) as 'pause' | 'resume' | 'delete'); await this.extraCommand('schedules', ''); }
     else if (command === 'delete') { const s = d.conversations!.find(s => s.id === argument && !s.trashedAt); if (s) await this.sessions.requestDelete(s.id); else await this.panel('Chat not found.'); }
     else if (['trashmove', 'restore', 'purgeconfirm'].includes(command ?? '')) {

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { CronExpressionParser } from 'cron-parser';
 import type { StateStore } from './state.js';
 import type { AgentSettings } from './settings.js';
-import { projectName } from './safety.js';
+import { projectName, redact } from './safety.js';
 
 export interface TelegramMessageContext { beforeMessageId?: number; replyToMessageId?: number }
 
@@ -40,6 +40,21 @@ function next(s: Pick<Schedule, 'cron' | 'intervalMinutes' | 'at' | 'timezone'>,
 }
 export class Automation {
   constructor(readonly store: StateStore) { store.data.tasks ??= []; store.data.schedules ??= []; }
+  taskView(query: { offset?: number; limit?: number; project?: string; status?: Task['status']; include_summary?: boolean } = {}, secrets: string[] = []) {
+    const offset = query.offset ?? 0, limit = query.limit ?? 20;
+    const records = this.store.data.tasks!.filter(t => (!query.project || t.project === query.project) && (!query.status || t.status === query.status)).slice().reverse();
+    return { paused: !!this.store.data.queuePaused, total: records.length, offset, nextOffset: offset + limit < records.length ? offset + limit : null,
+      tasks: records.slice(offset, offset + limit).map(t => ({ id: t.id, kind: t.kind, project: t.project, chatKey: t.chatKey, status: t.status, createdAt: t.createdAt,
+        startedAt: t.startedAt, finishedAt: t.finishedAt, failureKind: t.failureKind,
+        ...(query.include_summary ? { summary: redact(t.displayPrompt ?? t.prompt, secrets).replace(/\s+/g, ' ').slice(0, 180) } : {}) })) };
+  }
+  scheduleView(offset = 0, limit = 20, secrets: string[] = []) {
+    const records = this.store.data.schedules!;
+    return { total: records.length, offset, nextOffset: offset + limit < records.length ? offset + limit : null,
+      schedules: records.slice(offset, offset + limit).map(s => ({ id: s.id, name: redact(s.name, secrets), project: s.project, kind: s.kind,
+        prompt: redact(s.prompt, secrets).slice(0, 500), promptTruncated: redact(s.prompt, secrets).length > 500,
+        enabled: s.enabled, timezone: s.timezone, at: s.at, cron: s.cron, intervalMinutes: s.intervalMinutes, nextRun: s.nextRun, lastRun: s.lastRun, lastStatus: s.lastStatus })) };
+  }
   private insert(input: Omit<Task, 'id' | 'status' | 'createdAt'>): Task {
     projectName(input.project);
     if (!input.prompt.trim() || input.prompt.length > 30000) throw new Error('Task must contain 1-30000 characters.');

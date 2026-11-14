@@ -10,12 +10,16 @@ export class ChatArchive {
   private writing: Promise<void> = Promise.resolve();
   constructor(private dir: string, private secrets: string[]) {}
   private file(id: string): string { return path.join(this.dir, createHash('sha256').update(id).digest('hex') + '.json'); }
-  async read(id: string): Promise<ChatTurn[]> {
+  /** Private persistence/backup copy. Never expose through model inspection tools. */
+  async snapshot(id: string): Promise<ChatTurn[]> {
     try {
       const data = JSON.parse(await readFile(this.file(id), 'utf8'));
       if (!Array.isArray(data) || !data.every(x => ['user', 'assistant'].includes(x.role) && typeof x.text === 'string')) throw new Error('Invalid chat archive');
       return data;
     } catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') return []; throw new Error('Cannot read saved chat.'); }
+  }
+  async read(id: string): Promise<ChatTurn[]> {
+    return (await this.snapshot(id)).map(turn => ({ ...turn, text: redact(turn.text, this.secrets), ...(turn.file ? { file: { ...turn.file, name: redact(turn.file.name, this.secrets) } } : {}) }));
   }
   private async write(id: string, turns: ChatTurn[]): Promise<void> {
     await mkdir(this.dir, { recursive: true, mode: 0o700 });
@@ -25,7 +29,7 @@ export class ChatArchive {
   }
   async append(id: string, turn: ChatTurn): Promise<void> {
     const task = this.writing.then(async () => {
-      const turns = await this.read(id);
+      const turns = await this.snapshot(id);
       if (turn.eventId && turns.some(t => t.eventId === turn.eventId)) return;
       turns.push({ ...turn, text: redact(turn.text, this.secrets) });
       await this.write(id, turns);
@@ -36,9 +40,9 @@ export class ChatArchive {
   async bind(from: string, to: string): Promise<void> {
     if (from === to) return;
     const task = this.writing.then(async () => {
-      const existing = await this.read(to);
-      const incoming = await this.read(from);
-      if (incoming.length) await this.write(to, [...existing, ...incoming]);
+      const existing = await this.snapshot(to);
+      const incoming = await this.snapshot(from);
+      if (incoming.length) await this.write(to, [...incoming, ...existing]);
       if (from.startsWith('draft-')) await unlink(this.file(from)).catch(e => { if (e.code !== 'ENOENT') throw e; });
     });
     this.writing = task.catch(() => {}); await task;
