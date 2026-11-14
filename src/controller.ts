@@ -310,7 +310,8 @@ export class Controller {
     const command = match?.[1]?.toLowerCase();
     const argument = match?.[2]?.trim() ?? '';
     const stopping = command === 'stop' && !!this.running;
-    const ownerWork = (!command && !!text) || !!message.voice || command === 'run' || command === 'stop';
+    const incomingMedia = !!(message.voice || message.document || message.photo?.length || message.video || message.video_note || message.animation || message.audio);
+    const ownerWork = (!command && !!text) || incomingMedia || command === 'run' || command === 'stop';
     if (ownerWork && this.conversation?.projectChange) {
       delete this.conversation.projectChange; this.conversation.changeCancelledByOwner = true;
     }
@@ -718,8 +719,9 @@ export class Controller {
     let release!: () => void;
     const transition = new Promise<void>(resolve => { release = resolve; }); this.projectTransition = transition;
     const previousProject = this.store.data.project;
-    let selected = false, continuation: Task | undefined;
+    let selectionAttempted = false, continuation: Task | undefined;
     const assertPending = () => {
+      if (this.persistenceFailed) throw new ProjectError('Project changes are paused because storage needs attention.');
       if (active.projectChange !== change || abort.signal.aborted || this.shuttingDown) throw new ProjectError('The pending project change was cancelled by a newer instruction or Stop.');
     };
     try {
@@ -727,7 +729,8 @@ export class Controller {
         await this.projects.workspace(change.project);
         assertPending();
         if (change.continueTask && Date.now() >= Date.parse(task.deadlineAt)) throw new ProjectError('The original task time limit ended before project continuation. Send a new instruction when ready.');
-        const target = await this.projects.select(change.project, assertPending); selected = true;
+        selectionAttempted = true;
+        const target = await this.projects.select(change.project, assertPending);
         assertPending();
         await this.dismiss('uploads');
         if (change.continueTask) {
@@ -745,11 +748,13 @@ export class Controller {
         await this.say(`Project ${target.name}: ${change.action === 'archive' ? 'archived' : 'moved to 48-hour Trash'}.`, false, 'project-change');
       }
     } catch (error) {
-      try {
-        if (continuation?.status === 'queued') await this.automation.cancelTask(continuation.id);
-        if (selected && this.store.data.project === change.project) await this.projects.select(previousProject);
-      } catch { this.persistenceFailed = true; console.error('Project selection recovery failed; new tasks paused.'); }
       if (!(error instanceof ProjectError)) { this.persistenceFailed = true; console.error('Project change storage failed; new tasks paused.'); }
+      try {
+        // enqueue mutates before its save resolves; recover staged records even
+        // when that rejection prevented assignment to continuation above.
+        for (const staged of this.store.data.tasks!.filter(t => t.handoffFrom === task.id && t.status === 'queued')) await this.automation.cancelTask(staged.id);
+        if (selectionAttempted && this.store.data.project === change.project) await this.projects.select(previousProject);
+      } catch { this.persistenceFailed = true; console.error('Project selection recovery failed; new tasks paused.'); }
       await this.say(error instanceof ProjectError ? error.message : 'The project change could not finish. Check storage before continuing; no work was replayed.');
     } finally {
       if (this.conversation === active) this.conversation = undefined;

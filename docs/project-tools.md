@@ -47,8 +47,13 @@ the target for the owner's next message.
 
 The continuation keeps the original task deadline. Stop, failure, refusal, storage
 failure or shutdown prevent a pending switch/self-closure from applying. A new
-owner steering instruction cancels the pending change and reaches the same active
-conversation; Claude must reevaluate and request it again if still appropriate.
+owner instruction or incoming media cancels the pending change. Text, captioned
+attachments and voice instructions reach the active conversation; a bare upload
+still waits for a prompt. Claude must reevaluate and request the change again if
+still appropriate. Changes stay cancellable through final-answer delivery and
+selection persistence. Failed handoff saves cancel staged continuations and
+recover the previous selection; a worker restart marks unstarted handoffs
+interrupted for explicit review rather than running uncertain work.
 Already completed file edits are preserved. Switching does not stop an independent
 background job, but a live job blocks archiving/deleting its project.
 

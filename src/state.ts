@@ -110,7 +110,9 @@ export class StateStore {
       if (data[key] !== undefined && !Array.isArray(data[key])) throw new Error('Cannot load bot state; invalid automation records.');
       data[key] ??= [];
     }
-    for (const task of data.tasks!) if (task.status === 'running') { task.status = 'interrupted'; task.failureKind = 'worker_restart'; task.finishedAt = new Date().toISOString(); }
+    // A queued handoff may have been staged in the middle of a selection or
+    // cancellation transaction. Never replay that uncertain continuation.
+    for (const task of data.tasks!) if (task.status === 'running' || (task.status === 'queued' && task.handoffFrom)) { task.status = 'interrupted'; task.failureKind = 'worker_restart'; task.finishedAt = new Date().toISOString(); }
     for (const job of data.backgroundJobs ?? []) if (['starting', 'running'].includes(job.status)) { job.status = 'interrupted'; job.finishedAt = new Date().toISOString(); }
     data.bindings = Object.assign(Object.create(null), data.bindings ?? {});
     data.drafts = Object.assign(Object.create(null), data.drafts ?? {});

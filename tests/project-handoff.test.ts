@@ -8,6 +8,7 @@ import { AgentSafetyError, type Runner, type AgentRequest } from '../src/agent.j
 import { loadConfig } from '../src/config.js';
 import { StateStore } from '../src/state.js';
 import type { ProjectToolContext } from '../src/project-tools.js';
+import type { Message } from '../src/safety.js';
 
 const message = (text: string) => ({ from: { id: 123 }, chat: { id: 123, type: 'private' }, text });
 async function setup(run: Runner['run']) {
@@ -183,4 +184,75 @@ for (const action of ['archive', 'trash'] as const) test(`an owner correction be
   assert.equal(calls, 2); assert.equal(fixture.store.data.project, 'default');
   assert.equal((await fixture.bot.projects.get('default')).status, 'active');
   assert.ok(fixture.store.data.tasks!.every(t => t.status === 'completed'));
+});
+
+const attachments: Record<string, Partial<Message>> = {
+  document: { document: { file_id: 'note', file_name: 'note.txt' } },
+  photo: { photo: [{ file_id: 'photo', width: 100, height: 100 }] },
+  video: { video: { file_id: 'video', file_name: 'clip.mp4' } },
+  animation: { animation: { file_id: 'animation', file_name: 'clip.gif' } },
+  video_note: { video_note: { file_id: 'video-note' } },
+  audio: { audio: { file_id: 'audio', file_name: 'note.mp3' } },
+};
+for (const [type, attachment] of Object.entries(attachments)) test(`a captioned ${type} cancels pending deletion after the inbox closes`, async () => {
+  let calls = 0, release!: () => void, delivering!: () => void;
+  const gate = new Promise<void>(r => { release = r; }), ready = new Promise<void>(r => { delivering = r; });
+  const fixture = await setup(async request => {
+    calls++;
+    if (calls === 1) { await projects(request).requestClose('default', 'trash'); request.steering!.finish(); }
+    return { text: calls === 1 ? 'Source final answer' : 'Inspected the new file', session: 'source-chat', cumulativeCost: 0 };
+  });
+  fixture.sender.send = async (_id, text) => { fixture.replies.push(text); if (text === 'Source final answer') { delivering(); await gate; } };
+  await fixture.bot.handle(message('Delete this project')); await ready;
+  await fixture.bot.handle({ ...message(''), ...attachment, caption: 'Cancel deletion; keep this project and inspect this file' });
+  release(); await fixture.bot.idle();
+  assert.equal(calls, 2); assert.equal((await fixture.bot.projects.get('default')).status, 'active');
+  assert.ok(fixture.store.data.tasks!.every(t => t.status === 'completed'));
+});
+
+test('a bare photo cancels pending closure while still waiting for a text instruction', async () => {
+  let calls = 0, release!: () => void, delivering!: () => void;
+  const gate = new Promise<void>(r => { release = r; }), ready = new Promise<void>(r => { delivering = r; });
+  const fixture = await setup(async request => {
+    calls++; await projects(request).requestClose('default', 'trash'); request.steering!.finish();
+    return { text: 'Source final answer', session: 'source-chat', cumulativeCost: 0 };
+  });
+  fixture.sender.send = async (_id, text) => { if (text === 'Source final answer') { delivering(); await gate; } };
+  await fixture.bot.handle(message('Delete this project')); await ready;
+  await fixture.bot.handle({ ...message(''), ...attachments.photo }); release(); await fixture.bot.idle();
+  assert.equal(calls, 1); assert.equal((await fixture.bot.projects.get('default')).status, 'active');
+  assert.equal(fixture.store.data.uploads!.length, 1); assert.equal(fixture.store.data.batches![0].status, 'collecting');
+});
+
+for (const failure of ['selection', 'enqueue'] as const) test(`${failure} persistence failure cannot leave an executable handoff on disk`, async () => {
+  let calls = 0;
+  const fixture = await setup(async request => {
+    calls++; const context = projects(request); await context.catalog.create({ id: 'target', name: 'Target' });
+    await context.requestSwitch('target', 'OLD_REMAINING_WORK'); request.steering!.finish();
+    return { text: 'Done', session: 'source-chat', cumulativeCost: 0 };
+  });
+  const save = fixture.store.save.bind(fixture.store); let failed = false;
+  fixture.store.save = async () => {
+    if (!failed && (failure === 'selection' ? fixture.store.data.project === 'target' : fixture.store.data.tasks!.some(t => t.handoffFrom))) { failed = true; throw new Error('injected persistence failure'); }
+    return save();
+  };
+  await fixture.bot.handle(message('Switch and continue')); await fixture.bot.idle();
+  assert.equal(failed, true); assert.equal(calls, 1); assert.equal(fixture.store.data.project, 'default');
+  const persisted = JSON.parse(await readFile(fixture.store.file, 'utf8'));
+  assert.equal(persisted.project, 'default'); assert.ok(!persisted.tasks.some((t: { handoffFrom?: string; status: string }) => t.handoffFrom && t.status === 'queued'));
+  const restarted = new Controller(fixture.config, await StateStore.open(fixture.store.file), fixture.sender, { async run() { calls++; throw new Error('handoff must not replay'); } });
+  await restarted.tick(); await restarted.idle(); assert.equal(calls, 1); await restarted.stop();
+});
+
+test('a worker restart interrupts unstarted project handoffs while retaining ordinary queued work', async () => {
+  const fixture = await setup(async () => { throw new Error('not used'); });
+  await fixture.bot.projects.create({ id: 'target', name: 'Target' });
+  const source = await fixture.bot.automation.enqueue({ kind: 'agent', project: 'default', chatKey: 'source-chat', prompt: 'Original work' });
+  await fixture.bot.automation.finish(source.id, 'completed');
+  const handoff = await fixture.bot.automation.enqueue({ kind: 'agent', project: 'target', chatKey: 'target-chat', prompt: 'Remaining work', handoffFrom: source.id });
+  const reminder = await fixture.bot.automation.enqueue({ kind: 'reminder', project: 'default', chatKey: 'reminder-chat', prompt: 'Future reminder' });
+  const reopened = await StateStore.open(fixture.store.file);
+  assert.equal(reopened.data.tasks!.find(t => t.id === handoff.id)!.status, 'interrupted');
+  assert.equal(reopened.data.tasks!.find(t => t.id === handoff.id)!.failureKind, 'worker_restart');
+  assert.equal(reopened.data.tasks!.find(t => t.id === reminder.id)!.status, 'queued');
 });
