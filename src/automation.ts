@@ -3,6 +3,7 @@ import { CronExpressionParser } from 'cron-parser';
 import type { StateStore } from './state.js';
 import type { AgentSettings } from './settings.js';
 import { projectName, redact } from './safety.js';
+import { assertProjectWork, projectAcceptsWork } from './project-state.js';
 
 export interface TelegramMessageContext { beforeMessageId?: number; replyToMessageId?: number }
 
@@ -57,6 +58,7 @@ export class Automation {
   }
   private insert(input: Omit<Task, 'id' | 'status' | 'createdAt'>): Task {
     projectName(input.project);
+    assertProjectWork(this.store.data, input.project);
     if (!input.prompt.trim() || input.prompt.length > 30000) throw new Error('Task must contain 1-30000 characters.');
     if (input.occurrence) {
       const existing = this.store.data.tasks!.find(t => t.scheduleId === input.scheduleId && t.occurrence === input.occurrence);
@@ -69,7 +71,7 @@ export class Automation {
   async enqueue(input: Omit<Task, 'id' | 'status' | 'createdAt'>): Promise<Task> { const task = this.insert(input); await this.store.save(); return task; }
   async claim(): Promise<Task | undefined> {
     if (this.store.data.queuePaused || this.store.data.tasks!.some(t => t.status === 'running')) return;
-    const task = this.store.data.tasks!.find(t => t.status === 'queued');
+    const task = this.store.data.tasks!.find(t => t.status === 'queued' && projectAcceptsWork(this.store.data, t.project));
     if (!task) return;
     task.status = 'running'; task.startedAt = new Date().toISOString(); await this.store.save(); return task;
   }
@@ -109,11 +111,13 @@ export class Automation {
     return s;
   }
   async createSchedule(input: ScheduleInput, now = new Date()): Promise<Schedule> {
+    assertProjectWork(this.store.data, input.project);
     const s = this.makeSchedule(input, now); this.store.data.schedules!.push(s); await this.store.save(); return s;
   }
   async changeSchedule(id: string, action: 'pause' | 'resume' | 'delete', now = new Date()): Promise<void> {
     const list = this.store.data.schedules!; const s = list.find(s => s.id === id);
     if (!s) throw new Error('Schedule not found.');
+    if (action === 'resume') assertProjectWork(this.store.data, s.project);
     if (action === 'delete') this.store.data.schedules = list.filter(x => x.id !== id);
     else { s.enabled = action === 'resume'; if (s.enabled && (s.cron || s.intervalMinutes)) s.nextRun = next(s, now); }
     for (const task of this.store.data.tasks!.filter(t => t.scheduleId === id && t.status === 'queued')) {
@@ -122,6 +126,7 @@ export class Automation {
     await this.store.save();
   }
   async editSchedule(id: string, input: ScheduleInput, now = new Date()): Promise<Schedule> {
+    assertProjectWork(this.store.data, input.project);
     const old = this.store.data.schedules!.find(s => s.id === id); if (!old) throw new Error('Schedule not found.');
     const fresh = this.makeSchedule(input, now); fresh.id = old.id;
     this.store.data.schedules = this.store.data.schedules!.map(s => s.id === old.id ? fresh : s);
@@ -131,7 +136,7 @@ export class Automation {
   async tick(now = new Date()): Promise<number> {
     let added = 0; let changed = false;
     for (const s of this.store.data.schedules!) {
-      if (!s.enabled || Date.parse(s.nextRun) > +now) continue;
+      if (!s.enabled || !projectAcceptsWork(this.store.data, s.project) || Date.parse(s.nextRun) > +now) continue;
       const occurrence = s.nextRun;
       if (!this.store.data.tasks!.some(t => t.scheduleId === s.id && ['queued', 'running'].includes(t.status))) {
         this.insert({ kind: s.kind, project: s.project, chatKey: 'schedule-' + s.id, prompt: s.prompt, scheduleId: s.id, occurrence, interactive: false }); added++;

@@ -7,6 +7,7 @@ import { z } from 'zod';
 import { configSecrets, type Config } from './config.js';
 import type { StateStore } from './state.js';
 import { safeFile, projectName, redact } from './safety.js';
+import { assertProjectWork, projectVisible } from './project-state.js';
 
 export const backgroundJobSchema = z.object({
   id: z.string().regex(/^[a-f0-9]{16}$/), project: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,47}$/), chatKey: z.string().regex(/^[a-zA-Z0-9_-]{1,100}$/),
@@ -81,6 +82,7 @@ export class BackgroundJobs {
   private async launch(input: BackgroundInput): Promise<BackgroundJob> {
     if (this.closing || this.storageFailed) throw new BackgroundError('Background execution is stopped or its storage needs attention.');
     projectName(input.project);
+    assertProjectWork(this.store.data, input.project);
     const expected = path.join(this.config.dataDir, 'workspaces', input.project);
     if (path.resolve(input.root) !== path.resolve(expected) || (await lstat(path.dirname(expected))).isSymbolicLink() || (await lstat(expected)).isSymbolicLink()) throw new BackgroundError('Choose a regular project workspace.');
     const script = await safeFile(expected, input.script);
@@ -150,7 +152,7 @@ export class BackgroundJobs {
   private async notifyDue(now: number) {
     if (this.closing || this.storageFailed) return;
     for (const job of this.store.data.backgroundJobs!) {
-      if (!terminal(job) || job.notifiedAt || (job.notifyAfter && Date.parse(job.notifyAfter) > now)) continue;
+      if (!terminal(job) || job.notifiedAt || !projectVisible(this.store.data, job.project) || (job.notifyAfter && Date.parse(job.notifyAfter) > now)) continue;
       job.notificationAttempts = (job.notificationAttempts ?? 0) + 1;
       try { await this.notify({ ...job, args: [...job.args] }); job.notifiedAt = new Date(Math.max(Date.now(), Date.parse(job.finishedAt ?? job.createdAt))).toISOString(); delete job.notifyAfter; }
       catch { job.notifyAfter = new Date(Math.max(now, Date.now()) + 30_000).toISOString(); console.warn('Background completion delivery deferred; saved output is available.'); }

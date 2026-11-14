@@ -31,6 +31,19 @@ test('a real background process outlives the submitting function and delivers co
   } finally { await jobs.stop(); }
 });
 
+test('archived and trashed projects cannot start a new background process', async () => {
+  const { jobs, store, start, script } = await setup();
+  try {
+    const file = await script('never-run.mjs', "console.log('must not run');");
+    for (const status of ['archived', 'trashed', 'purging', 'purged'] as const) {
+      const stamp = new Date().toISOString();
+      store.data.projects = [{ id: 'default', name: 'Default', description: '', status, createdAt: stamp, updatedAt: stamp }];
+      await assert.rejects(start(file), /archived|Trash|deleted|purge/i);
+      assert.equal(jobs.list().length, 0);
+    }
+  } finally { await jobs.stop(); }
+});
+
 test('background stderr and split credentials are redacted and child processes inherit no service secrets', async () => {
   const { jobs, config, store, start, script } = await setup();
   const old = process.env.TELEGRAM_BOT_TOKEN; process.env.TELEGRAM_BOT_TOKEN = config.token;

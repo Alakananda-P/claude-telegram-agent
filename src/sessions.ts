@@ -4,6 +4,7 @@ import { StateStore, type Conversation } from './state.js';
 import { ChatArchive, type ChatTurn } from './chats.js';
 import { redact, safeJson, PathAccessError } from './safety.js';
 import { randomUUID } from 'node:crypto';
+import { ProjectError, projectVisible } from './project-state.js';
 
 const titleText = (text: string): string => text.replace(/[\p{Cc}\p{Cf}]/gu, ' ').replace(/\s+/g, ' ').trim().slice(0, 64);
 export const sessionTitle = (record: Conversation): string => record.title || `${record.project} conversation`;
@@ -43,7 +44,7 @@ export class SessionCatalog {
     }
     return [...groups].map(([id, versions]) => ({ record: this.find(id), versions, trashed: versions.some(s => !!s.trashedAt) }));
   }
-  records() { return this.groups().filter(g => !g.trashed).map(g => g.record).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)); }
+  records() { return this.groups().filter(g => !g.trashed && projectVisible(this.store.data, g.record.project)).map(g => g.record).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)); }
   async bind(from: string, to: string, project: string): Promise<void> {
     const source = this.store.data.conversations?.find(s => s.id === this.resolve(from, project));
     let target = this.store.data.conversations?.find(s => s.id === to);
@@ -219,7 +220,7 @@ export class SessionCatalog {
 export async function toolResult(action: () => unknown | Promise<unknown>, secrets: string[] = []) {
   try { return { content: [{ type: 'text' as const, text: safeJson(await action(), secrets) }] }; }
   catch (error) { return { isError: true, content: [{ type: 'text' as const,
-    text: error instanceof SessionAccessError || error instanceof PathAccessError ? error.message : 'Saved data could not be accessed. No raw service details are exposed.' }] }; }
+    text: error instanceof SessionAccessError || error instanceof PathAccessError || error instanceof ProjectError ? redact(error.message, secrets) : 'Saved data could not be accessed. No raw service details are exposed.' }] }; }
 }
 export const SESSION_TOOL_NAMES = ['list_sessions', 'read_session', 'rename_session', 'search_sessions', 'request_delete_session', 'restore_session', 'list_trash'].map(name => `mcp__sessions__${name}`);
 export function sessionTools(catalog: SessionCatalog) {
