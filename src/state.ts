@@ -7,6 +7,7 @@ import { keyRecordSchema, type KeyRecord } from './key-pool.js';
 import { backgroundJobSchema, type BackgroundJob } from './background.js';
 import { projectRecordSchema, type ProjectRecord } from './project-state.js';
 import type { ModelCatalogState } from './models.js';
+import type { PricingState } from './pricing.js';
 
 const identifier = z.string().regex(/^[a-zA-Z0-9_-]{1,100}$/);
 const projectId = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,47}$/);
@@ -59,6 +60,8 @@ export interface State {
   modelCatalog?: ModelCatalogState;
   /** Newest model id per family that the owner was told about (new optional field). */
   modelNotices?: Record<string, string>;
+  /** Last good pricing-page copy (new optional field). */
+  pricing?: PricingState;
   indicatorIds?: number[];
   lastSpeed?: string;
   memoryEnabled?: boolean;

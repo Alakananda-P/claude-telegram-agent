@@ -17,6 +17,7 @@ import { diagnoseFailedSessions } from './diagnostics.js';
 import { Automation } from './automation.js';
 import { KeyPool, messageProbe } from './key-pool.js';
 import { ModelCatalog, fetchModels } from './models.js';
+import { PriceBook, fetchPricingPage } from './pricing.js';
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -49,8 +50,11 @@ async function main(): Promise<void> {
   console.log(`API key pool ready: configured=${keys.list().length}; automaticChecks=true.`);
   // Model list: refreshed at startup when stale and every 12 h; the last good copy or the built-in list is used meanwhile.
   const models = new ModelCatalog(store, config.modelFamilies, () => fetchModels((keys.selectedConfig() ?? config).apiKey));
+  // Prices: the pricing page is read only when a current model has no saved price; a failure retries at the next check.
+  ledger.prices = new PriceBook(store, () => fetchPricingPage());
+  const checkPrices = () => ledger.prices.ensure([...models.current().values()].map(m => m.id)).catch(() => false);
   let announce = () => Promise.resolve();
-  const refreshModels = () => { if (models.due()) void models.refresh().then(() => announce()).catch(() => {}); };
+  const refreshModels = () => { if (models.due()) void models.refresh().then(() => Promise.all([announce(), checkPrices()])).catch(() => {}); };
   refreshModels();
   const modelTimer = setInterval(refreshModels, 60 * 60_000); modelTimer.unref();
   const controller = new Controller(config, store, telegram, new ResilientRunner(config, store, undefined, undefined, keys), ledger, new HaikuTitles(config, ledger, undefined, () => keys.selectedConfig()), keys);
@@ -150,6 +154,7 @@ async function main(): Promise<void> {
     }
     await controller.menu();
     await announce();
+    void checkPrices();
     if (store.data.lastJob?.status === 'interrupted') await telegram.send(config.owner, 'The previous task was interrupted by a restart. Review its files before retrying.').catch(() => {});
     console.log('Private Telegram worker started.');
     controller.start();
