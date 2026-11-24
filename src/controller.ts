@@ -88,8 +88,13 @@ function withMessageContext(text: string, context?: TelegramMessageContext): str
   return context?.replyToMessageId ? text + '\n\n[Telegram reply target: bot message ID ' + context.replyToMessageId + '. Inspect list_telegram_messages for its preview before acting.]' : text;
 }
 
+/** A new owner message restarts the time limit from now, capped at three limits from the task start. Never shortens it. */
+export function extendedDeadline(startedAt: string, current: string, timeoutMs: number, now = Date.now()): string {
+  return new Date(Math.max(Date.parse(current), Math.min(now + timeoutMs, Date.parse(startedAt) + 3 * timeoutMs))).toISOString();
+}
+
 export class Controller {
-  private conversation?: { messageContext?: TelegramMessageContext; task: Task; input: SteeringInput; abort: AbortController; cwd: string; ready: Promise<void>; serial: Promise<void>; projectChange?: ProjectChange; changeCancelledByOwner?: boolean };
+  private conversation?: { messageContext?: TelegramMessageContext; task: Task; input: SteeringInput; abort: AbortController; cwd: string; ready: Promise<void>; serial: Promise<void>; projectChange?: ProjectChange; changeCancelledByOwner?: boolean; extendDeadline?: () => void };
   private running?: { abort: AbortController; done: Promise<void>; task: Task };
   private projectTransition?: Promise<void>;
   private shuttingDown = false;
@@ -457,7 +462,7 @@ export class Controller {
       if (active.task.project !== this.store.data.project || this.resolveChat(active.task.chatKey) !== this.resolveChat(this.chatKey())) return this.say('Another saved chat is running. Stop it before starting work in this chat. Your message was not queued.');
       const release = active.input.reserve()!;
       const record: SteerRecord = { messageContext, id: randomUUID(), text: prompt, displayText: displayPrompt, voiceInput, attachedFiles, status: 'preparing' };
-      (active.task.steers ??= []).push(record);
+      (active.task.steers ??= []).push(record); active.extendDeadline?.();
       try { await this.store.save(); } catch (error) { release(); throw error; }
       this.prepareSteer(active, record, release);
       return;
@@ -563,7 +568,13 @@ export class Controller {
     let progress = task.voiceInput ? 'Transcribing voice…' : 'Thinking…';
     let timedOut = false;
     let pendingHelpers = 0;
-    const timeout = setTimeout(() => { timedOut = true; abort.abort(); }, Math.max(1, Date.parse(task.deadlineAt) - Date.now()));
+    const expire = () => setTimeout(() => { timedOut = true; abort.abort(); }, Math.max(1, Date.parse(task.deadlineAt!) - Date.now()));
+    let timeout = expire();
+    active.extendDeadline = () => {
+      if (timedOut || abort.signal.aborted) return;
+      task.deadlineAt = extendedDeadline(task.startedAt!, task.deadlineAt!, this.config.timeoutMs);
+      clearTimeout(timeout); timeout = expire();
+    };
     const assertLive = () => {
       if (this.conversation !== active || abort.signal.aborted || task.status !== 'running') throw new ProjectError('This task has ended. Send a new instruction to manage projects.');
     };

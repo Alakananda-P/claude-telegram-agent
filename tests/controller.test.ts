@@ -4,7 +4,7 @@ import { mkdtemp, readFile, readdir, mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { ChatArchive } from '../src/chats.js';
-import { Controller } from '../src/controller.js';
+import { Controller, extendedDeadline } from '../src/controller.js';
 import { AgentSafetyError, type Runner, type AgentRequest } from '../src/agent.js';
 import { loadConfig } from '../src/config.js';
 import { StateStore } from '../src/state.js';
@@ -402,6 +402,28 @@ test('project names matching Object prototype properties start without a phantom
   await bot.handle(message('/project constructor'));
   await bot.handle(message('first')); await bot.idle();
   assert.equal(calls[0].session, undefined);
+});
+
+test('each owner steer moves the task deadline forward, capped at three time limits from the start', async () => {
+  let abortedAt = 0; let began!: () => void; const started = new Promise<void>(resolve => { began = resolve; });
+  const runner: Runner = { async run(_request, _emit, abort) {
+    began();
+    await new Promise<void>((_resolve, reject) => abort.signal.addEventListener('abort', () => { abortedAt = Date.now(); reject(new Error('aborted')); }, { once: true }));
+    throw new Error('unreachable');
+  } };
+  const { bot, config, store } = await setup(runner);
+  config.timeoutMs = 150;
+  await bot.handle(message('work')); await started;
+  const first = store.data.tasks![0].deadlineAt!;
+  await new Promise(resolve => setTimeout(resolve, 100));
+  const steeredAt = Date.now(); await bot.handle(message('one more thing')); await bot.idle();
+  assert.ok(Date.parse(store.data.tasks![0].deadlineAt!) > Date.parse(first));
+  assert.ok(abortedAt - steeredAt >= 140, 'the time limit restarts from the latest owner message');
+  assert.equal(store.data.tasks![0].failureKind, 'timeout');
+  const start = '2026-11-24T10:00:00.000Z', limit = 20 * 60_000;
+  assert.equal(extendedDeadline(start, '2026-11-24T10:20:00.000Z', limit, Date.parse('2026-11-24T10:15:00.000Z')), '2026-11-24T10:35:00.000Z');
+  assert.equal(extendedDeadline(start, '2026-11-24T10:50:00.000Z', limit, Date.parse('2026-11-24T10:55:00.000Z')), '2026-11-24T11:00:00.000Z');
+  assert.equal(extendedDeadline(start, '2026-11-24T10:20:00.000Z', limit, Date.parse('2026-11-24T10:01:00.000Z')), '2026-11-24T10:21:00.000Z');
 });
 
 test('timeout still aborts bounded work without a spending cap', async () => {
