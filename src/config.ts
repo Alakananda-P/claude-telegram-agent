@@ -9,11 +9,13 @@ export interface Config {
   modelFamilies: string[];
   /** Set only when CLAUDE_MODEL names a family without an old id (see familySettings). */
   modelFamily?: string;
+  /** RENDER_API_KEY and GITHUB_TOKEN when set: only redacted here, used by /update. */
+  updateKeys?: string[];
   backupKeys?: string[]; backupEncryptionKey?: string;
   keyLabels?: string[]; elevenLabsKey?: string;
 }
 
-export function configSecrets(c: Config): string[] { return [c.token, c.apiKey, ...(c.backupKeys ?? []), ...(c.backupEncryptionKey ? [c.backupEncryptionKey] : []), ...(c.elevenLabsKey ? [c.elevenLabsKey] : [])]; }
+export function configSecrets(c: Config): string[] { return [c.token, c.apiKey, ...(c.backupKeys ?? []), ...(c.backupEncryptionKey ? [c.backupEncryptionKey] : []), ...(c.elevenLabsKey ? [c.elevenLabsKey] : []), ...(c.updateKeys ?? [])]; }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const required = (key: string) => {
@@ -56,7 +58,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
   if (backupEncryptionKey && !/^[a-f0-9]{64}$/i.test(backupEncryptionKey)) throw new Error('Set BACKUP_ENCRYPTION_KEY to 32 random bytes encoded as hex.');
   return { token, owner, apiKey: required('ANTHROPIC_API_KEY'), model, backupKeys, backupEncryptionKey, keyLabels, elevenLabsKey: env.ELEVENLABS_API_KEY?.trim() || undefined,
-    effort, fast: (env.CLAUDE_FAST_MODE ?? 'true') === 'true', permissionMode: 'auto', maxTurns, modelFamilies, ...(modelFamily ? { modelFamily } : {}),
+    effort, fast: (env.CLAUDE_FAST_MODE ?? 'true') === 'true', permissionMode: 'auto', maxTurns, modelFamilies, ...(modelFamily ? { modelFamily } : {}), updateKeys: [env.RENDER_API_KEY, env.GITHUB_TOKEN].map(v => v?.trim()).filter((v): v is string => !!v),
     timeoutMs: positive('JOB_TIMEOUT_MINUTES', 20) * 60_000,
     dataDir: path.resolve(env.DATA_DIR ?? './data') };
 }

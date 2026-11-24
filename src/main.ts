@@ -18,6 +18,7 @@ import { Automation } from './automation.js';
 import { KeyPool, messageProbe } from './key-pool.js';
 import { ModelCatalog, fetchModels } from './models.js';
 import { PriceBook, fetchPricingPage } from './pricing.js';
+import { UpdateClient, updateConfig } from './updater.js';
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -59,6 +60,7 @@ async function main(): Promise<void> {
   const modelTimer = setInterval(refreshModels, 60 * 60_000); modelTimer.unref();
   const controller = new Controller(config, store, telegram, new ResilientRunner(config, store, undefined, undefined, keys), ledger, new HaikuTitles(config, ledger, undefined, () => keys.selectedConfig()), keys);
   controller.models = models;
+  const updates = updateConfig(process.env); if (updates) controller.updates = new UpdateClient(updates);
   announce = () => controller.announceModelChanges().catch(() => {});
   const shutdown = new AbortController();
   let stopping = false;
@@ -125,6 +127,7 @@ async function main(): Promise<void> {
       { command: 'status', description: 'Current task and execution limits' },
       { command: 'stop', description: 'Stop current task' },
       { command: 'plan', description: 'Plan a task first, approve before changes' },
+      { command: 'update', description: 'Update the bot to the newest main' },
       { command: 'new', description: 'Fresh conversation, keep files' },
       { command: 'fresh', description: 'New conversation with completed-work summary' },
       { command: 'project', description: 'Create or switch project' },

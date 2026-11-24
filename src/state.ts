@@ -8,6 +8,7 @@ import { backgroundJobSchema, type BackgroundJob } from './background.js';
 import { projectRecordSchema, type ProjectRecord } from './project-state.js';
 import type { ModelCatalogState } from './models.js';
 import type { PricingState } from './pricing.js';
+import type { UpdateRecord } from './updater.js';
 
 const identifier = z.string().regex(/^[a-zA-Z0-9_-]{1,100}$/);
 const projectId = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,47}$/);
@@ -62,6 +63,8 @@ export interface State {
   modelNotices?: Record<string, string>;
   /** Last good pricing-page copy (new optional field). */
   pricing?: PricingState;
+  /** The last /update: what was live before it, for /de_update (new optional field). */
+  update?: UpdateRecord;
   indicatorIds?: number[];
   lastSpeed?: string;
   memoryEnabled?: boolean;

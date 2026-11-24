@@ -11,6 +11,7 @@ import { StateStore } from '../src/state.js';
 import type { Message } from '../src/safety.js';
 import type { Buttons } from '../src/ui.js';
 import { parseModels } from '../src/models.js';
+import { UpdateError } from '../src/updater.js';
 import { TranscriptionError, type TranscriptionService } from '../src/transcription.js';
 
 const message = (text: string): Message => ({ from: { id: 123 }, chat: { id: 123, type: 'private' }, text });
@@ -423,6 +424,34 @@ test('plan approval: the plan and buttons reach the owner; a tap approves and a 
   await bot.idle();
   assert.ok(replies.some(r => r.includes('Decisions: [{"approved":true},{"approved":false,"feedback":"Use CSV, not Excel"}]')));
   assert.equal(steering!.messages.length, 0);
+});
+
+test('/update: not configured, confirm backs up then deploys, a failed build is reported, a failed backup deploys nothing', async () => {
+  const { bot, replies, panels, store } = await setup();
+  await bot.handle(message('/update')); assert.match(replies.at(-1)!, /not configured/i);
+  const live = { id: 'dep-live', commit: 'a'.repeat(40), status: 'live' }; const target = 'b'.repeat(40);
+  const done: string[] = []; let backupFails = false;
+  bot.updates = { liveDeploy: async () => live, mainCommit: async () => target, changes: async () => ['Fix the hang'],
+    backup: async commit => { done.push('backup ' + commit.slice(0, 1)); if (backupFails) throw new UpdateError('GitHub returned HTTP 500.'); return 'snap'; },
+    deploy: async commit => { done.push('deploy ' + commit.slice(0, 1)); return 'dep-new'; },
+    deployStatus: async id => ({ id, commit: target, status: 'build_failed' }), rollback: async () => 'never' };
+  bot.updatePollMs = 5;
+  const tokenOf = () => panels.at(-1)!.buttons.flat().find(b => b.callback_data.startsWith('updateok '))!.callback_data.split(' ')[1];
+  const tap = (data: string, from = 123) => bot.callback({ id: 'u', from: { id: from }, message: { ...message(''), message_id: 70 }, data });
+  await bot.handle(message('/update'));
+  assert.match(panels.at(-1)!.text, /Live: aaaaaaa\nNew: bbbbbbb/); assert.match(panels.at(-1)!.text, /Fix the hang/);
+  await tap('updateok ' + tokenOf(), 999); assert.deepEqual(done, [], 'only the owner can confirm');
+  await tap('updateok deadbeef'); assert.deepEqual(done, []); assert.match(replies.at(-1)!, /expired/);
+  await bot.handle(message('/update')); await tap('updateok ' + tokenOf());
+  assert.deepEqual(done, ['backup a', 'deploy b']);
+  assert.deepEqual({ ...store.data.update, startedAt: undefined }, { previousDeployId: 'dep-live', previousCommit: live.commit, targetCommit: target, deployId: 'dep-new', startedAt: undefined });
+  for (let i = 0; i < 200 && !replies.some(r => /Update failed/.test(r)); i++) await new Promise(r => setTimeout(r, 5));
+  assert.match(replies.find(r => /Update failed/.test(r))!, /build failed\). The old version keeps running/);
+  assert.equal(store.data.update!.result, 'build_failed');
+  done.length = 0; backupFails = true;
+  await bot.handle(message('/update')); await tap('updateok ' + tokenOf());
+  assert.deepEqual(done, ['backup a'], 'a failed backup stops the update before deploying'); assert.match(replies.at(-1)!, /Backup failed, so nothing was deployed/);
+  await bot.handle(message('/update')); await tap('updateno ' + tokenOf()); assert.match(replies.at(-1)!, /cancelled/);
 });
 
 test('work continues beyond the former daily cap without budget reservations', async () => {

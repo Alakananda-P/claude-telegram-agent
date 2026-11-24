@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { UpdateClient, updateConfig, type Http } from '../src/updater.js';
+import { configSecrets, loadConfig } from '../src/config.js';
 
 const env = { RENDER_API_KEY: 'rnd_test_only', RENDER_SERVICE_ID: 'srv-abc123', GITHUB_TOKEN: 'github_pat_test_only', GITHUB_REPOSITORY_URL: 'https://github.com/owner/bot.git', BACKUP_REPOSITORY: 'owner/bot-previous' };
 const live = 'a'.repeat(40), next = 'b'.repeat(40);
@@ -65,4 +66,9 @@ test('the backup copies the live tree as one commit and fails when the copy does
   assert.equal(mismatch.backup.ref, undefined, 'main is never moved to a bad copy');
   const down = fake(['POST /repos/owner/bot-previous/git/blobs']);
   await assert.rejects(new UpdateClient(updateConfig(env)!, down.http).backup(live), error => /GitHub returned HTTP 500/.test(String(error)) && !String(error).includes('test_only'));
+});
+
+test('update keys are redacted like every other configured secret', () => {
+  const config = loadConfig({ TELEGRAM_BOT_TOKEN: '123456:abcdefghijklmnopqrstuvw', TELEGRAM_OWNER_ID: '123', ANTHROPIC_API_KEY: 'test-only', ...env });
+  assert.ok(configSecrets(config).includes('rnd_test_only')); assert.ok(configSecrets(config).includes('github_pat_test_only'));
 });

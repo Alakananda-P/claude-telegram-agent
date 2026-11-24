@@ -8,6 +8,7 @@ import { authorized, projectName, redact, privatePreview, safeFile, secretPath, 
 import { EFFORTS, effectiveSettings, settingsLabel, modelLabel, familyOf, familySettings, settingsFamily, type AgentSettings, type Effort } from './settings.js';
 import { ModelCatalog, type CatalogModel } from './models.js';
 import { PriceBook } from './pricing.js';
+import { FINAL_DEPLOY_STATUSES, UpdateError, type Deploy, type Updates } from './updater.js';
 import { UsageLedger } from './usage.js';
 import { SharedMemory } from './memory.js';
 import { button, BACK, HOME, type Buttons } from './ui.js';
@@ -67,6 +68,7 @@ Send a task in plain text, or upload a document with instructions in its caption
 /status — current job, model and execution limits
 /stop — cancel the running task (does not undo edits)
 /plan TASK — plan first (read-only); you approve the plan before any change
+/update — back up the live bot and deploy the newest main (after your tap)
 /new — fresh conversation, keep project files
 /project NAME — create/switch project while idle
 /projects — named projects, archive and 48-hour Trash
@@ -116,6 +118,10 @@ export class Controller {
   private cleaningUi?: Promise<void>;
   private restorePending?: { path: string; project: string; expires: number };
   private projectPurgeRequests = new Map<string, { id: string; expires: number }>();
+  /** GitHub + Render access for /update; undefined means not configured. Set by main.ts. */
+  updates?: Updates;
+  updatePollMs = 15_000;
+  private pendingUpdate?: { token: string; live: Deploy; target: string; expires: number };
 
   constructor(private config: Config, private store: StateStore, private messenger: Messenger, private runner: Runner, private ledger?: UsageLedger, private titles?: TitleGenerator, private keys = new KeyPool(config, store), private transcriber: TranscriptionService = new Transcriber(config, store)) {
     this.memory = new SharedMemory(config.dataDir, configSecrets(config));
@@ -193,7 +199,7 @@ export class Controller {
     await this.messenger.acknowledge?.(callback.id).catch(() => {});
     const data = callback.data ?? '';
     const projectCallback = /^(pnew|ppage (?:active|archived|trashed) \d+|(?:pinfo|pedit|parchive|parchok|ptrash|ptrashok|prestore|ppurge) [a-zA-Z0-9][a-zA-Z0-9_-]{0,47}|pfiles [a-zA-Z0-9][a-zA-Z0-9_-]{0,47} \d+|ppurgeok [a-f0-9]{8})$/.test(data);
-    if (!/^(menu|help|status|stop|rename|new chat|fresh|model(?: [a-z]{1,32})?|efforts(?: (?:low|medium|high|xhigh|max))?|fast(?: (?:on|off))?|token count|cost|memory(?: (?:on|off|confirm-clear|clear))?|session(?: [a-zA-Z0-9_-]+)?|sessionpage \d+|history [a-zA-Z0-9_-]+ \d+|projects|project [a-zA-Z0-9_-]+|files|batch|process(?: [a-zA-Z0-9_-]+)?|discard [a-zA-Z0-9_-]+|queue(?: (?:pause|resume))?|task(?:cancel|first|retry|confirm) [a-zA-Z0-9_-]+|schedules|schedule(?:pause|resume|delete) [a-zA-Z0-9_-]+|trash|(?:delete|trashmove|restore|purge|purgeconfirm) [a-zA-Z0-9_-]+|backup(?: (?:export|files|daily|off))?|restorebackup confirm|health(?: retry)?|keys(?: retired)?|keyhistory [a-f0-9]{16} \d+|background(?: \d+)?|backgroundlog [a-f0-9]{16} \d+|backgroundcancel [a-f0-9]{16}|plan(?:ok|no) [a-f0-9]{8}|clock)$/.test(data) && !projectCallback) return;
+    if (!/^(menu|help|status|stop|rename|new chat|fresh|model(?: [a-z]{1,32})?|efforts(?: (?:low|medium|high|xhigh|max))?|fast(?: (?:on|off))?|token count|cost|memory(?: (?:on|off|confirm-clear|clear))?|session(?: [a-zA-Z0-9_-]+)?|sessionpage \d+|history [a-zA-Z0-9_-]+ \d+|projects|project [a-zA-Z0-9_-]+|files|batch|process(?: [a-zA-Z0-9_-]+)?|discard [a-zA-Z0-9_-]+|queue(?: (?:pause|resume))?|task(?:cancel|first|retry|confirm) [a-zA-Z0-9_-]+|schedules|schedule(?:pause|resume|delete) [a-zA-Z0-9_-]+|trash|(?:delete|trashmove|restore|purge|purgeconfirm) [a-zA-Z0-9_-]+|backup(?: (?:export|files|daily|off))?|restorebackup confirm|health(?: retry)?|keys(?: retired)?|keyhistory [a-f0-9]{16} \d+|background(?: \d+)?|backgroundlog [a-f0-9]{16} \d+|backgroundcancel [a-f0-9]{16}|plan(?:ok|no) [a-f0-9]{8}|update(?:ok|no) [a-f0-9]{8}|clock)$/.test(data) && !projectCallback) return;
     this.panelId = callback.message.message_id;
     try {
       if (data === 'memory confirm-clear') {
@@ -403,6 +409,7 @@ export class Controller {
     }
     if (this.pump && command && !['run', 'get', 'files', 'session', 'new', 'fresh', 'project', 'rename'].includes(command)) return this.say('Busy with your current task. New messages steer it; change settings after it finishes. You can switch chats now; messages in another chat are queued.');
     if (this.persistenceFailed) return this.say('State storage failed. Restart only after checking the persistent disk; new tasks are disabled.');
+    if (command === 'update' || command === 'updateok' || command === 'updateno') return this.updateCommand(command, argument);
     try {
       const root = await this.workspace();
       if (command === 'rename') {
@@ -519,6 +526,51 @@ export class Controller {
     await this.automation.enqueue({ kind: 'agent', messageContext, project: this.store.data.project, chatKey: this.chatKey(), prompt, displayPrompt, voiceInput, attachedFiles, settings: { ...this.settings }, interactive: true, ...(planMode ? { planMode: true } : {}) });
     this.kick();
     if (otherChat) await this.say('Another chat is running. This message is queued for this chat and starts when that task finishes. See /queue.');
+  }
+
+  /** /update: show live -> new main with the commit titles; on the owner's Confirm tap, back up the
+   * live code, save what was live, start the Render deploy and report a failure. Bot code only. */
+  private async updateCommand(command: string, argument: string): Promise<void> {
+    const updates = this.updates;
+    if (!updates) return this.say('Updates are not configured. Add RENDER_API_KEY, RENDER_SERVICE_ID, GITHUB_TOKEN and BACKUP_REPOSITORY in Render, then try /update again.');
+    const failed = (error: unknown) => this.say(error instanceof UpdateError ? error.message : 'The update check failed.');
+    if (command === 'update') {
+      try {
+        const live = await updates.liveDeploy(); const target = await updates.mainCommit();
+        if (live.commit === target) return this.say(`Already up to date (${target.slice(0, 7)}).`);
+        const titles = await updates.changes(live.commit, target).catch(() => []);
+        const token = randomUUID().replaceAll('-', '').slice(0, 8);
+        this.pendingUpdate = { token, live, target, expires: Date.now() + 10 * 60_000 };
+        return this.panel(`Update available\nLive: ${live.commit.slice(0, 7) || 'unknown'}\nNew: ${target.slice(0, 7)}\n\n${titles.length ? 'Changes:\n' + titles.map(t => '• ' + t).join('\n') : 'No change list.'}\n\nConfirm backs up the live version, then deploys the new one. If the build fails, the old version keeps running.`,
+          [[button('Confirm update', 'updateok ' + token), button('Cancel', 'updateno ' + token)]], 'update');
+      } catch (error) { return failed(error); }
+    }
+    const pending = this.pendingUpdate;
+    if (!pending || pending.token !== argument || pending.expires < Date.now()) return this.say('This update confirmation expired. Send /update again.');
+    this.pendingUpdate = undefined; await this.dismiss('update');
+    if (command === 'updateno') return this.say('Update cancelled. Nothing changed.');
+    try { await this.say('Backing up the live version…'); await updates.backup(pending.live.commit); }
+    catch (error) { return this.say('Backup failed, so nothing was deployed. ' + (error instanceof UpdateError ? error.message : '')); }
+    this.store.data.update = { previousDeployId: pending.live.id, previousCommit: pending.live.commit, targetCommit: pending.target, startedAt: new Date().toISOString() };
+    await this.store.save();
+    let deployId: string;
+    try { deployId = await updates.deploy(pending.target); }
+    catch (error) { this.store.data.update.result = 'deploy_not_started'; await this.store.save(); return this.say('The deploy could not start; the old version keeps running. ' + (error instanceof UpdateError ? error.message : '')); }
+    this.store.data.update.deployId = deployId; await this.store.save();
+    await this.say(`Deploy started for ${pending.target.slice(0, 7)}. The new version reports here when it is live; /de_update goes back to ${pending.live.commit.slice(0, 7)}.`);
+    void this.watchDeploy(updates, deployId);
+  }
+  /** Polls a deploy until it ends. A failure is reported here; a live deploy is reported by the new version itself. */
+  private async watchDeploy(updates: Updates, deployId: string, limitMs = 45 * 60_000): Promise<void> {
+    const until = Date.now() + limitMs;
+    while (!this.shuttingDown && Date.now() < until) {
+      await new Promise(resolve => setTimeout(resolve, this.updatePollMs));
+      const deploy = await updates.deployStatus(deployId).catch(() => undefined);
+      if (!deploy || !FINAL_DEPLOY_STATUSES.includes(deploy.status)) continue;
+      if (this.store.data.update?.deployId === deployId) { this.store.data.update.result = deploy.status; await this.store.save().catch(() => {}); }
+      if (deploy.status !== 'live') await this.say(`Update failed (${deploy.status.replace(/_/g, ' ')}). The old version keeps running; nothing to undo.`);
+      return;
+    }
   }
 
   /** Sends the plan with Approve / Keep planning buttons and waits for the owner's tap or text reply. The task deadline and Stop still apply. */
