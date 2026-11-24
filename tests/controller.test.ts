@@ -500,6 +500,20 @@ test('after /update the new version reports itself live once, or rolls back by i
   assert.equal(store.data.update!.result, 'self_check_failed'); assert.equal(store.data.update!.rollbackDeployId, 'dep-rollback');
 });
 
+test('Render and GitHub keys never reach Telegram, even if an error text carried one', async () => {
+  const { bot, replies, panels, config } = await setup();
+  config.updateKeys = ['rnd_secret_test_value', 'github_pat_secret_test_value'];
+  bot.updates = { liveDeploy: async () => { throw new UpdateError('Render said rnd_secret_test_value is wrong'); }, mainCommit: async () => 'b'.repeat(40), changes: async () => [],
+    backup: async () => 'snap', deploy: async () => 'd', deployStatus: async id => ({ id, commit: '', status: 'live' }), rollback: async () => 'r' };
+  await bot.handle(message('/update'));
+  bot.updates.liveDeploy = async () => ({ id: 'dep', commit: 'a'.repeat(40), status: 'live' });
+  bot.updates.changes = async () => ['Use github_pat_secret_test_value here'];
+  await bot.handle(message('/update'));
+  const shown = JSON.stringify([replies, panels]);
+  assert.doesNotMatch(shown, /rnd_secret_test_value|github_pat_secret_test_value/);
+  assert.ok(replies.length + panels.length >= 2);
+});
+
 test('work continues beyond the former daily cap without budget reservations', async () => {
   const { bot, store, calls, replies } = await setup();
   for (let i = 0; i < 7; i++) {
