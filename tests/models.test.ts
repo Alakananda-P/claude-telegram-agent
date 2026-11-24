@@ -7,6 +7,7 @@ import { StateStore } from '../src/state.js';
 import { BUILTIN_MODELS, ModelCatalog, fetchModels, parseModels, type FetchLike } from '../src/models.js';
 import { loadConfig } from '../src/config.js';
 import { modelLabel } from '../src/settings.js';
+import { Controller } from '../src/controller.js';
 
 const fixture = async () => JSON.parse(await readFile(path.join(import.meta.dirname, 'fixtures-models-2026-11-25.json'), 'utf8'));
 const store = async () => StateStore.open(path.join(await mkdtemp(path.join(tmpdir(), 'tg-models-')), 'state.json'));
@@ -67,4 +68,22 @@ test('CLAUDE_MODEL accepts a family or any model id of an allowed family and is 
   assert.throws(() => loadConfig({ ...base, CLAUDE_MODEL: 'claude-haiku-5-5' }), /CLAUDE_MODEL/);
   assert.throws(() => loadConfig({ ...base, CLAUDE_MODEL: 'gpt-5' }), /CLAUDE_MODEL/);
   assert.deepEqual(['claude-fable-5-2', 'claude-opus-4-5-20251101', 'claude-opus-5', 'claude-haiku-5-5', 'something-else'].map(modelLabel), ['Fable 5.2', 'Opus 4.5', 'Opus 5', 'Haiku 5.5', 'something-else']);
+});
+
+test('a family whose newest model changes is announced to the owner once', async () => {
+  const dataDir = await mkdtemp(path.join(tmpdir(), 'tg-models-notice-'));
+  const config = loadConfig({ TELEGRAM_BOT_TOKEN: '123456:abcdefghijklmnopqrstuvw', TELEGRAM_OWNER_ID: '123', ANTHROPIC_API_KEY: 'test-only', DATA_DIR: dataDir });
+  const s = await StateStore.open(path.join(dataDir, 'bot', 'state.json'));
+  const sent: string[] = [];
+  const messenger = { async send(_c: number, text: string) { sent.push(text); }, async temporary() { return 1; }, async edit() {}, async remove() {}, async typing() {} };
+  const bot = new Controller(config, s, messenger as never, { async run() { throw new Error('unused'); } });
+  s.data.settings = { model: 'claude-fable-5-1', effort: 'high', fast: false };
+  await bot.announceModelChanges();
+  assert.deepEqual(sent.filter(t => /Fable 5\.1 -> Fable 5\.2/.test(t)).length, 1);
+  await bot.announceModelChanges(); assert.equal(sent.length, 1, 'only once');
+  s.data.modelCatalog = { fetchedAt: new Date().toISOString(), models: [{ id: 'claude-fable-6', label: 'Claude Fable 6', family: 'fable', createdAt: '2027-01-01T00:00:00Z' }] };
+  await bot.announceModelChanges(); assert.match(sent.at(-1)!, /Fable 5\.2 -> Fable 6/); assert.equal(sent.length, 2);
+  s.data.settings = { model: 'claude-opus-5-5', effort: 'high', fast: true };
+  await bot.announceModelChanges(); assert.equal(sent.length, 2, 'an unchanged family says nothing');
+  assert.equal((await StateStore.open(s.file)).data.modelNotices?.fable, 'claude-fable-6');
 });

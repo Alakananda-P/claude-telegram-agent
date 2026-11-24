@@ -152,6 +152,16 @@ export class Controller {
   /** Model list; main.ts replaces it with one that fetches the Models API. */
   models: ModelCatalog;
   private get settings(): AgentSettings { return this.store.data.settings ?? { model: this.config.model, ...(this.config.modelFamily ? { family: this.config.modelFamily } : {}), effort: this.config.effort, fast: this.config.fast }; }
+  /** Tells the owner once when the newest model of the chosen family changes, e.g. Fable 5.1 -> Fable 5.2. */
+  async announceModelChanges(): Promise<void> {
+    const s = this.settings; const family = settingsFamily(s);
+    const newest = this.models.current().get(family)?.id; if (!newest) return;
+    const seen = this.store.data.modelNotices ??= {};
+    const previous = Object.hasOwn(seen, family) ? seen[family] : familyOf(s.model) === family ? s.model : undefined;
+    if (previous === newest && seen[family] === newest) return;
+    seen[family] = newest; await this.store.save();
+    if (previous && previous !== newest) await this.say(`Model update: ${modelLabel(previous)} -> ${modelLabel(newest)}. Your ${family[0].toUpperCase() + family.slice(1)} choice now runs ${modelLabel(newest)}. Change it any time with /model.`, true);
+  }
   /** The settings a task runs with: the newest model of the chosen family. Never persisted. */
   private resolved(s: AgentSettings): AgentSettings {
     const { family: _family, ...rest } = s;
@@ -398,6 +408,7 @@ export class Controller {
           const choice = argument.toLowerCase(); const family = /^[a-z]{1,32}$/.test(choice) ? choice : familyOf(choice);
           if (!family || !this.config.modelFamilies.includes(family)) return this.panel('Choose ' + this.config.modelFamilies.join(', ') + '.');
           const { family: _old, ...rest } = next; next = { ...rest, ...familySettings(family) };
+          const newest = this.models.current().get(family)?.id; if (newest) (this.store.data.modelNotices ??= {})[family] = newest;
         } else if (command === 'fast') {
           if (!['on', 'off'].includes(argument.toLowerCase())) return this.panel('Use /fast on or /fast off.');
           next.fast = argument.toLowerCase() === 'on';

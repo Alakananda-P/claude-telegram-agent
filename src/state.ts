@@ -57,6 +57,8 @@ export interface State {
   settings?: AgentSettings;
   /** Last good Models API list (new optional field; older versions ignore it). */
   modelCatalog?: ModelCatalogState;
+  /** Newest model id per family that the owner was told about (new optional field). */
+  modelNotices?: Record<string, string>;
   indicatorIds?: number[];
   lastSpeed?: string;
   memoryEnabled?: boolean;

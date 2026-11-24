@@ -49,11 +49,13 @@ async function main(): Promise<void> {
   console.log(`API key pool ready: configured=${keys.list().length}; automaticChecks=true.`);
   // Model list: refreshed at startup when stale and every 12 h; the last good copy or the built-in list is used meanwhile.
   const models = new ModelCatalog(store, config.modelFamilies, () => fetchModels((keys.selectedConfig() ?? config).apiKey));
-  const refreshModels = () => { if (models.due()) void models.refresh().catch(() => {}); };
+  let announce = () => Promise.resolve();
+  const refreshModels = () => { if (models.due()) void models.refresh().then(() => announce()).catch(() => {}); };
   refreshModels();
   const modelTimer = setInterval(refreshModels, 60 * 60_000); modelTimer.unref();
   const controller = new Controller(config, store, telegram, new ResilientRunner(config, store, undefined, undefined, keys), ledger, new HaikuTitles(config, ledger, undefined, () => keys.selectedConfig()), keys);
   controller.models = models;
+  announce = () => controller.announceModelChanges().catch(() => {});
   const shutdown = new AbortController();
   let stopping = false;
   const stop = () => {
@@ -147,6 +149,7 @@ async function main(): Promise<void> {
       if (!cleared) await telegram.send(config.owner, 'Your new chat is ready. Telegram could not remove some older messages. Saved chats are in Sessions.');
     }
     await controller.menu();
+    await announce();
     if (store.data.lastJob?.status === 'interrupted') await telegram.send(config.owner, 'The previous task was interrupted by a restart. Review its files before retrying.').catch(() => {});
     console.log('Private Telegram worker started.');
     controller.start();
