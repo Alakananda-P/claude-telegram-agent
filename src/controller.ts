@@ -201,7 +201,7 @@ export class Controller {
     await this.messenger.acknowledge?.(callback.id).catch(() => {});
     const data = callback.data ?? '';
     const projectCallback = /^(pnew|ppage (?:active|archived|trashed) \d+|(?:pinfo|pedit|parchive|parchok|ptrash|ptrashok|prestore|ppurge) [a-zA-Z0-9][a-zA-Z0-9_-]{0,47}|pfiles [a-zA-Z0-9][a-zA-Z0-9_-]{0,47} \d+|ppurgeok [a-f0-9]{8})$/.test(data);
-    if (!/^(menu|help|status|stop|rename|new chat|fresh|model(?: [a-z]{1,32})?|efforts(?: (?:low|medium|high|xhigh|max))?|fast(?: (?:on|off))?|token count|cost|memory(?: (?:on|off|confirm-clear|clear))?|session(?: [a-zA-Z0-9_-]+)?|sessionpage \d+|history [a-zA-Z0-9_-]+ \d+|projects|project [a-zA-Z0-9_-]+|files|batch|process(?: [a-zA-Z0-9_-]+)?|discard [a-zA-Z0-9_-]+|queue(?: (?:pause|resume))?|task(?:cancel|first|retry|confirm) [a-zA-Z0-9_-]+|schedules|schedule(?:pause|resume|delete) [a-zA-Z0-9_-]+|trash|(?:delete|trashmove|restore|purge|purgeconfirm) [a-zA-Z0-9_-]+|backup(?: (?:export|files|daily|off))?|restorebackup confirm|health(?: retry)?|keys(?: retired)?|keyhistory [a-f0-9]{16} \d+|background(?: \d+)?|backgroundlog [a-f0-9]{16} \d+|backgroundcancel [a-f0-9]{16}|plan(?:ok|no) [a-f0-9]{8}|update(?:ok|no) [a-f0-9]{8}|deupdate(?:ok|no) [a-f0-9]{8}|clock)$/.test(data) && !projectCallback) return;
+    if (!/^(menu|help|status|stop|rename|new chat|fresh|model(?: [a-z]{1,32})?|efforts(?: (?:low|medium|high|xhigh|max))?|fast(?: (?:on|off))?|token count|cost|memory(?: (?:on|off|confirm-clear|clear))?|session(?: [a-zA-Z0-9_-]+)?|sessionpage \d+|history [a-zA-Z0-9_-]+ \d+|projects|project [a-zA-Z0-9_-]+|files|batch|process(?: [a-zA-Z0-9_-]+)?|discard [a-zA-Z0-9_-]+|queue(?: (?:pause|resume))?|task(?:cancel|first|retry|confirm) [a-zA-Z0-9_-]+|schedules|schedule(?:pause|resume|delete) [a-zA-Z0-9_-]+|trash|(?:delete|trashmove|restore|purge|purgeconfirm) [a-zA-Z0-9_-]+|backup(?: (?:export|files|daily|off))?|restorebackup confirm|health(?: retry)?|keys(?: retired)?|keyhistory [a-f0-9]{16} \d+|keyremove [a-f0-9]{16}|background(?: \d+)?|backgroundlog [a-f0-9]{16} \d+|backgroundcancel [a-f0-9]{16}|plan(?:ok|no) [a-f0-9]{8}|update(?:ok|no) [a-f0-9]{8}|deupdate(?:ok|no) [a-f0-9]{8}|clock)$/.test(data) && !projectCallback) return;
     this.panelId = callback.message.message_id;
     try {
       if (data === 'memory confirm-clear') {
@@ -1083,6 +1083,10 @@ export class Controller {
       await this.panel(`${view.job.name} · ${view.job.status.replaceAll('_', ' ')}\n\n${view.text || 'No output yet.'}`, [...(view.nextOffset !== undefined ? [[button('More output', `backgroundlog ${id} ${view.nextOffset}`)]] : []), [button('Background jobs', 'background')], ...BACK]); return true;
     }
     if (command === 'backgroundcancel') { await this.background.cancel(argument); return this.extraCommand('background', ''); }
+    if (command === 'keyremove') {
+      try { await this.keys.remove(argument); } catch (error) { await this.panel(error instanceof Error ? error.message : 'Could not remove that key.', [[button('Retired keys', 'keys retired')], ...BACK]); return true; }
+      const view = this.keys.panel('retired'); await this.panel('Key removed from the list. Its history line is kept; the key itself was never stored.\n\n' + view.text, view.buttons); return true;
+    }
     if (command === 'keys' || command === 'keyhistory') {
       const [id, page] = argument.split(' ');
       const view = this.keys.panel(command === 'keyhistory' || id === 'retired' ? id : undefined, /^\d+$/.test(page ?? '') ? Number(page) : 0);

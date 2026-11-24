@@ -65,6 +65,8 @@ export interface State {
   pricing?: PricingState;
   /** The last /update: what was live before it, for /de_update (new optional field). */
   update?: UpdateRecord;
+  /** One line per removed key record (label and reason, never the key; new optional field). */
+  removedKeys?: { label: string; removedAt: string; reason: string }[];
   indicatorIds?: number[];
   lastSpeed?: string;
   memoryEnabled?: boolean;

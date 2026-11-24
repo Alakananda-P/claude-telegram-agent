@@ -50,9 +50,28 @@ export class KeyPool {
       if (previous) { previous.label = c.label; migrateAuthStreak(previous); continue; }
       store.data.keyRecords![c.id] = { label: c.label, status: store.data.disabledKeyIds.includes(c.id) ? 'error' : 'ready', attempts: 0, successes: 0, failures: 0, checks: 0, nextCheckAt: stamp(this.now()), history: [{ at: stamp(this.now()), event: 'added', source: 'setup' }] };
     }
+    // A retired key that is no longer configured is dead: drop its record, keep one history line.
+    const configured = new Set(this.credentials.map(c => c.id));
+    for (const [id, r] of Object.entries(store.data.keyRecords!)) if (!configured.has(id) && r.status === 'retired') this.forget(id, 'retired and no longer configured');
     this.credentials = this.credentials.filter(c => store.data.keyRecords![c.id].status !== 'retired');
     if (store.data.activeKeyId && store.data.keyRecords![store.data.activeKeyId]?.status === 'retired') delete store.data.activeKeyId;
   }
+  private configuredIds() { return new Set([...new Set([this.config.apiKey, ...(this.config.backupKeys ?? [])])].map(key => createHash('sha256').update(key).digest('hex').slice(0, 16))); }
+  private forget(id: string, reason: string) {
+    const d = this.store.data; const record = d.keyRecords![id]; if (!record) return;
+    delete d.keyRecords![id];
+    d.removedKeys = [...(d.removedKeys ?? []), { label: record.label, removedAt: stamp(this.now()), reason }].slice(-50);
+    d.disabledKeyIds = d.disabledKeyIds?.filter(x => x !== id);
+    if (d.activeKeyId === id) delete d.activeKeyId;
+  }
+  /** The owner's Remove button: only retired keys or keys no longer in the environment. */
+  async remove(id: string): Promise<void> {
+    const record = this.store.data.keyRecords![id];
+    if (!record || (record.status !== 'retired' && this.configuredIds().has(id))) throw new Error('Only retired or unconfigured keys can be removed. A configured key with no credit comes back after a recharge.');
+    this.forget(id, 'removed by the owner'); this.credentials = this.credentials.filter(c => c.id !== id); await this.store.save();
+  }
+  /** Records of keys that left the environment without being retired (e.g. out of credit). */
+  private unconfigured() { const configured = this.configuredIds(); return Object.entries(this.store.data.keyRecords!).filter(([id, r]) => !configured.has(id) && r.status !== 'retired').map(([id, r]) => ({ ...r, id, selected: false })); }
   async initialize() { await this.store.save(); }
   list() { return this.credentials.map(c => ({ ...this.record(c.id), id: c.id, selected: this.store.data.activeKeyId === c.id })); }
   private archived() { return Object.entries(this.store.data.keyRecords!).filter(([, r]) => r.status === 'retired').map(([id, r]) => ({ ...r, id, selected: false })); }
@@ -147,10 +166,10 @@ export class KeyPool {
   start() { if (this.timer) return; const tick = () => void this.checkDue().catch(() => console.warn('Key status check deferred; storage unavailable.')); this.timer = setInterval(tick, 60_000); this.timer.unref(); tick(); }
   async stop() { this.stopped = true; clearInterval(this.timer); this.probeAbort?.abort(); await this.checking; }
   panel(id?: string, page = 0): { text: string; buttons: Buttons } {
-    const retired = this.archived(), rows = id === 'retired' ? retired : this.list();
+    const retired = [...this.archived(), ...this.unconfigured()], rows = id === 'retired' ? retired : this.list();
     const r = [...rows, ...retired].find(x => x.id === id);
     const time = (v?: string) => v ? new Date(v).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }) + ' IST' : 'not yet';
-    if (!r) return { text: `${id === 'retired' ? 'Retired keys' : 'API key status'} · ${rows.length} keys\n\n` + rows.map(x => `${x.selected ? '▶ ' : ''}${x.label}: ${x.status}${x.lastError ? ' (' + x.lastError + ')' : ''}\nTask successes: ${x.successes} · Failures: ${x.failures}\nLast success: ${time(x.lastSuccessAt)}`).join('\n\n') + '\n\nAuto checks: healthy keys every 6h; credit/auth/limit failures every 30m; network/server failures every 2m. Checks wait while a task runs. After 48h of consecutive authentication failures, a fresh failed check permanently removes the key from routing and checks. History is kept. Status is historical, not a credit balance.', buttons: [...rows.map(x => [button(x.label + ' · history', `keyhistory ${x.id} 0`)]), ...(id !== 'retired' && retired.length ? [[button(`Retired keys (${retired.length})`, 'keys retired')]] : []), [button(id === 'retired' ? 'Active keys' : 'Refresh', 'keys')], ...BACK] };
+    if (!r) return { text: `${id === 'retired' ? 'Retired keys' : 'API key status'} · ${rows.length} keys\n\n` + rows.map(x => `${x.selected ? '▶ ' : ''}${x.label}: ${x.status}${x.lastError ? ' (' + x.lastError + ')' : ''}\nTask successes: ${x.successes} · Failures: ${x.failures}\nLast success: ${time(x.lastSuccessAt)}`).join('\n\n') + '\n\nAuto checks: healthy keys every 6h; credit/auth/limit failures every 30m; network/server failures every 2m. Checks wait while a task runs. After 48h of consecutive authentication failures, a fresh failed check permanently removes the key from routing and checks. History is kept. Status is historical, not a credit balance.', buttons: [...rows.map(x => [button(x.label + ' · history', `keyhistory ${x.id} 0`), ...(id === 'retired' ? [button('Remove ' + x.label, `keyremove ${x.id}`)] : [])]), ...(id !== 'retired' && retired.length ? [[button(`Retired keys (${retired.length})`, 'keys retired')]] : []), [button(id === 'retired' ? 'Active keys' : 'Refresh', 'keys')], ...BACK] };
     const pages = Math.max(1, Math.ceil(r.history.length / 8)), p = Math.max(0, Math.min(pages - 1, page));
     const history = [...r.history].reverse().slice(p * 8, (p + 1) * 8);
     return { text: `${r.label} · ${r.status}${r.selected ? ' · selected' : ''}\nAttempts: ${r.attempts} · Completed: ${r.successes} · Failures: ${r.failures} · Checks: ${r.checks}\nLast success: ${time(r.lastSuccessAt)}\nLast failure: ${time(r.lastFailureAt)}\nLast check: ${time(r.lastCheckAt)}\n${r.retiredAt ? 'Retired: ' + time(r.retiredAt) : 'Next check: ' + time(r.nextCheckAt)}${r.authFailureSince ? '\nAuthentication failures since: ' + time(r.authFailureSince) : ''}\n\nHistory ${p + 1}/${pages}\n` + history.map(h => `${time(h.at)}\n${h.event}${h.reason ? ': ' + h.reason : ''} · ${h.source}`).join('\n\n'), buttons: [...(p > 0 ? [[button('Newer', `keyhistory ${id} ${p - 1}`)]] : []), ...(p + 1 < pages ? [[button('Older', `keyhistory ${id} ${p + 1}`)]] : []), [button('All keys', 'keys')], ...BACK] };
