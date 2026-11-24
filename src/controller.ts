@@ -316,7 +316,9 @@ export class Controller {
     const argument = match?.[2]?.trim() ?? '';
     const stopping = command === 'stop' && !!this.running;
     const incomingMedia = !!(message.voice || message.document || message.photo?.length || message.video || message.video_note || message.animation || message.audio);
-    const ownerWork = (!command && !!text) || incomingMedia || command === 'run' || command === 'stop';
+    // Switching chats or projects is allowed while a task runs; like new work, it cancels the task's pending project change.
+    const switching = ['new', 'fresh'].includes(command ?? '') || (['session', 'project'].includes(command ?? '') && !!argument);
+    const ownerWork = (!command && !!text) || incomingMedia || command === 'run' || command === 'stop' || switching;
     if (ownerWork && this.conversation?.projectChange) {
       delete this.conversation.projectChange; this.conversation.changeCancelledByOwner = true;
     }
@@ -361,7 +363,7 @@ export class Controller {
       this.running?.abort.abort();
       return this.say('Stop requested; queue paused. File edits already made are kept; external effects are not undone. Resume queued work from /queue.');
     }
-    if (this.pump && command && !['run', 'get', 'files'].includes(command)) return this.say('Busy with your current task. New messages steer it; switch chats or settings after it finishes.');
+    if (this.pump && command && !['run', 'get', 'files', 'session', 'new', 'fresh', 'project', 'rename'].includes(command)) return this.say('Busy with your current task. New messages steer it; change settings after it finishes. You can switch chats now; messages in another chat are queued.');
     if (this.persistenceFailed) return this.say('State storage failed. Restart only after checking the persistent disk; new tasks are disabled.');
     try {
       const root = await this.workspace();
@@ -458,8 +460,8 @@ export class Controller {
     // startup window so rapid consecutive messages join the very first task.
     while (this.pump && !this.conversation && (!this.running || this.running.task.kind === 'agent') && !this.store.data.queuePaused) await new Promise(r => setTimeout(r, 5));
     const active = this.conversation;
-    if (active?.input.accepting && !active.abort.signal.aborted) {
-      if (active.task.project !== this.store.data.project || this.resolveChat(active.task.chatKey) !== this.resolveChat(this.chatKey())) return this.say('Another saved chat is running. Stop it before starting work in this chat. Your message was not queued.');
+    const otherChat = !!active && (active.task.project !== this.store.data.project || this.resolveChat(active.task.chatKey) !== this.resolveChat(this.chatKey()));
+    if (active?.input.accepting && !active.abort.signal.aborted && !otherChat) {
       const release = active.input.reserve()!;
       const record: SteerRecord = { messageContext, id: randomUUID(), text: prompt, displayText: displayPrompt, voiceInput, attachedFiles, status: 'preparing' };
       (active.task.steers ??= []).push(record); active.extendDeadline?.();
@@ -470,6 +472,7 @@ export class Controller {
     if (this.store.data.queuePaused) return this.say('Processing is paused. Resume from /queue, then send your instruction. Your message was not queued.');
     await this.automation.enqueue({ kind: 'agent', messageContext, project: this.store.data.project, chatKey: this.chatKey(), prompt, displayPrompt, voiceInput, attachedFiles, settings: { ...this.settings }, interactive: true });
     this.kick();
+    if (otherChat) await this.say('Another chat is running. This message is queued for this chat and starts when that task finishes. See /queue.');
   }
 
   private prepareSteer(active: NonNullable<Controller['conversation']>, record: SteerRecord, release: () => void): void {

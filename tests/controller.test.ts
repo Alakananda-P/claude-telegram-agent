@@ -350,7 +350,7 @@ test('busy task accepts steering, blocks project changes, /status stays responsi
   await bot.handle(message('first'));
   await ready;
   await bot.handle(message('second'));
-  await bot.handle(message('/project forbidden'));
+  await bot.handle(message('/model sonnet'));
   await bot.handle(message('/status'));
   assert.equal(calls, 1);
   assert.equal(store.data.project, 'default');
@@ -361,6 +361,31 @@ test('busy task accepts steering, blocks project changes, /status stays responsi
   assert.equal(store.data.active, null);
   assert.equal(store.data.queuePaused, true);
   assert.equal(store.data.tasks!.filter(t => t.status === 'queued').length, 0);
+});
+
+test('while a task runs the owner can switch chats and projects; work for another chat is queued, not refused', async () => {
+  const prompts: string[] = []; let release!: () => void; const hold = new Promise<void>(resolve => { release = resolve; });
+  let started!: () => void; const ready = new Promise<void>(resolve => { started = resolve; });
+  const runner: Runner = { async run(request, emit) {
+    prompts.push(request.prompt); await emit({ type: 'session', id: 'chat-' + prompts.length });
+    if (prompts.length === 1) { started(); await hold; }
+    return { text: 'Done ' + prompts.length, session: 'chat-' + prompts.length, cumulativeCost: 0 };
+  } };
+  const { bot, replies, store } = await setup(runner);
+  await bot.handle(message('long job')); await ready;
+  try {
+    await bot.handle(message('/new'));
+    assert.ok(!replies.some(r => /busy/i.test(r)), 'chat switching is not blocked');
+    await bot.handle(message('quick question in the new chat'));
+    assert.ok(replies.some(r => /queued/i.test(r)));
+    assert.ok(!replies.some(r => /not queued/i.test(r)));
+    const queued = store.data.tasks!.filter(t => t.status === 'queued');
+    assert.equal(queued.length, 1); assert.match(queued[0].prompt, /quick question/);
+    await bot.handle(message('/project side-work'));
+    assert.equal(store.data.project, 'side-work');
+  } finally { release(); await bot.idle(); }
+  assert.equal(prompts.length, 2); assert.match(prompts[1], /quick question/);
+  assert.equal(store.data.tasks!.filter(t => t.status === 'completed').length, 2);
 });
 
 test('work continues beyond the former daily cap without budget reservations', async () => {
