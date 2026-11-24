@@ -523,6 +523,24 @@ test('/model buttons come from the model list by family; state only ever stores 
   assert.ok(legacy.includes(saved.settings.model)); assert.ok(saved.tasks.every((t: { settings?: { model: string } }) => !t.settings || legacy.includes(t.settings.model)));
 });
 
+test('fast mode follows the fast price table and effort buttons follow the model\'s supported levels', async () => {
+  const { bot, calls, store, panels, replies } = await setup();
+  await bot.handle(message('/model sonnet')); await bot.handle(message('/fast on'));
+  await bot.handle(message('/fast'));
+  assert.match(replies.at(-1)!, /Fast mode applies to: Fable 5\.2, Opus 5\.5/);
+  await bot.handle(message('sonnet work')); await bot.idle();
+  assert.equal(calls[0].settings?.fast, false, 'Sonnet 5.5 has no fast price');
+  store.data.modelCatalog = { fetchedAt: new Date().toISOString(), models: [{ id: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6', family: 'sonnet', createdAt: '2027-02-17T00:00:00Z', efforts: ['low', 'medium', 'high', 'max'] }] };
+  await bot.handle(message('/efforts xhigh'));
+  assert.match(replies.at(-1)!, /low, medium, high, max/);
+  store.data.settings!.effort = 'xhigh';
+  await bot.handle(message('/efforts'));
+  assert.deepEqual(panels.at(-1)!.buttons.flat().filter(b => b.callback_data.startsWith('efforts ')).map(b => b.callback_data), ['efforts low', 'efforts medium', 'efforts high', 'efforts max']);
+  await bot.handle(message('effort work')); await bot.idle();
+  assert.equal(calls[1].settings?.effort, 'high', 'an unsupported saved level runs at the nearest lower supported level');
+  assert.equal(store.data.settings!.effort, 'xhigh', 'the saved choice is kept');
+});
+
 test('model controls persist across restarts, validate choices, and reach each job', async () => {
   const { bot, calls, store, replies, dataDir } = await setup();
   await bot.handle(message('/model sonnet'));
@@ -540,7 +558,7 @@ test('model controls persist across restarts, validate choices, and reach each j
   await bot.handle(message('fable task')); await bot.idle();
   assert.equal(calls[2].settings?.model, 'claude-fable-5-2', 'the newest Fable runs');
   assert.equal(store.data.settings?.model, 'claude-fable-5-1', 'state keeps the old id so a rolled-back version still loads it');
-  assert.equal(calls[2].settings?.fast, false);
+  assert.equal(calls[2].settings?.fast, true, 'Fable 5.2 is in the fast-mode price table');
   assert.equal(store.data.settings?.fast, true);
   await bot.handle(message('/efforts nonsense'));
   assert.match(replies.at(-1)!, /low.*medium.*high/i);

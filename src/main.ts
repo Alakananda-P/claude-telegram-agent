@@ -116,7 +116,7 @@ async function main(): Promise<void> {
       { command: 'menu', description: 'Open control panel' },
       { command: 'model', description: 'Choose Fable, Opus or Sonnet' },
       { command: 'efforts', description: 'Choose reasoning effort' },
-      { command: 'fast', description: 'Opus Fast mode on or off' },
+      { command: 'fast', description: 'Fast mode on or off (supported models)' },
       { command: 'session', description: 'Saved chats and resume' },
       { command: 'rename', description: 'Rename the current chat' },
       { command: 'memory', description: 'Shared long-term memory' },

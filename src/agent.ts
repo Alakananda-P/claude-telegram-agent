@@ -84,7 +84,8 @@ export class ClaudeRunner implements Runner {
   constructor(private config: Config, private makeQuery: QueryFactory = query, private idle: IdleLimits = IDLE_LIMITS) {}
 
   async run(request: AgentRequest, emit: (event: AgentEvent) => void | Promise<void>, abort: AbortController): Promise<AgentResult> {
-    const selected = effectiveSettings(request.settings ?? this.config);
+    // Request settings were resolved by the controller (newest model, fast table, supported effort).
+    const selected = request.settings ?? effectiveSettings(this.config);
     const memory = new SharedMemory(this.config.dataDir, configSecrets(this.config));
     const memoryText = request.memoryEnabled === false ? '' : await memory.context(request.prompt);
     const memoryPrompt = request.memoryEnabled === false

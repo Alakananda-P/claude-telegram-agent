@@ -17,14 +17,17 @@ export function settingsFamily(s: AgentSettings): string { return s.family ?? fa
 export function familySettings(family: string): { model: string; family?: string } {
   return Object.hasOwn(MODELS, family) ? { model: MODELS[family as keyof typeof MODELS] } : { model: MODELS.opus, family };
 }
-export function effectiveSettings(settings: AgentSettings): AgentSettings {
-  return { ...settings, fast: settings.fast && settings.model === MODELS.opus };
+/** Models with fast-mode prices in the built-in table; the price book adds any the pricing page lists. */
+export const FAST_MODELS = ['claude-fable-5-2', 'claude-opus-5-5'];
+export function effectiveSettings(settings: AgentSettings, fastAllowed: (model: string) => boolean = model => FAST_MODELS.includes(model)): AgentSettings {
+  return { ...settings, fast: settings.fast && fastAllowed(settings.model) };
 }
 export function modelLabel(model: string): string {
   const m = /^claude-([a-z]+)-(\d{1,2})(?:-(\d{1,2}))?(?:-\d{8})?$/.exec(model);
   return m ? m[1][0].toUpperCase() + m[1].slice(1) + ' ' + m[2] + (m[3] ? '.' + m[3] : '') : model;
 }
 export function settingsLabel(settings: AgentSettings): string {
-  const s = effectiveSettings(settings);
+  // Callers pass settings that are already effective (fast and effort resolved for the model).
+  const s = settings;
   return `${modelLabel(s.model)} · ${s.fast ? 'Fast' : 'Standard'} · ${s.effort} effort`;
 }
