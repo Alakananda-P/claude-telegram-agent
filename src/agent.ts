@@ -283,7 +283,9 @@ export class ClaudeRunner implements Runner {
             corrections.set(correction, pending); continue;
           }
           if (ids.some(id => corrections.has(id))) repairingResponse = false;
-          initialAnswered ||= answeredIds.includes(input.initialId) || !ids.length;
+          // Owner messages are consumed FIFO after the first prompt, so an
+          // acknowledged later message also acknowledges the first prompt.
+          initialAnswered ||= answeredIds.includes(input.initialId) || !ids.length || answeredIds.some(id => input.messages.some(m => m.id === id));
           output = { text: event.result, session: event.session_id, cumulativeCost: event.total_cost_usd };
           const acknowledged = input.acknowledge(answeredIds); await emit({ type: 'steered', ids: acknowledged });
           if (initialAnswered && !background.count && await input.complete(abort.signal)) break;

@@ -168,16 +168,53 @@ test('a result that keeps the turn open reports why, without any message text', 
   const steering = new SteeringInput(); const events: AgentEvent[] = [];
   const make: QueryFactory = ({ prompt }) => ({ async *[Symbol.asyncIterator]() {
     const incoming = (prompt as AsyncIterable<import('@anthropic-ai/claude-agent-sdk').SDKUserMessage>)[Symbol.asyncIterator]();
-    await incoming.next(); yield init as SDKMessage;
-    // An owner message folded into the first turn; the result echoes only that message.
-    const release = steering.reserve()!; const folded = steering.add('private follow-up'); release();
-    yield { ...result, result: 'Private answer', user_message_uuids: [folded.id] } as unknown as SDKMessage;
+    const first = (await incoming.next()).value!; yield init as SDKMessage;
+    // An owner follow-up arrives after the first turn started; the result answers only the first prompt.
+    const release = steering.reserve()!; const later = steering.add('private follow-up'); release();
+    yield { ...result, result: 'Private answer', user_message_uuids: [first.uuid] } as unknown as SDKMessage;
+    await incoming.next();
+    yield { ...result, uuid: 'result-two', result: 'Private second answer', user_message_uuids: [later.id] } as unknown as SDKMessage;
   }, close() {} });
   const output = await new ClaudeRunner(config, make).run({ prompt: 'Private request', cwd: '/work', steering }, e => { events.push(e); }, new AbortController());
-  assert.equal(output.text, 'Private answer');
+  assert.equal(output.text, 'Private second answer');
   const held = events.filter(e => e.type === 'held_open');
-  assert.deepEqual(held, [{ type: 'held_open', initialAnswered: false, helpers: 0, unanswered: 0, preparing: 0, ackIds: 1, initialInAck: false }]);
+  assert.deepEqual(held, [{ type: 'held_open', initialAnswered: true, helpers: 0, unanswered: 1, preparing: 0, ackIds: 1, initialInAck: true }]);
   assert.doesNotMatch(JSON.stringify(held), /Private/);
+});
+
+test('a steer folded into the first turn also acknowledges the first prompt and closes the turn', async () => {
+  const steering = new SteeringInput(); const events: AgentEvent[] = [];
+  const make: QueryFactory = ({ prompt }) => ({ async *[Symbol.asyncIterator]() {
+    const incoming = (prompt as AsyncIterable<import('@anthropic-ai/claude-agent-sdk').SDKUserMessage>)[Symbol.asyncIterator]();
+    await incoming.next(); yield init as SDKMessage;
+    const release = steering.reserve()!; const folded = steering.add('also add totals'); release();
+    // The SDK reports only the latest consumed uuid for a folded turn.
+    yield { ...result, result: 'Done with totals', user_message_uuids: [folded.id] } as unknown as SDKMessage;
+  }, close() {} });
+  const output = await new ClaudeRunner(config, make).run({ prompt: 'Make the sheet', cwd: '/work', steering }, e => { events.push(e); }, new AbortController());
+  assert.equal(output.text, 'Done with totals');
+  assert.equal(steering.accepting, false);
+  assert.deepEqual(events.filter(e => e.type === 'held_open'), []);
+});
+
+test('a helper hand-back consumed by a later non-notification result stops holding the turn open', async () => {
+  const steering = new SteeringInput();
+  const make: QueryFactory = ({ prompt }) => ({ async *[Symbol.asyncIterator]() {
+    const incoming = (prompt as AsyncIterable<import('@anthropic-ai/claude-agent-sdk').SDKUserMessage>)[Symbol.asyncIterator]();
+    const first = (await incoming.next()).value!; yield init as SDKMessage;
+    yield { type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: 'audit', run_id: 'run-1', task_type: 'local_agent', description: 'Audit' }] } as unknown as SDKMessage;
+    yield { ...result, result: 'Helper is running.', origin: { kind: 'human' }, user_message_uuids: [first.uuid] } as unknown as SDKMessage;
+    const update = steering.add('Status?'); const next = (await incoming.next()).value!;
+    yield { type: 'system', subtype: 'task_notification', task_id: 'audit', run_id: 'run-1', status: 'completed', summary: 'Audit done' } as unknown as SDKMessage;
+    yield { type: 'system', subtype: 'background_tasks_changed', tasks: [] } as unknown as SDKMessage;
+    // This turn was already running when the hand-back was queued.
+    yield { ...result, uuid: 'r2', result: 'Still waiting for the audit.', origin: { kind: 'human' }, user_message_uuids: [next.uuid] } as unknown as SDKMessage;
+    assert.equal(update.answered, true); assert.equal(steering.accepting, true);
+    // The SDK folds the hand-back into a later turn whose origin is not task-notification.
+    yield { ...result, uuid: 'r3', result: 'Audit report: all good', origin: { kind: 'human' } } as unknown as SDKMessage;
+  }, close() {} });
+  const answer = await new ClaudeRunner(config, make).run({ prompt: 'Audit', cwd: '/work', steering }, () => {}, new AbortController());
+  assert.equal(answer.text, 'Audit report: all good'); assert.equal(steering.accepting, false);
 });
 
 test('a notification-only completion cannot finish the pending human turn', async () => {

@@ -8,6 +8,8 @@ export class NativeBackground {
   private draining = new Set<string>();
   private notified = new Set<string>();
   private consumed = new Set<string>();
+  /** Notified helpers that have already seen one result after their notification. */
+  private waited = new Set<string>();
   private runs = new Map<string, string>();
   get count() { return new Set([...this.live, ...this.draining, ...this.notified]).size; }
   private key(id: string, run?: string) { return id + ':' + (run ?? this.runs.get(id) ?? ''); }
@@ -21,7 +23,13 @@ export class NativeBackground {
         const delivered = !origin
           || (origin.kind === 'task-notification' && (!origin.runId || key.endsWith(':' + origin.runId)))
           || (origin.kind === 'peer' && !!origin.senderTaskId && key === this.key(origin.senderTaskId));
-        if (delivered) { this.consumed.add(key); this.draining.delete(key); this.notified.delete(key); }
+        // The first result after a notification may belong to a turn that was
+        // already running. Any later result comes from a turn that started after
+        // the hand-back was queued, so a helper that has left the SDK's live list
+        // is settled even when that result carries another origin (H-26).
+        const settled = !this.live.has(key) && this.waited.has(key);
+        if (delivered || settled) { this.consumed.add(key); this.draining.delete(key); this.notified.delete(key); this.waited.delete(key); }
+        else this.waited.add(key);
       }
     }
     if (event.type !== 'system') return;
