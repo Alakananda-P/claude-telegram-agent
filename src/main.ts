@@ -53,6 +53,7 @@ async function main(): Promise<void> {
   refreshModels();
   const modelTimer = setInterval(refreshModels, 60 * 60_000); modelTimer.unref();
   const controller = new Controller(config, store, telegram, new ResilientRunner(config, store, undefined, undefined, keys), ledger, new HaikuTitles(config, ledger, undefined, () => keys.selectedConfig()), keys);
+  controller.models = models;
   const shutdown = new AbortController();
   let stopping = false;
   const stop = () => {

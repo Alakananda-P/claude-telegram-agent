@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { EFFORTS, type Effort } from './settings.js';
+import { EFFORTS, familyOf, type Effort } from './settings.js';
 import type { StateStore } from './state.js';
 
 /** One Claude model as listed by the Anthropic Models API (GET /v1/models). */
@@ -26,8 +26,7 @@ const catalogModel = z.object({ id: modelId, label: z.string().min(1).max(80), f
   efforts: z.array(z.enum(EFFORTS)).optional(), lifecycle: z.string().max(32).optional(), retiresAt: z.string().nullable().optional() });
 const catalogState = z.object({ fetchedAt: z.string(), models: z.array(catalogModel).max(500) });
 
-/** Family of a model id when the API gives no `line`, e.g. claude-fable-5-2 -> fable. */
-export function familyOf(id: string): string | undefined { return /^claude-([a-z]+)-/.exec(id)?.[1]; }
+export { familyOf };
 
 /** Parses one Models API page. Entries that do not match the expected shape are skipped, never trusted. */
 export function parseModels(page: unknown): CatalogModel[] {

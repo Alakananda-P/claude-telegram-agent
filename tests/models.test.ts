@@ -6,6 +6,7 @@ import path from 'node:path';
 import { StateStore } from '../src/state.js';
 import { BUILTIN_MODELS, ModelCatalog, fetchModels, parseModels, type FetchLike } from '../src/models.js';
 import { loadConfig } from '../src/config.js';
+import { modelLabel } from '../src/settings.js';
 
 const fixture = async () => JSON.parse(await readFile(path.join(import.meta.dirname, 'fixtures-models-2026-11-25.json'), 'utf8'));
 const store = async () => StateStore.open(path.join(await mkdtemp(path.join(tmpdir(), 'tg-models-')), 'state.json'));
@@ -55,4 +56,15 @@ test('ALLOWED_MODEL_FAMILIES sets the families and rejects malformed values', ()
   assert.deepEqual(loadConfig(base).modelFamilies, ['fable', 'opus', 'sonnet']);
   assert.deepEqual(loadConfig({ ...base, ALLOWED_MODEL_FAMILIES: 'opus, haiku' }).modelFamilies, ['opus', 'haiku']);
   assert.throws(() => loadConfig({ ...base, ALLOWED_MODEL_FAMILIES: 'opus;rm -rf' }), /ALLOWED_MODEL_FAMILIES/);
+});
+
+test('CLAUDE_MODEL accepts a family or any model id of an allowed family and is stored as a rollback-safe id', () => {
+  const base = { TELEGRAM_BOT_TOKEN: '123456:abcdefghijklmnopqrstuvw', TELEGRAM_OWNER_ID: '123', ANTHROPIC_API_KEY: 'test-only' };
+  assert.equal(loadConfig({ ...base, CLAUDE_MODEL: 'claude-fable-5-2' }).model, 'claude-fable-5-1');
+  assert.equal(loadConfig({ ...base, CLAUDE_MODEL: 'opus' }).model, 'claude-opus-5-5');
+  const haiku = loadConfig({ ...base, CLAUDE_MODEL: 'claude-haiku-5-5', ALLOWED_MODEL_FAMILIES: 'opus,haiku' });
+  assert.equal(haiku.model, 'claude-opus-5-5'); assert.equal(haiku.modelFamily, 'haiku');
+  assert.throws(() => loadConfig({ ...base, CLAUDE_MODEL: 'claude-haiku-5-5' }), /CLAUDE_MODEL/);
+  assert.throws(() => loadConfig({ ...base, CLAUDE_MODEL: 'gpt-5' }), /CLAUDE_MODEL/);
+  assert.deepEqual(['claude-fable-5-2', 'claude-opus-4-5-20251101', 'claude-opus-5', 'claude-haiku-5-5', 'something-else'].map(modelLabel), ['Fable 5.2', 'Opus 4.5', 'Opus 5', 'Haiku 5.5', 'something-else']);
 });

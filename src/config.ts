@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { MODELS, EFFORTS, type Effort } from './settings.js';
+import { MODELS, EFFORTS, familyOf, familySettings, type Effort } from './settings.js';
 
 export interface Config {
   token: string; owner: number; apiKey: string; dataDir: string;
@@ -7,6 +7,8 @@ export interface Config {
   maxTurns: number; timeoutMs: number;
   /** Model families offered in /model (ALLOWED_MODEL_FAMILIES); the newest model of each comes from the Models API. */
   modelFamilies: string[];
+  /** Set only when CLAUDE_MODEL names a family without an old id (see familySettings). */
+  modelFamily?: string;
   backupKeys?: string[]; backupEncryptionKey?: string;
   keyLabels?: string[]; elevenLabsKey?: string;
 }
@@ -32,12 +34,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   if ((env.CLAUDE_PERMISSION_MODE ?? 'auto') !== 'auto') throw new Error('CLAUDE_PERMISSION_MODE must be auto; bypass is not enabled.');
   const effort = (env.CLAUDE_EFFORT ?? 'high') as Effort;
   if (!EFFORTS.includes(effort)) throw new Error('CLAUDE_EFFORT must be low, medium, high, xhigh or max.');
-  const model = env.CLAUDE_MODEL ?? MODELS.opus;
-  if (!Object.values(MODELS).includes(model as typeof MODELS.opus)) throw new Error('CLAUDE_MODEL must be claude-fable-5-1, claude-opus-5-5 or claude-sonnet-5-5.');
   if (!['true', 'false'].includes(env.CLAUDE_FAST_MODE ?? 'true')) throw new Error('CLAUDE_FAST_MODE must be true or false.');
   const families = (env.ALLOWED_MODEL_FAMILIES ?? 'fable,opus,sonnet').split(',').map(f => f.trim());
   if (!families.length || families.length > 8 || families.some(f => !/^[a-z]{1,32}$/.test(f))) throw new Error('ALLOWED_MODEL_FAMILIES must be a comma-separated list of model families, e.g. fable,opus,sonnet.');
   const modelFamilies = [...new Set(families)];
+  // CLAUDE_MODEL names a family (opus) or any model id of an allowed family; the newest model of that family runs.
+  const requested = env.CLAUDE_MODEL ?? MODELS.opus;
+  const requestedFamily = /^[a-z]{1,32}$/.test(requested) ? requested : /^claude-[a-z0-9-]{1,80}$/.test(requested) ? familyOf(requested) : undefined;
+  if (!requestedFamily || !modelFamilies.includes(requestedFamily)) throw new Error('CLAUDE_MODEL must be a model family from ALLOWED_MODEL_FAMILIES (for example opus) or a Claude model id in one of them.');
+  const { model, family: modelFamily } = familySettings(requestedFamily);
   const maxTurns = positive('MAX_TURNS', 50);
   if (!Number.isInteger(maxTurns)) throw new Error('MAX_TURNS must be an integer.');
   let backupKeys: string[] = [];
@@ -51,7 +56,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
   if (backupEncryptionKey && !/^[a-f0-9]{64}$/i.test(backupEncryptionKey)) throw new Error('Set BACKUP_ENCRYPTION_KEY to 32 random bytes encoded as hex.');
   return { token, owner, apiKey: required('ANTHROPIC_API_KEY'), model, backupKeys, backupEncryptionKey, keyLabels, elevenLabsKey: env.ELEVENLABS_API_KEY?.trim() || undefined,
-    effort, fast: (env.CLAUDE_FAST_MODE ?? 'true') === 'true', permissionMode: 'auto', maxTurns, modelFamilies,
+    effort, fast: (env.CLAUDE_FAST_MODE ?? 'true') === 'true', permissionMode: 'auto', maxTurns, modelFamilies, ...(modelFamily ? { modelFamily } : {}),
     timeoutMs: positive('JOB_TIMEOUT_MINUTES', 20) * 60_000,
     dataDir: path.resolve(env.DATA_DIR ?? './data') };
 }

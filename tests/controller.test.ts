@@ -10,6 +10,7 @@ import { loadConfig } from '../src/config.js';
 import { StateStore } from '../src/state.js';
 import type { Message } from '../src/safety.js';
 import type { Buttons } from '../src/ui.js';
+import { parseModels } from '../src/models.js';
 import { TranscriptionError, type TranscriptionService } from '../src/transcription.js';
 
 const message = (text: string): Message => ({ from: { id: 123 }, chat: { id: 123, type: 'private' }, text });
@@ -502,6 +503,26 @@ test('timeout still aborts bounded work without a spending cap', async () => {
   assert.equal((await StateStore.open(store.file)).data.tasks![0].failureKind, 'timeout');
 });
 
+test('/model buttons come from the model list by family; state only ever stores ids the previous version accepts', async () => {
+  const { bot, calls, store, panels, config } = await setup();
+  const page = JSON.parse(await readFile(path.join(import.meta.dirname, 'fixtures-models-2026-11-25.json'), 'utf8'));
+  store.data.modelCatalog = { fetchedAt: new Date().toISOString(), models: parseModels(page) };
+  config.modelFamilies.push('haiku');
+  await bot.handle(message('/model'));
+  const buttons = panels.at(-1)!.buttons.flat();
+  assert.deepEqual(buttons.filter(b => b.callback_data.startsWith('model ')).map(b => [b.text.replace('✓ ', ''), b.callback_data]),
+    [['Fable 5.2', 'model fable'], ['Opus 5.5', 'model opus'], ['Sonnet 5.5', 'model sonnet'], ['Haiku 5.5', 'model haiku']]);
+  await bot.callback({ id: 'm', from: { id: 123 }, message: { ...message(''), message_id: 90 }, data: 'model haiku' });
+  assert.deepEqual(store.data.settings && { model: store.data.settings.model, family: store.data.settings.family }, { model: 'claude-opus-5-5', family: 'haiku' });
+  await bot.handle(message('haiku work')); await bot.idle();
+  assert.equal(calls[0].settings?.model, 'claude-haiku-5-5');
+  await bot.handle(message('/model claude-fable-5-2'));
+  assert.equal(store.data.settings?.model, 'claude-fable-5-1'); assert.equal(store.data.settings?.family, undefined);
+  const legacy = ['claude-fable-5-1', 'claude-opus-5-5', 'claude-sonnet-5-5'];
+  const saved = JSON.parse(await readFile(store.file, 'utf8'));
+  assert.ok(legacy.includes(saved.settings.model)); assert.ok(saved.tasks.every((t: { settings?: { model: string } }) => !t.settings || legacy.includes(t.settings.model)));
+});
+
 test('model controls persist across restarts, validate choices, and reach each job', async () => {
   const { bot, calls, store, replies, dataDir } = await setup();
   await bot.handle(message('/model sonnet'));
@@ -517,7 +538,8 @@ test('model controls persist across restarts, validate choices, and reach each j
   assert.equal(calls[1].settings?.fast, true);
   await bot.handle(message('/model fable'));
   await bot.handle(message('fable task')); await bot.idle();
-  assert.equal(calls[2].settings?.model, 'claude-fable-5-1');
+  assert.equal(calls[2].settings?.model, 'claude-fable-5-2', 'the newest Fable runs');
+  assert.equal(store.data.settings?.model, 'claude-fable-5-1', 'state keeps the old id so a rolled-back version still loads it');
   assert.equal(calls[2].settings?.fast, false);
   assert.equal(store.data.settings?.fast, true);
   await bot.handle(message('/efforts nonsense'));
