@@ -14,6 +14,7 @@ export class SteeringInput {
   private listeners = new Set<() => void>();
   private changed() { for (const wake of [...this.listeners]) wake(); }
   get accepting() { return this.open; }
+  get pendingPreparations() { return this.preparing; }
   reserve(): (() => void) | undefined {
     if (!this.open) return;
     this.preparing++; let released = false;

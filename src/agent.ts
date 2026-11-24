@@ -16,7 +16,9 @@ export type AgentEvent = { type: 'session'; id: string } | { type: 'progress'; t
   | { type: 'commentary'; id: string; text: string } | { type: 'steered'; ids: string[] }
   | { type: 'usage'; session: string; id: string; models: Record<string, unknown>; cost: number }
   | { type: 'step'; session: string; id: string; model: string; usage: Record<string, unknown>; complete: boolean }
-  | { type: 'speed'; state: string } | { type: 'effect'; tool?: string };
+  | { type: 'speed'; state: string } | { type: 'effect'; tool?: string }
+  /** Diagnostic only: a result arrived but the turn stayed open. Never carries message text. */
+  | { type: 'held_open'; initialAnswered: boolean; helpers: number; unanswered: number; preparing: number; ackIds: number; initialInAck: boolean; origin?: string };
 export interface AgentRequest { prompt: string; cwd: string; session?: string; settings?: AgentSettings; memoryEnabled?: boolean; sessions?: SessionCatalog; projects?: ProjectToolContext; workspace?: WorkspaceContext; resumeContext?: string; steering?: SteeringInput }
 export interface AgentResult { text: string; session: string; cumulativeCost: number }
 export interface Runner {
@@ -171,6 +173,9 @@ export class ClaudeRunner implements Runner {
       stream = this.makeQuery({ prompt: input.stream(request.prompt, signal), options });
       let initialAnswered = false, correctionSent = false;
       const corrections = new Map<string, string[]>();
+      const heldOpen = (answeredIds: string[], origin?: string): AgentEvent => ({ type: 'held_open', initialAnswered, helpers: background.count,
+        unanswered: input.messages.filter(m => !m.answered).length, preparing: input.pendingPreparations,
+        ackIds: answeredIds.length, initialInAck: answeredIds.includes(input.initialId), ...(origin ? { origin } : {}) });
       for await (const event of stream) {
         const previousHelpers = background.count;
         background.observe(event);
@@ -266,6 +271,7 @@ export class ClaudeRunner implements Runner {
               output = { text: substantive(event.result) ? event.result : output!.text, session: event.session_id, cumulativeCost: event.total_cost_usd };
               if (!background.count && await input.complete(abort.signal)) break;
             }
+            await emit(heldOpen(answeredIds, event.origin?.kind));
             continue;
           }
           if (!substantive(event.result)) {
@@ -281,6 +287,7 @@ export class ClaudeRunner implements Runner {
           output = { text: event.result, session: event.session_id, cumulativeCost: event.total_cost_usd };
           const acknowledged = input.acknowledge(answeredIds); await emit({ type: 'steered', ids: acknowledged });
           if (initialAnswered && !background.count && await input.complete(abort.signal)) break;
+          await emit(heldOpen(answeredIds, event.origin?.kind));
           // More owner input was accepted before this result, but the provider
           // has not answered it yet. Keep this SDK session and consume its result.
           if (substantive(event.result) && lastPublished !== event.result) {

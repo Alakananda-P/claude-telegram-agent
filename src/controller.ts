@@ -666,6 +666,7 @@ export class Controller {
         } else if (event.type === 'speed') this.store.data.lastSpeed = event.state;
         else if (event.type === 'progress') progress = redact(event.text, configSecrets(this.config));
         else if (event.type === 'helpers') pendingHelpers = event.count;
+        else if (event.type === 'held_open') { const { type: _type, ...why } = event; console.warn(JSON.stringify({ event: 'turn_held_open', task: task.id, ...why })); }
       }, abort);
       abort.signal.throwIfAborted();
       await bind(result.session);

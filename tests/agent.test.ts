@@ -164,6 +164,22 @@ test('late steering survives the first result and finishes in the same SDK conve
   assert.deepEqual(events.filter(e => e.type === 'usage').map(e => e.cost), [0.1, 0.15]);
 });
 
+test('a result that keeps the turn open reports why, without any message text', async () => {
+  const steering = new SteeringInput(); const events: AgentEvent[] = [];
+  const make: QueryFactory = ({ prompt }) => ({ async *[Symbol.asyncIterator]() {
+    const incoming = (prompt as AsyncIterable<import('@anthropic-ai/claude-agent-sdk').SDKUserMessage>)[Symbol.asyncIterator]();
+    await incoming.next(); yield init as SDKMessage;
+    // An owner message folded into the first turn; the result echoes only that message.
+    const release = steering.reserve()!; const folded = steering.add('private follow-up'); release();
+    yield { ...result, result: 'Private answer', user_message_uuids: [folded.id] } as unknown as SDKMessage;
+  }, close() {} });
+  const output = await new ClaudeRunner(config, make).run({ prompt: 'Private request', cwd: '/work', steering }, e => { events.push(e); }, new AbortController());
+  assert.equal(output.text, 'Private answer');
+  const held = events.filter(e => e.type === 'held_open');
+  assert.deepEqual(held, [{ type: 'held_open', initialAnswered: false, helpers: 0, unanswered: 0, preparing: 0, ackIds: 1, initialInAck: false }]);
+  assert.doesNotMatch(JSON.stringify(held), /Private/);
+});
+
 test('a notification-only completion cannot finish the pending human turn', async () => {
   const make: QueryFactory = ({ prompt }) => ({ async *[Symbol.asyncIterator]() {
     const incoming = (prompt as AsyncIterable<import('@anthropic-ai/claude-agent-sdk').SDKUserMessage>)[Symbol.asyncIterator]();
