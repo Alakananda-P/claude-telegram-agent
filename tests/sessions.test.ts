@@ -186,3 +186,15 @@ test('trash expires after 48 hours, restore cancels expiry and purge prevents tr
   assert.equal(store.data.sessions.default, 'active-id');
   assert.equal(store.data.memoryEnabled, true);
 });
+
+test('a task sees its own chat as currentSession, not the chat the owner has selected', async () => {
+  const { catalog, store } = await setup();
+  const scheduled = catalog.scoped('old-id', 'bills');
+  assert.equal(scheduled.context().currentSession, 'old-id');
+  assert.equal(scheduled.list().currentSession, 'old-id');
+  assert.equal(catalog.context().currentSession, 'active-id', 'the owner selection is unchanged');
+  store.data.bindings = { 'schedule-7': 'old-id' };
+  assert.equal(catalog.scoped('schedule-7', 'bills').context().currentSession, 'old-id', 'a bound schedule chat resolves to its session');
+  const fresh = catalog.scoped('schedule-new', 'default').context();
+  assert.equal(fresh.currentSession, null); assert.equal(fresh.currentTitle, 'New chat');
+});

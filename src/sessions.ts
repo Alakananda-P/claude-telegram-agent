@@ -65,9 +65,17 @@ export class SessionCatalog {
     await this.ensureName(to);
     await this.store.save();
   }
-  context() {
-    const current = this.store.data.sessions[this.store.data.project];
-    const currentSession = current ? this.resolve(current, this.store.data.project) : null;
+  /** H-16: the same catalog, but currentSession is the given task chat (a scheduled run or a chat the owner switched away from). */
+  scoped(chatKey: string, project: string): SessionCatalog {
+    const view = Object.create(this) as SessionCatalog;
+    view.context = () => this.contextFor(chatKey, project);
+    return view;
+  }
+  context() { return this.contextFor(this.store.data.sessions[this.store.data.project], this.store.data.project); }
+  private contextFor(current: string | undefined, project: string) {
+    const resolved = current ? this.resolve(current, project) : undefined;
+    // Drafts and schedule chats that have not started a session yet have no saved session.
+    const currentSession = resolved && !/^(draft|schedule)-/.test(resolved) ? resolved : null;
     const record = this.store.data.conversations?.find(s => s.id === currentSession);
     return { total: this.records().length, currentSession,
       currentTitle: record ? this.title(record) : 'New chat', titleSource: record?.titleSource ?? null };
