@@ -4,7 +4,7 @@
 export interface UpdateConfig { renderKey: string; serviceId: string; githubToken: string; sourceRepo: string; backupRepo: string }
 export interface Deploy { id: string; commit: string; status: string }
 /** Saved when the owner confirms /update. */
-export interface UpdateRecord { previousDeployId: string; previousCommit: string; targetCommit: string; deployId?: string; startedAt: string; result?: string; reportedAt?: string }
+export interface UpdateRecord { previousDeployId: string; previousCommit: string; targetCommit: string; deployId?: string; startedAt: string; result?: string; reportedAt?: string; rollbackDeployId?: string; rollbackAt?: string }
 /** What the controller needs; the fake in tests implements the same calls. */
 export type Updates = Pick<UpdateClient, 'liveDeploy' | 'mainCommit' | 'changes' | 'backup' | 'deploy' | 'deployStatus' | 'rollback'>;
 export type Http = (url: string, init: { method: string; headers: Record<string, string>; body?: string; signal: AbortSignal }) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;

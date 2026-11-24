@@ -128,6 +128,7 @@ async function main(): Promise<void> {
       { command: 'stop', description: 'Stop current task' },
       { command: 'plan', description: 'Plan a task first, approve before changes' },
       { command: 'update', description: 'Update the bot to the newest main' },
+      { command: 'de_update', description: 'Roll back the last update' },
       { command: 'new', description: 'Fresh conversation, keep files' },
       { command: 'fresh', description: 'New conversation with completed-work summary' },
       { command: 'project', description: 'Create or switch project' },

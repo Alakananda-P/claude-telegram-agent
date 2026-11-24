@@ -69,6 +69,7 @@ Send a task in plain text, or upload a document with instructions in its caption
 /stop — cancel the running task (does not undo edits)
 /plan TASK — plan first (read-only); you approve the plan before any change
 /update — back up the live bot and deploy the newest main (after your tap)
+/de_update — roll back to the version that was live before the last /update
 /new — fresh conversation, keep project files
 /project NAME — create/switch project while idle
 /projects — named projects, archive and 48-hour Trash
@@ -122,6 +123,7 @@ export class Controller {
   updates?: Updates;
   updatePollMs = 15_000;
   private pendingUpdate?: { token: string; live: Deploy; target: string; expires: number };
+  private pendingRollback?: { token: string; expires: number };
 
   constructor(private config: Config, private store: StateStore, private messenger: Messenger, private runner: Runner, private ledger?: UsageLedger, private titles?: TitleGenerator, private keys = new KeyPool(config, store), private transcriber: TranscriptionService = new Transcriber(config, store)) {
     this.memory = new SharedMemory(config.dataDir, configSecrets(config));
@@ -199,7 +201,7 @@ export class Controller {
     await this.messenger.acknowledge?.(callback.id).catch(() => {});
     const data = callback.data ?? '';
     const projectCallback = /^(pnew|ppage (?:active|archived|trashed) \d+|(?:pinfo|pedit|parchive|parchok|ptrash|ptrashok|prestore|ppurge) [a-zA-Z0-9][a-zA-Z0-9_-]{0,47}|pfiles [a-zA-Z0-9][a-zA-Z0-9_-]{0,47} \d+|ppurgeok [a-f0-9]{8})$/.test(data);
-    if (!/^(menu|help|status|stop|rename|new chat|fresh|model(?: [a-z]{1,32})?|efforts(?: (?:low|medium|high|xhigh|max))?|fast(?: (?:on|off))?|token count|cost|memory(?: (?:on|off|confirm-clear|clear))?|session(?: [a-zA-Z0-9_-]+)?|sessionpage \d+|history [a-zA-Z0-9_-]+ \d+|projects|project [a-zA-Z0-9_-]+|files|batch|process(?: [a-zA-Z0-9_-]+)?|discard [a-zA-Z0-9_-]+|queue(?: (?:pause|resume))?|task(?:cancel|first|retry|confirm) [a-zA-Z0-9_-]+|schedules|schedule(?:pause|resume|delete) [a-zA-Z0-9_-]+|trash|(?:delete|trashmove|restore|purge|purgeconfirm) [a-zA-Z0-9_-]+|backup(?: (?:export|files|daily|off))?|restorebackup confirm|health(?: retry)?|keys(?: retired)?|keyhistory [a-f0-9]{16} \d+|background(?: \d+)?|backgroundlog [a-f0-9]{16} \d+|backgroundcancel [a-f0-9]{16}|plan(?:ok|no) [a-f0-9]{8}|update(?:ok|no) [a-f0-9]{8}|clock)$/.test(data) && !projectCallback) return;
+    if (!/^(menu|help|status|stop|rename|new chat|fresh|model(?: [a-z]{1,32})?|efforts(?: (?:low|medium|high|xhigh|max))?|fast(?: (?:on|off))?|token count|cost|memory(?: (?:on|off|confirm-clear|clear))?|session(?: [a-zA-Z0-9_-]+)?|sessionpage \d+|history [a-zA-Z0-9_-]+ \d+|projects|project [a-zA-Z0-9_-]+|files|batch|process(?: [a-zA-Z0-9_-]+)?|discard [a-zA-Z0-9_-]+|queue(?: (?:pause|resume))?|task(?:cancel|first|retry|confirm) [a-zA-Z0-9_-]+|schedules|schedule(?:pause|resume|delete) [a-zA-Z0-9_-]+|trash|(?:delete|trashmove|restore|purge|purgeconfirm) [a-zA-Z0-9_-]+|backup(?: (?:export|files|daily|off))?|restorebackup confirm|health(?: retry)?|keys(?: retired)?|keyhistory [a-f0-9]{16} \d+|background(?: \d+)?|backgroundlog [a-f0-9]{16} \d+|backgroundcancel [a-f0-9]{16}|plan(?:ok|no) [a-f0-9]{8}|update(?:ok|no) [a-f0-9]{8}|deupdate(?:ok|no) [a-f0-9]{8}|clock)$/.test(data) && !projectCallback) return;
     this.panelId = callback.message.message_id;
     try {
       if (data === 'memory confirm-clear') {
@@ -410,6 +412,7 @@ export class Controller {
     if (this.pump && command && !['run', 'get', 'files', 'session', 'new', 'fresh', 'project', 'rename'].includes(command)) return this.say('Busy with your current task. New messages steer it; change settings after it finishes. You can switch chats now; messages in another chat are queued.');
     if (this.persistenceFailed) return this.say('State storage failed. Restart only after checking the persistent disk; new tasks are disabled.');
     if (command === 'update' || command === 'updateok' || command === 'updateno') return this.updateCommand(command, argument);
+    if (command === 'de_update' || command === 'deupdateok' || command === 'deupdateno') return this.rollbackCommand(command, argument);
     try {
       const root = await this.workspace();
       if (command === 'rename') {
@@ -558,6 +561,31 @@ export class Controller {
     catch (error) { this.store.data.update.result = 'deploy_not_started'; await this.store.save(); return this.say('The deploy could not start; the old version keeps running. ' + (error instanceof UpdateError ? error.message : '')); }
     this.store.data.update.deployId = deployId; await this.store.save();
     await this.say(`Deploy started for ${pending.target.slice(0, 7)}. The new version reports here when it is live; /de_update goes back to ${pending.live.commit.slice(0, 7)}.`);
+    void this.watchDeploy(updates, deployId);
+  }
+  /** /de_update: after the owner's tap, Render rolls back to the deploy that was live before the
+   * last /update (no rebuild). If Render refuses, the saved previous commit is deployed instead. */
+  private async rollbackCommand(command: string, argument: string): Promise<void> {
+    const updates = this.updates; const record = this.store.data.update;
+    if (!updates) return this.say('Updates are not configured. Add RENDER_API_KEY, RENDER_SERVICE_ID, GITHUB_TOKEN and BACKUP_REPOSITORY in Render. Without them, roll back in the Render dashboard: Events > previous deploy > Rollback.');
+    if (!record) return this.say('Nothing to roll back: no /update has been made from this bot yet.');
+    if (command === 'de_update') {
+      const token = randomUUID().replaceAll('-', '').slice(0, 8); this.pendingRollback = { token, expires: Date.now() + 10 * 60_000 };
+      return this.panel(`Roll back to ${record.previousCommit.slice(0, 7)}?\n\nRender switches back to the deploy that was live before the last update (no rebuild). Running work is stopped by the restart.`,
+        [[button('Confirm rollback', 'deupdateok ' + token), button('Cancel', 'deupdateno ' + token)]], 'update');
+    }
+    const pending = this.pendingRollback;
+    if (!pending || pending.token !== argument || pending.expires < Date.now()) return this.say('This rollback confirmation expired. Send /de_update again.');
+    this.pendingRollback = undefined; await this.dismiss('update');
+    if (command === 'deupdateno') return this.say('Rollback cancelled. Nothing changed.');
+    let deployId: string;
+    try { deployId = await updates.rollback(record.previousDeployId); }
+    catch {
+      try { deployId = await updates.deploy(record.previousCommit); }
+      catch (error) { return this.say('Rollback could not start. ' + (error instanceof UpdateError ? error.message : '') + ' Use the Render dashboard: Events > previous deploy > Rollback.'); }
+    }
+    record.rollbackDeployId = deployId; record.rollbackAt = new Date().toISOString(); await this.store.save();
+    await this.say(`Rollback started to ${record.previousCommit.slice(0, 7)}. The bot restarts when Render switches; the old version then shows its normal start message.`);
     void this.watchDeploy(updates, deployId);
   }
   /** Polls a deploy until it ends. A failure is reported here; a live deploy is reported by the new version itself. */

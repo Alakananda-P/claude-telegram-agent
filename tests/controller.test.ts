@@ -454,6 +454,30 @@ test('/update: not configured, confirm backs up then deploys, a failed build is 
   await bot.handle(message('/update')); await tap('updateno ' + tokenOf()); assert.match(replies.at(-1)!, /cancelled/);
 });
 
+test('/de_update rolls back to the saved previous deploy after a tap, falling back to a deploy of the previous commit', async () => {
+  const { bot, replies, panels, store } = await setup();
+  const done: string[] = []; let rollbackFails = false;
+  bot.updates = { liveDeploy: async () => ({ id: 'dep-new', commit: 'b'.repeat(40), status: 'live' }), mainCommit: async () => 'b'.repeat(40), changes: async () => [], backup: async () => 'snap',
+    deploy: async commit => { done.push('deploy ' + commit.slice(0, 1)); return 'dep-redeploy'; },
+    deployStatus: async id => ({ id, commit: 'a'.repeat(40), status: 'live' }),
+    rollback: async id => { done.push('rollback ' + id); if (rollbackFails) throw new UpdateError('Render returned HTTP 500.'); return 'dep-rollback'; } };
+  bot.updatePollMs = 5;
+  await bot.handle(message('/de_update')); assert.match(replies.at(-1)!, /nothing to roll back/i);
+  store.data.update = { previousDeployId: 'dep-live', previousCommit: 'a'.repeat(40), targetCommit: 'b'.repeat(40), deployId: 'dep-new', startedAt: new Date().toISOString() };
+  const tokenOf = () => panels.at(-1)!.buttons.flat().find(b => b.callback_data.startsWith('deupdateok '))!.callback_data.split(' ')[1];
+  const tap = (data: string, from = 123) => bot.callback({ id: 'r', from: { id: from }, message: { ...message(''), message_id: 71 }, data });
+  await bot.handle(message('/de_update')); assert.match(panels.at(-1)!.text, /aaaaaaa/);
+  await tap('deupdateok ' + tokenOf(), 999); assert.deepEqual(done, [], 'only the owner can roll back');
+  await tap('deupdateok ' + tokenOf());
+  assert.deepEqual(done, ['rollback dep-live']); assert.match(replies.at(-1)!, /Rollback started/);
+  assert.equal(store.data.update!.rollbackDeployId, 'dep-rollback');
+  done.length = 0; rollbackFails = true;
+  await bot.handle(message('/de_update')); await tap('deupdateok ' + tokenOf());
+  assert.deepEqual(done, ['rollback dep-live', 'deploy a'], 'fallback: deploy the saved previous commit');
+  assert.equal(store.data.update!.rollbackDeployId, 'dep-redeploy');
+  await bot.handle(message('/de_update')); await tap('deupdateno ' + tokenOf()); assert.match(replies.at(-1)!, /cancelled/i);
+});
+
 test('work continues beyond the former daily cap without budget reservations', async () => {
   const { bot, store, calls, replies } = await setup();
   for (let i = 0; i < 7; i++) {
