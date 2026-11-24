@@ -242,6 +242,18 @@ test('download failure shows failure and creates no false upload or job', async 
   await bot.handle(photo('broken'));
   assert.equal(store.data.uploads!.length, 0); assert.equal(calls.length, 0); assert.match(replies.at(-1)!, /Upload could not be accepted/); assert.ok(!replies.join('').includes('private-network-detail'));
 });
+test('/plan starts the task in plan mode; plain messages and retries keep their own mode', async () => {
+  const { bot, calls, store } = await setup();
+  await bot.handle(message('/plan sort the bills')); await bot.idle();
+  await bot.handle(message('plain work')); await bot.idle();
+  assert.equal(calls[0].prompt.includes('sort the bills'), true); assert.equal(calls[0].planMode, true);
+  assert.equal(calls[1].planMode, undefined);
+  assert.equal(store.data.tasks![0].planMode, true);
+  assert.equal((await StateStore.open(store.file)).data.tasks![0].planMode, true);
+  store.data.tasks![0].status = 'failed'; const retried = await bot.automation.retryTask(store.data.tasks![0].id);
+  assert.equal(retried.planMode, true);
+});
+
 test('new messages steer the running conversation instead of becoming separate queued tasks', async () => {
   let release!: () => void; let began!: () => void;
   const ready = new Promise<void>(resolve => { began = resolve; }); const wait = new Promise<void>(resolve => { release = resolve; }); const calls: AgentRequest[] = [];

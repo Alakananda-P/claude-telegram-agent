@@ -305,6 +305,14 @@ test('a failed input preparation racing with the last result cannot leave the co
   assert.equal(steering.accepting, false);
 });
 
+test('a plan-mode request starts the SDK in plan mode and the init guard follows the requested mode', async () => {
+  let options!: Options;
+  const planned = await new ClaudeRunner(config, factory([{ ...init, permissionMode: 'plan' }, result], o => { options = o; })).run({ prompt: 'x', cwd: '/work', planMode: true }, () => {}, new AbortController());
+  assert.equal(options.permissionMode, 'plan'); assert.equal(planned.text, result.result);
+  await assert.rejects(new ClaudeRunner(config, factory([init, result])).run({ prompt: 'x', cwd: '/work', planMode: true }, () => {}, new AbortController()), /configuration/i);
+  await assert.rejects(new ClaudeRunner(config, factory([{ ...init, permissionMode: 'plan' }, result])).run({ prompt: 'x', cwd: '/work' }, () => {}, new AbortController()), /configuration/i);
+});
+
 test('runner passes exact requested settings, resume, limits and a filtered child environment', async () => {
   const events: AgentEvent[] = [];
   let options!: Options;

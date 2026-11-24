@@ -110,6 +110,7 @@ async function main(): Promise<void> {
       { command: 'cost', description: 'Lifetime estimated Claude cost' },
       { command: 'status', description: 'Current task and execution limits' },
       { command: 'stop', description: 'Stop current task' },
+      { command: 'plan', description: 'Plan a task first, approve before changes' },
       { command: 'new', description: 'Fresh conversation, keep files' },
       { command: 'fresh', description: 'New conversation with completed-work summary' },
       { command: 'project', description: 'Create or switch project' },

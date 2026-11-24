@@ -19,6 +19,8 @@ export interface Task {
   voiceInput?: string; attachedFiles?: string[];
   steers?: SteerRecord[];
   deadlineAt?: string; handoffFrom?: string;
+  /** Started with /plan: the SDK begins in plan mode and the owner approves the plan. */
+  planMode?: boolean;
 }
 export interface Schedule {
   id: string; name: string; kind: Task['kind']; prompt: string; project: string; timezone: string;
@@ -93,7 +95,7 @@ export class Automation {
     const task = this.store.data.tasks!.find(t => t.id === id);
     if (!task || !['failed', 'interrupted', 'cancelled'].includes(task.status)) throw new Error('Choose a failed or interrupted task.');
     if (task.prompt === '[Deleted session]') throw new Error('This task belongs to a permanently deleted chat.');
-    return this.enqueue({ kind: task.kind, project: task.project, chatKey: task.chatKey, prompt: task.prompt, messageContext: task.messageContext ? { ...task.messageContext } : undefined, displayPrompt: task.displayPrompt, voiceInput: task.voiceInput, attachedFiles: task.attachedFiles, steers: task.steers?.map(s => ({ ...s, id: randomUUID(), status: 'preparing' })), interactive: task.interactive, settings: task.settings });
+    return this.enqueue({ kind: task.kind, project: task.project, chatKey: task.chatKey, prompt: task.prompt, messageContext: task.messageContext ? { ...task.messageContext } : undefined, displayPrompt: task.displayPrompt, voiceInput: task.voiceInput, attachedFiles: task.attachedFiles, steers: task.steers?.map(s => ({ ...s, id: randomUUID(), status: 'preparing' })), interactive: task.interactive, settings: task.settings, ...(task.planMode ? { planMode: true } : {}) });
   }
   async prioritize(id: string): Promise<void> {
     const list = this.store.data.tasks!; const i = list.findIndex(t => t.id === id && t.status === 'queued');
