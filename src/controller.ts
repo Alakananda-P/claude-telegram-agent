@@ -4,7 +4,7 @@ import { mkdir, lstat, readdir, readFile, writeFile, statfs } from 'node:fs/prom
 import { configSecrets, type Config } from './config.js';
 import { AgentError, AgentApiError, AgentSafetyError, type Runner, type PlanDecision } from './agent.js';
 import { StateStore } from './state.js';
-import { authorized, projectName, redact, privatePreview, safeFile, secretPath, PathAccessError, type Message, type Callback } from './safety.js';
+import { authorized, projectName, redact, privatePreview, safeFile, secretPath, detectTokens, maskTokens, PathAccessError, type Message, type Callback } from './safety.js';
 import { EFFORTS, effectiveSettings, settingsLabel, modelLabel, familyOf, familySettings, settingsFamily, type AgentSettings, type Effort } from './settings.js';
 import { ModelCatalog, type CatalogModel } from './models.js';
 import { PriceBook } from './pricing.js';
@@ -528,7 +528,12 @@ export class Controller {
       if (!prompt) return this.say('Send a text task, photo, video or document. Use /help for commands.');
       const pending = this.pendingBatches();
       if (pending.length) await this.processBatches(pending, prompt, undefined, messageContext);
-      else await this.launch(prompt, root, prompt, undefined, undefined, messageContext, command === 'plan');
+      else {
+        // H-11: warn about a pasted token and keep it out of the chat archive and previews.
+        const tokens = detectTokens(prompt);
+        if (tokens.length) await this.say(`This message looks like a ${tokens.join(' and ')}. Delete it from Telegram (long-press > Delete) and rotate the key if it was not meant to be shared. It is hidden in the saved chat.`);
+        await this.launch(prompt, root, maskTokens(prompt), undefined, undefined, messageContext, command === 'plan');
+      }
     } catch (error) {
       await this.say(error instanceof PathAccessError || error instanceof ProjectError ? error.message : 'Could not process this request. Check the command, file path/size and storage. No automatic retry was performed.');
     }
@@ -1101,7 +1106,7 @@ export class Controller {
     const captions = batches.map(b => b.prompt).filter(Boolean).join('\n');
     const prompt = (instruction && captions && !voiceInput && instruction !== captions ? captions + '\n' + instruction : instruction) ?? (captions || 'Inspect these files. For bill photos, extract only clear values, check arithmetic, and ask about unclear fields with relevant crops. If the desired output is unclear, ask the owner.');
     for (const batch of batches) batch.status = 'queued';
-    await this.launch(prompt + '\n\nAttached project files:\n' + files.map(f => f.path).join('\n'), await this.workspace(batches[0].project), prompt + `\n[${files.length} attached files]`, voiceInput, voiceInput ? files.filter(f => f.path !== voiceInput).map(f => f.path) : undefined, messageContext);
+    await this.launch(prompt + '\n\nAttached project files:\n' + files.map(f => f.path).join('\n'), await this.workspace(batches[0].project), maskTokens(prompt) + `\n[${files.length} attached files]`, voiceInput, voiceInput ? files.filter(f => f.path !== voiceInput).map(f => f.path) : undefined, messageContext);
     for (const batch of batches) await this.dismiss('batch-' + batch.id);
     await this.uploadReceipt();
     await this.dismiss('controls');

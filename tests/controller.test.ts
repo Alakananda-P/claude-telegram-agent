@@ -595,6 +595,17 @@ test('an album and its caption start one task together, and a pending caption is
   assert.match(calls.at(-1)!.prompt, /June bills/); assert.match(calls.at(-1)!.prompt, /make the sheet/);
 });
 
+test('a message carrying a recognizable token gets a delete warning and the token is masked in the archive and preview', async () => {
+  const { bot, calls, replies, store, dataDir } = await setup();
+  const token = 'ghp_' + 'A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8';
+  await bot.handle(message('use this token ' + token + ' for the repo')); await bot.idle();
+  assert.match(replies.join('\n'), /looks like a GitHub token/i); assert.match(replies.join('\n'), /Delete/);
+  assert.ok(calls[0].prompt.includes(token), 'the agent still gets what the owner sent');
+  assert.ok(!store.data.tasks![0].displayPrompt!.includes(token));
+  const archive = await new ChatArchive(path.join(dataDir, 'bot/chats'), []).read(store.data.sessions.default);
+  assert.ok(!JSON.stringify(archive).includes(token)); assert.match(JSON.stringify(archive), /\[hidden GitHub token\]/);
+});
+
 test('work continues beyond the former daily cap without budget reservations', async () => {
   const { bot, store, calls, replies } = await setup();
   for (let i = 0; i < 7; i++) {
