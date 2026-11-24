@@ -536,6 +536,19 @@ test('changed files are sent in the background, so the next owner message starts
   await bot.idle();
 });
 
+test('an image Telegram refuses as a photo is sent as a document instead of being dropped', async () => {
+  const { bot, sender, files, replies } = await setup({ async run(request, emit) {
+    await emit({ type: 'session', id: 'png-chat' }); await mkdir(path.join(request.cwd, 'output'), { recursive: true });
+    await writeFile(path.join(request.cwd, 'output', 'chart.png'), 'not-really-a-png');
+    return { text: 'Chart ready', session: 'png-chat', cumulativeCost: 0 };
+  } });
+  const photos: string[] = [];
+  (sender as { sendPhoto?: (c: number, name: string) => Promise<void> }).sendPhoto = async (_c, name) => { photos.push(name); throw new Error('Bad Request: PHOTO_INVALID_DIMENSIONS'); };
+  await bot.handle(message('draw the chart')); await bot.idle();
+  assert.deepEqual(photos, ['chart.png']); assert.deepEqual(files, ['chart.png']);
+  assert.ok(!replies.some(r => /automatic delivery failed/.test(r)));
+});
+
 test('work continues beyond the former daily cap without budget reservations', async () => {
   const { bot, store, calls, replies } = await setup();
   for (let i = 0; i < 7; i++) {

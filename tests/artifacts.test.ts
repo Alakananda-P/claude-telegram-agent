@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { artifactSnapshot, changedArtifacts } from '../src/artifacts.js';
+import { artifactSnapshot, changedArtifacts, changedArtifactReport } from '../src/artifacts.js';
 import { safeFile } from '../src/safety.js';
 
 test('automatic delivery is output-only while explicit project file access remains available', async () => {
@@ -34,6 +34,18 @@ test('automatic delivery refuses an output directory symlink and linked files', 
 test('Markdown deliverables are sent automatically while identifiable private documents require explicit retrieval', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'tg-private-artifacts-')); await mkdir(path.join(root, 'output'));
   for (const file of ['weekly-report.md', 'aadhaar_front.jpg', 'PAN-card.pdf', 'passport_scan.png', 'api_keys.txt', 'panorama.jpg']) await writeFile(path.join(root, 'output', file), 'test fixture');
-  assert.deepEqual(Object.keys(await artifactSnapshot(root)).sort(), ['output/panorama.jpg', 'output/weekly-report.md']);
+  assert.deepEqual((await changedArtifacts(root, {})).sort(), ['output/panorama.jpg', 'output/weekly-report.md']);
   assert.equal(await safeFile(root, 'output/aadhaar_front.jpg'), path.join(root, 'output/aadhaar_front.jpg'));
+});
+
+test('changed output files that are not sent automatically are counted, without naming private ones', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'artifacts-skipped-')); await mkdir(path.join(root, 'output'));
+  const before = await artifactSnapshot(root);
+  await writeFile(path.join(root, 'output', 'chart.png'), 'png');
+  await writeFile(path.join(root, 'output', 'aadhaar_scan.png'), 'private');
+  const report = await changedArtifactReport(root, before);
+  assert.deepEqual(report, { files: ['output/chart.png'], skippedPrivate: 1, tooLarge: [] });
+  assert.deepEqual(await changedArtifacts(root, before), ['output/chart.png']);
+  const again = await changedArtifactReport(root, await artifactSnapshot(root));
+  assert.deepEqual(again, { files: [], skippedPrivate: 0, tooLarge: [] }, 'unchanged files are not reported again');
 });

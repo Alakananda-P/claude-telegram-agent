@@ -18,7 +18,7 @@ import { TitleAccountingError, type TitleGenerator } from './titles.js';
 import { Automation, clockInfo, type Task, type Batch, type SteerRecord, type TelegramMessageContext } from './automation.js';
 import type { MessageListOptions, MessageDeletion } from './telegram.js';
 import { SteeringInput } from './steering.js';
-import { artifactSnapshot, changedArtifacts } from './artifacts.js';
+import { artifactSnapshot, changedArtifactReport } from './artifacts.js';
 import { Backups } from './backup.js';
 import { KeyPool } from './key-pool.js';
 import { Transcriber, TranscriptionError, type TranscriptionService } from './transcription.js';
@@ -879,9 +879,12 @@ export class Controller {
       if (!alreadyPublished) await this.say(preview, true);
       // W47-02: the answer is out, so the queue moves on now. Changed files and the chat title
       // follow in the background; their failures are reported but never change this task's status.
-      const artifacts = await changedArtifacts(cwd, before).then(files => files.filter(file => !delivered.has(file)), () => undefined);
+      const report = await changedArtifactReport(cwd, before).catch(() => undefined);
+      const artifacts = report?.files.filter(file => !delivered.has(file));
       this.afterAnswer(async () => {
-        if (!artifacts) { await this.say('Files may have changed, but the output folder could not be read. Use /files to check.'); return; }
+        if (!report || !artifacts) { await this.say('Files may have changed, but the output folder could not be read. Use /files to check.'); return; }
+        if (report.skippedPrivate) await this.say(`${report.skippedPrivate} changed file(s) in output/ look like private documents by name, so they were not sent automatically. Use /files and /get to download them.`);
+        for (const file of report.tooLarge.slice(0, 5)) await this.say(`${file} is larger than 49 MB, so Telegram cannot send it. It is saved in the project.`);
         if (artifacts.length) await this.say(`Sending ${artifacts.length > 1 ? Math.min(artifacts.length, 20) + ' files' : 'file'}…`, false, 'deliveries');
         for (const file of artifacts.slice(0, 20)) { try { await this.deliver(cwd, file, 'Ready · ' + path.basename(file)); } catch { await this.say(`File saved; automatic delivery failed. Retry: /get ${file}`); } }
         if (artifacts.length > 20) await this.say('Additional files are saved. Use /files and /get to download them.');
@@ -1061,8 +1064,13 @@ export class Controller {
     if ((await lstat(file)).size > 49000000) throw new Error('File exceeds 49 MB.');
     const bytes = await readFile(file);
     if (configSecrets(this.config).some(s => s.length > 5 && bytes.includes(Buffer.from(s)))) throw new Error('Credential-bearing file cannot be sent.');
-    if (/\.(png|jpe?g|webp)$/i.test(file) && this.messenger.sendPhoto) await this.messenger.sendPhoto(this.config.owner, path.basename(file), bytes, preview);
-    else { if (preview) await this.say(preview, true); await this.messenger.sendFile(this.config.owner, path.basename(file), bytes); }
+    if (/\.(png|jpe?g|webp)$/i.test(file) && this.messenger.sendPhoto) {
+      // W47-07: Telegram refuses some images as photos (dimensions, ratio, format). Send those as a document.
+      try { await this.messenger.sendPhoto(this.config.owner, path.basename(file), bytes, preview); return; }
+      catch { console.warn('Photo upload refused; sending the image as a document.'); }
+    }
+    if (preview) await this.say(preview, true);
+    await this.messenger.sendFile(this.config.owner, path.basename(file), bytes);
   }
   async exportBackup(files = false): Promise<void> {
     const bytes = await this.backups.export(files);
