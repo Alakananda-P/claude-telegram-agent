@@ -667,6 +667,7 @@ export class Controller {
         else if (event.type === 'progress') progress = redact(event.text, configSecrets(this.config));
         else if (event.type === 'helpers') pendingHelpers = event.count;
         else if (event.type === 'held_open') { const { type: _type, ...why } = event; console.warn(JSON.stringify({ event: 'turn_held_open', task: task.id, ...why })); }
+        else if (event.type === 'idle_closed') console.warn(JSON.stringify({ event: 'turn_idle_closed', task: task.id, helpers: event.helpers }));
       }, abort);
       abort.signal.throwIfAborted();
       await bind(result.session);

@@ -217,6 +217,43 @@ test('a helper hand-back consumed by a later non-notification result stops holdi
   assert.equal(answer.text, 'Audit report: all good'); assert.equal(steering.accepting, false);
 });
 
+const fastIdle = { answerMs: 20, helperMs: 80 };
+const forever = () => new Promise<never>(() => {});
+
+test('idle watchdog closes a silent turn after the answer when a helper never reports, and says so', async () => {
+  const events: AgentEvent[] = []; const steering = new SteeringInput();
+  const make: QueryFactory = ({ prompt }) => ({ async *[Symbol.asyncIterator]() {
+    const incoming = (prompt as AsyncIterable<import('@anthropic-ai/claude-agent-sdk').SDKUserMessage>)[Symbol.asyncIterator]();
+    const first = (await incoming.next()).value!; yield init as SDKMessage;
+    yield { type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: 'audit', run_id: 'run-1', task_type: 'local_agent', description: 'Audit' }] } as unknown as SDKMessage;
+    yield { ...result, result: 'Main answer', user_message_uuids: [first.uuid] } as unknown as SDKMessage;
+    await forever(); // The SDK goes silent and never ends the stream.
+  }, close() {} });
+  const started = Date.now();
+  const output = await new ClaudeRunner(config, make, fastIdle).run({ prompt: 'Audit', cwd: '/work', steering }, e => { events.push(e); }, new AbortController());
+  assert.equal(output.text, 'Main answer'); assert.equal(steering.accepting, false);
+  assert.ok(Date.now() - started >= fastIdle.helperMs, 'pending helpers get the longer wait');
+  assert.deepEqual(events.filter(e => e.type === 'idle_closed'), [{ type: 'idle_closed', helpers: 1 }]);
+  assert.ok(events.some(e => e.type === 'commentary' && /did not report back/.test(e.text)));
+});
+
+test('idle watchdog never closes while an owner message is unanswered or the main turn is still running', async () => {
+  const steering = new SteeringInput(); const events: AgentEvent[] = [];
+  const make: QueryFactory = ({ prompt }) => ({ async *[Symbol.asyncIterator]() {
+    const incoming = (prompt as AsyncIterable<import('@anthropic-ai/claude-agent-sdk').SDKUserMessage>)[Symbol.asyncIterator]();
+    const first = (await incoming.next()).value!; yield init as SDKMessage;
+    const release = steering.reserve()!; const later = steering.add('one more thing'); release();
+    yield { ...result, result: 'First answer', user_message_uuids: [first.uuid] } as unknown as SDKMessage;
+    await new Promise(resolve => setTimeout(resolve, 60)); // Silent, but the owner message is still pending.
+    await incoming.next();
+    yield { type: 'stream_event', parent_tool_use_id: null, session_id: 'session-1', uuid: 's1', event: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } } } as unknown as SDKMessage;
+    await new Promise(resolve => setTimeout(resolve, 60)); // A long tool run inside the open main turn.
+    yield { ...result, uuid: 'r2', result: 'Second answer', user_message_uuids: [later.id] } as unknown as SDKMessage;
+  }, close() {} });
+  const output = await new ClaudeRunner(config, make, fastIdle).run({ prompt: 'Start', cwd: '/work', steering }, e => { events.push(e); }, new AbortController());
+  assert.equal(output.text, 'Second answer'); assert.deepEqual(events.filter(e => e.type === 'idle_closed'), []);
+});
+
 test('a notification-only completion cannot finish the pending human turn', async () => {
   const make: QueryFactory = ({ prompt }) => ({ async *[Symbol.asyncIterator]() {
     const incoming = (prompt as AsyncIterable<import('@anthropic-ai/claude-agent-sdk').SDKUserMessage>)[Symbol.asyncIterator]();
