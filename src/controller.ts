@@ -119,6 +119,15 @@ export class Controller {
   private cleaningUi?: Promise<void>;
   private restorePending?: { path: string; project: string; expires: number };
   private projectPurgeRequests = new Map<string, { id: string; expires: number }>();
+  /** File delivery and titles that run after an answer was sent (W47-02). */
+  private postAnswer = new Set<Promise<void>>();
+  private afterAnswer(work: () => Promise<void>): void {
+    const job: Promise<void> = work().catch(error => {
+      if (error instanceof TitleAccountingError) this.persistenceFailed = true;
+      console.warn('Post-answer work failed; the task stays completed.');
+    }).finally(() => this.postAnswer.delete(job));
+    this.postAnswer.add(job);
+  }
   /** GitHub + Render access for /update; undefined means not configured. Set by main.ts. */
   updates?: Updates;
   updatePollMs = 15_000;
@@ -260,7 +269,8 @@ export class Controller {
     await this.store.save();
   }
 
-  async idle(): Promise<void> { while (this.pump) await this.pump; }
+  /** Waits for the queue and for post-answer work (file delivery, titles). */
+  async idle(): Promise<void> { while (this.pump || this.postAnswer.size) { if (this.pump) await this.pump; else await Promise.allSettled([...this.postAnswer]); } }
 
   async tick(now = new Date()): Promise<void> {
     if (this.ticking || this.shuttingDown) return;
@@ -867,10 +877,16 @@ export class Controller {
       const preview = result.text.length > 12000 ? result.text.slice(0, 12000) + `\n\nFull result: /get ${outputName}` : result.text;
       await finishIndicator();
       if (!alreadyPublished) await this.say(preview, true);
-      const artifacts = (await changedArtifacts(cwd, before)).filter(file => !delivered.has(file));
-      for (const file of artifacts.slice(0, 20)) { try { await this.deliver(cwd, file, 'Ready · ' + path.basename(file)); } catch { await this.say(`File saved; automatic delivery failed. Retry: /get ${file}`); } }
-      if (artifacts.length > 20) await this.say('Additional files are saved. Use /files and /get to download them.');
-      if (this.titles && !abort.signal.aborted) await this.sessions.autoName(result.session, turns => this.titles!.generate(turns, abort.signal));
+      // W47-02: the answer is out, so the queue moves on now. Changed files and the chat title
+      // follow in the background; their failures are reported but never change this task's status.
+      const artifacts = await changedArtifacts(cwd, before).then(files => files.filter(file => !delivered.has(file)), () => undefined);
+      this.afterAnswer(async () => {
+        if (!artifacts) { await this.say('Files may have changed, but the output folder could not be read. Use /files to check.'); return; }
+        if (artifacts.length) await this.say(`Sending ${artifacts.length > 1 ? Math.min(artifacts.length, 20) + ' files' : 'file'}…`, false, 'deliveries');
+        for (const file of artifacts.slice(0, 20)) { try { await this.deliver(cwd, file, 'Ready · ' + path.basename(file)); } catch { await this.say(`File saved; automatic delivery failed. Retry: /get ${file}`); } }
+        if (artifacts.length > 20) await this.say('Additional files are saved. Use /files and /get to download them.');
+      });
+      if (this.titles) this.afterAnswer(async () => { await this.sessions.autoName(result.session, turns => this.titles!.generate(turns, AbortSignal.timeout(60_000))); });
       console.log(`Claude task completed: ${selected.model}; effort=${selected.effort}; requestedFast=${selected.fast}; reportedSpeed=${this.store.data.lastSpeed ?? 'unknown'}.`);
     } catch (error) {
       if (error instanceof TitleAccountingError) this.persistenceFailed = true;

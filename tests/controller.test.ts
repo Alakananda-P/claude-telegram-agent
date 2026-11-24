@@ -514,6 +514,28 @@ test('Render and GitHub keys never reach Telegram, even if an error text carried
   assert.ok(replies.length + panels.length >= 2);
 });
 
+test('changed files are sent in the background, so the next owner message starts at once', async () => {
+  const prompts: string[] = []; let release!: () => void; const gate = new Promise<void>(resolve => { release = resolve; });
+  const { bot, sender, replies, files } = await setup({ async run(request, emit) {
+    prompts.push(request.prompt); await emit({ type: 'session', id: 'files-chat' });
+    if (prompts.length === 1) { await mkdir(path.join(request.cwd, 'output'), { recursive: true }); await writeFile(path.join(request.cwd, 'output', 'report.csv'), 'a,b'); }
+    return { text: 'Done ' + prompts.length, session: 'files-chat', cumulativeCost: 0 };
+  } });
+  const send = sender.sendFile.bind(sender);
+  sender.sendFile = async (chat: number, name: string, bytes: Uint8Array) => { await gate; return send(chat, name, bytes); };
+  const until = async (check: () => boolean) => { for (let i = 0; i < 400 && !check(); i++) await new Promise(r => setTimeout(r, 5)); return check(); };
+  try {
+    await bot.handle(message('make the report'));
+    assert.ok(await until(() => replies.some(r => r.includes('Done 1'))));
+    assert.ok(await until(() => replies.some(r => /Sending .*file/.test(r))));
+    await bot.handle(message('next question'));
+    assert.ok(await until(() => prompts.length === 2), 'the next task starts while the file is still uploading');
+    assert.equal(files.length, 0);
+  } finally { release(); }
+  assert.ok(await until(() => files.includes('report.csv')));
+  await bot.idle();
+});
+
 test('work continues beyond the former daily cap without budget reservations', async () => {
   const { bot, store, calls, replies } = await setup();
   for (let i = 0; i < 7; i++) {
