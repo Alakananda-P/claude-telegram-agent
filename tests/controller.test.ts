@@ -478,6 +478,28 @@ test('/de_update rolls back to the saved previous deploy after a tap, falling ba
   await bot.handle(message('/de_update')); await tap('deupdateno ' + tokenOf()); assert.match(replies.at(-1)!, /cancelled/i);
 });
 
+test('after /update the new version reports itself live once, or rolls back by itself when its self-check fails', async () => {
+  const { bot, replies, store } = await setup();
+  const done: string[] = [];
+  bot.updates = { liveDeploy: async () => ({ id: 'dep-new', commit: 'b'.repeat(40), status: 'live' }), mainCommit: async () => 'b'.repeat(40), changes: async () => [], backup: async () => 'snap',
+    deploy: async commit => { done.push('deploy ' + commit.slice(0, 1)); return 'dep-redeploy'; }, deployStatus: async id => ({ id, commit: 'a'.repeat(40), status: 'live' }),
+    rollback: async id => { done.push('rollback ' + id); return 'dep-rollback'; } };
+  bot.updatePollMs = 5;
+  const record = () => ({ previousDeployId: 'dep-live', previousCommit: 'a'.repeat(40), targetCommit: 'b'.repeat(40), deployId: 'dep-new', startedAt: new Date().toISOString() });
+  store.data.update = record();
+  await bot.reportUpdate('c'.repeat(40)); assert.equal(replies.length, 0, 'another commit is not this update');
+  await bot.reportUpdate(undefined); assert.equal(replies.length, 0);
+  await bot.reportUpdate('b'.repeat(40), true);
+  assert.match(replies.at(-1)!, /Update live: bbbbbbb \(was aaaaaaa\)\. Self-check passed: config, state, Telegram, agent test/);
+  assert.equal(store.data.update!.result, 'live'); assert.ok(store.data.update!.reportedAt);
+  await bot.reportUpdate('b'.repeat(40), true); assert.equal(replies.length, 1, 'reported once');
+  assert.deepEqual(done, []);
+  store.data.update = record(); replies.length = 0;
+  await bot.reportUpdate('b'.repeat(40), false);
+  assert.deepEqual(done, ['rollback dep-live']); assert.match(replies.join('\n'), /failed its self-check.*Rolling back to aaaaaaa/s);
+  assert.equal(store.data.update!.result, 'self_check_failed'); assert.equal(store.data.update!.rollbackDeployId, 'dep-rollback');
+});
+
 test('work continues beyond the former daily cap without budget reservations', async () => {
   const { bot, store, calls, replies } = await setup();
   for (let i = 0; i < 7; i++) {

@@ -79,8 +79,12 @@ async function main(): Promise<void> {
   try {
     await controller.prepareSessions(shutdown.signal);
     const checkId = process.env.VERIFY_AGENT_CHECK_ID ?? 'initial-upgrade';
+    // The new version after /update: Render sets RENDER_GIT_COMMIT for the running deploy.
+    const runningCommit = process.env.RENDER_GIT_COMMIT?.trim();
+    const updated = !!runningCommit && store.data.update?.targetCommit === runningCommit && !store.data.update.reportedAt;
+    let agentPassed: boolean | undefined;
     if (process.env.VERIFY_AGENT_ON_UPGRADE === 'true'
-      && (!store.data.upgradeCheck?.attempted || (store.data.upgradeCheck.checkId ?? 'initial-upgrade') !== checkId)) {
+      && (updated || !store.data.upgradeCheck?.attempted || (store.data.upgradeCheck.checkId ?? 'initial-upgrade') !== checkId)) {
       // Explicit rollout acceptance check; one short request, once per data disk.
       // Count its usage in the same ledger and never poll Telegram twice.
       store.data.upgradeCheck = { attempted: true, passed: false, checkId };
@@ -110,6 +114,8 @@ async function main(): Promise<void> {
         store.data.upgradeCheck.passed = store.data.upgradeCheck.actualSpeed === 'fast' && calledTools.has('mcp__workspace__clock') && calledTools.has('mcp__workspace__validate_bill');
       } catch { console.warn('Upgrade model check did not complete; inspect /status before a larger task.'); }
       finally { clearTimeout(timer); await store.save(); }
+      // Self-check after /update: the agent must have run both workspace tools (speed is not required).
+      if (updated) agentPassed = calledTools.has('mcp__workspace__clock') && calledTools.has('mcp__workspace__validate_bill');
       console.log(`Upgrade model check: passed=${store.data.upgradeCheck.passed}; model=${config.model}; effort=${config.effort}; actualSpeed=${store.data.upgradeCheck.actualSpeed ?? 'unconfirmed'}.`);
       console.log(`Upgrade workspace tools: clock=${calledTools.has('mcp__workspace__clock')}; billValidation=${calledTools.has('mcp__workspace__validate_bill')}.`);
     }
@@ -157,6 +163,8 @@ async function main(): Promise<void> {
       if (!cleared) await telegram.send(config.owner, 'Your new chat is ready. Telegram could not remove some older messages. Saved chats are in Sessions.');
     }
     await controller.menu();
+    // Config, state and Telegram checks passed to get here.
+    if (updated) await controller.reportUpdate(runningCommit, agentPassed);
     await announce();
     void checkPrices();
     if (store.data.lastJob?.status === 'interrupted') await telegram.send(config.owner, 'The previous task was interrupted by a restart. Review its files before retrying.').catch(() => {});

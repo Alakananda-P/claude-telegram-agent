@@ -563,6 +563,28 @@ export class Controller {
     await this.say(`Deploy started for ${pending.target.slice(0, 7)}. The new version reports here when it is live; /de_update goes back to ${pending.live.commit.slice(0, 7)}.`);
     void this.watchDeploy(updates, deployId);
   }
+  /** Called by the new version at startup. If it is the target of the last /update, it reports once:
+   * live after a passing self-check, or an automatic rollback when the agent self-check failed. */
+  async reportUpdate(commit: string | undefined, agentPassed?: boolean): Promise<void> {
+    const record = this.store.data.update;
+    if (!record || record.reportedAt || !commit || record.targetCommit !== commit) return;
+    const [to, from] = [record.targetCommit.slice(0, 7), record.previousCommit.slice(0, 7)];
+    record.reportedAt = new Date().toISOString(); record.result = agentPassed === false ? 'self_check_failed' : 'live';
+    await this.store.save();
+    if (agentPassed !== false) return this.say(`Update live: ${to} (was ${from}). Self-check passed: config, state, Telegram${agentPassed ? ', agent test' : ''}. /de_update goes back if anything looks wrong.`, true);
+    await this.say(`Update ${to} started but failed its self-check (agent test). Rolling back to ${from} automatically…`, true);
+    const dashboard = ' Use the Render dashboard: Events > previous deploy > Rollback.';
+    if (!this.updates) return this.say('Automatic rollback is not configured.' + dashboard, true);
+    let deployId: string;
+    try { deployId = await this.updates.rollback(record.previousDeployId); }
+    catch {
+      try { deployId = await this.updates.deploy(record.previousCommit); }
+      catch { return this.say('Automatic rollback could not start.' + dashboard, true); }
+    }
+    record.rollbackDeployId = deployId; record.rollbackAt = new Date().toISOString(); await this.store.save();
+    void this.watchDeploy(this.updates, deployId);
+  }
+
   /** /de_update: after the owner's tap, Render rolls back to the deploy that was live before the
    * last /update (no rebuild). If Render refuses, the saved previous commit is deployed instead. */
   private async rollbackCommand(command: string, argument: string): Promise<void> {

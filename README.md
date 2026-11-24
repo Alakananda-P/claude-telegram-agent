@@ -236,6 +236,26 @@ No public URL, webhook endpoint, TLS domain, Redis, or Telegram login session is
 needed. Telegram long polling is outbound HTTPS. Auto deploy is off to avoid
 interrupting running tasks unexpectedly; deploy manually while idle.
 
+### Updating from Telegram: /update and /de_update
+
+Set these in Render (optional; without them both commands answer "not configured"):
+`RENDER_API_KEY`, `RENDER_SERVICE_ID` (srv-...), `GITHUB_TOKEN` (fine-grained, only the
+bot repo and the backup repo, Contents read/write), `BACKUP_REPOSITORY` (owner/name of a
+private repo) and `GITHUB_REPOSITORY` (owner/name; `GITHUB_REPOSITORY_URL` also works).
+
+- `/update` shows the live commit, the newest `main` commit and the commit titles. After
+  you tap Confirm, the bot copies the live code to the backup repo (one commit, replaced
+  each time), saves the live deploy, deploys the new commit and reports a failed build
+  (the old version keeps running). The new version reports "Update live" after its
+  self-check (config, state, Telegram, and the agent test when
+  `VERIFY_AGENT_ON_UPGRADE=true`). If the agent test fails, it rolls back by itself.
+- `/de_update` rolls back to the deploy that was live before the last `/update` (Render
+  rollback, no rebuild; if Render refuses, the saved commit is deployed).
+- If the bot does not answer at all after an update, roll back from your phone: Render
+  dashboard > the bot service > Events > the previous deploy > Rollback.
+- State stays readable by the previous version: new data goes only into new optional
+  fields, and saved model settings keep the ids the previous version accepts.
+
 ## Commands
 
 | Command | Action |
