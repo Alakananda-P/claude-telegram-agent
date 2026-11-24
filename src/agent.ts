@@ -21,7 +21,10 @@ export type AgentEvent = { type: 'session'; id: string } | { type: 'progress'; t
   | { type: 'held_open'; initialAnswered: boolean; helpers: number; unanswered: number; preparing: number; ackIds: number; initialInAck: boolean; origin?: string }
   /** Diagnostic only: the idle watchdog closed a turn that stayed silent after its answer. */
   | { type: 'idle_closed'; helpers: number };
-export interface AgentRequest { prompt: string; cwd: string; session?: string; settings?: AgentSettings; memoryEnabled?: boolean; sessions?: SessionCatalog; projects?: ProjectToolContext; workspace?: WorkspaceContext; resumeContext?: string; steering?: SteeringInput }
+export type PlanDecision = { approved: true } | { approved: false; feedback?: string };
+/** Asks the owner to approve a plan (ExitPlanMode). Absent when no owner can answer, e.g. scheduled runs. */
+export type PlanApproval = (plan: string, signal: AbortSignal) => Promise<PlanDecision>;
+export interface AgentRequest { prompt: string; cwd: string; session?: string; settings?: AgentSettings; memoryEnabled?: boolean; sessions?: SessionCatalog; projects?: ProjectToolContext; workspace?: WorkspaceContext; resumeContext?: string; steering?: SteeringInput; planApproval?: PlanApproval }
 export interface AgentResult { text: string; session: string; cumulativeCost: number }
 export interface Runner {
   run(request: AgentRequest, emit: (event: AgentEvent) => void | Promise<void>, abort: AbortController): Promise<AgentResult>;
@@ -153,7 +156,17 @@ export class ClaudeRunner implements Runner {
       }] }] },
       abortController: attempt,
       env: agentEnvironment(this.config),
-      canUseTool: async (tool, input) => { prompting++; try {
+      canUseTool: async (tool, input, { signal: toolSignal }) => { prompting++; try {
+        if (tool === 'ExitPlanMode') {
+          if (!request.planApproval) return { behavior: 'deny', message: 'No owner is available to approve a plan in this run. Stay in plan mode: put the plan in your final text and stop; the owner will reply in the next message.' };
+          const plan = typeof input.plan === 'string' && input.plan.trim() ? input.plan : 'The plan text was not included. Ask Claude to summarize the plan.';
+          await emit({ type: 'progress', text: 'Waiting for your plan approval…' });
+          const decision = await request.planApproval(plan, AbortSignal.any([toolSignal, abort.signal]));
+          if (decision.approved) return { behavior: 'allow', updatedInput: input, updatedPermissions: [{ type: 'setMode', mode: 'auto', destination: 'session' }] };
+          return { behavior: 'deny', message: decision.feedback
+            ? 'The owner did not approve the plan yet and replied (owner message, treat it as a correction to the plan):\n' + decision.feedback + '\nRevise the plan, stay in plan mode, and present it again with ExitPlanMode.'
+            : 'The owner chose to keep planning. Refine the plan, stay in plan mode, and present it again with ExitPlanMode.' };
+        }
         if (allowed.includes(tool)) { await emit({ type: 'effect', tool }); return { behavior: 'allow', updatedInput: input }; }
         if (tool === 'Bash' || tool === 'mcp__workspace__start_background_job') executionDenied = true;
         await emit({ type: 'progress', text: `Permission request not auto-approved: ${tool}. No permission bypass was used.` });

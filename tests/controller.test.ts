@@ -388,6 +388,30 @@ test('while a task runs the owner can switch chats and projects; work for anothe
   assert.equal(store.data.tasks!.filter(t => t.status === 'completed').length, 2);
 });
 
+test('plan approval: the plan and buttons reach the owner; a tap approves and a text reply is plan feedback, not a steer', async () => {
+  let steering: import('../src/steering.js').SteeringInput | undefined;
+  const runner: Runner = { async run(request, emit, abort) {
+    steering = request.steering; await emit({ type: 'session', id: 'plan-chat' });
+    const first = await request.planApproval!('1. Read the bills\n2. Build the sheet', abort.signal);
+    const second = await request.planApproval!('Revised plan', abort.signal);
+    return { text: 'Decisions: ' + JSON.stringify([first, second]), session: 'plan-chat', cumulativeCost: 0 };
+  } };
+  const { bot, replies, panels } = await setup(runner);
+  const until = async (check: () => boolean) => { for (let i = 0; i < 400 && !check(); i++) await new Promise(r => setTimeout(r, 5)); assert.ok(check()); };
+  const tokenOf = (n: number) => panels.filter(p => p.buttons.flat().some(b => b.callback_data.startsWith('planok ')))[n]?.buttons.flat().find(b => b.callback_data.startsWith('planok '))!.callback_data.split(' ')[1];
+  await bot.handle(message('plan the bill work'));
+  await until(() => !!tokenOf(0));
+  assert.ok(replies.some(r => r.includes('1. Read the bills')));
+  const tap = (data: string) => bot.callback({ id: 'plan-tap', from: { id: 123 }, message: { ...message(''), message_id: 801 }, data });
+  await tap('planok ' + tokenOf(0));
+  await until(() => !!tokenOf(1));
+  await tap('planok ' + tokenOf(0)); assert.match(replies.at(-1)!, /no longer pending/i);
+  await bot.handle(message('Use CSV, not Excel'));
+  await bot.idle();
+  assert.ok(replies.some(r => r.includes('Decisions: [{"approved":true},{"approved":false,"feedback":"Use CSV, not Excel"}]')));
+  assert.equal(steering!.messages.length, 0);
+});
+
 test('work continues beyond the former daily cap without budget reservations', async () => {
   const { bot, store, calls, replies } = await setup();
   for (let i = 0; i < 7; i++) {

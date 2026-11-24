@@ -402,6 +402,25 @@ test('unresolved prompts deny instead of disabling auto safeguards', async () =>
   assert.equal(decision?.behavior, 'deny');
 });
 
+test('ExitPlanMode waits for the owner: approval switches back to auto, rejection returns the feedback', async () => {
+  const asked: string[] = []; const decisions = [{ approved: true as const }, { approved: false as const, feedback: 'Use CSV, not Excel' }, { approved: false as const }];
+  let options!: Options;
+  await new ClaudeRunner(config, factory([init, result], o => { options = o; })).run({ prompt: 'x', cwd: '/work',
+    planApproval: async plan => { asked.push(plan); return decisions.shift()!; } }, () => {}, new AbortController());
+  const ask = async () => (await options.canUseTool!('ExitPlanMode', { plan: '1. Read bills\n2. Build sheet' }, { signal: new AbortController().signal, toolUseID: '1', requestId: '1' })) as { behavior: string; message?: string; updatedPermissions?: unknown };
+  const approved = await ask();
+  assert.equal(approved.behavior, 'allow');
+  assert.deepEqual(approved.updatedPermissions, [{ type: 'setMode', mode: 'auto', destination: 'session' }]);
+  const rejected = await ask();
+  assert.equal(rejected.behavior, 'deny'); assert.match(rejected.message ?? '', /Use CSV, not Excel/);
+  const kept = await ask();
+  assert.equal(kept.behavior, 'deny'); assert.match(kept.message ?? '', /keep planning/i);
+  assert.deepEqual(asked, ['1. Read bills\n2. Build sheet', '1. Read bills\n2. Build sheet', '1. Read bills\n2. Build sheet']);
+  // Without an owner channel (scheduled runs), the plan is never auto-approved.
+  await new ClaudeRunner(config, factory([init, result], o => { options = o; })).run({ prompt: 'x', cwd: '/work' }, () => {}, new AbortController());
+  assert.equal((await ask()).behavior, 'deny');
+});
+
 test('runner rejects a main-agent model change after initialization', async () => {
   const changed = { type: 'assistant', parent_tool_use_id: null, message: {
     id: 'msg-test', type: 'message', role: 'assistant', model: 'claude-sonnet-5', content: [],
