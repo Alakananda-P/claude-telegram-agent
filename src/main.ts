@@ -16,6 +16,7 @@ import { SharedMemory } from './memory.js';
 import { diagnoseFailedSessions } from './diagnostics.js';
 import { Automation } from './automation.js';
 import { KeyPool, messageProbe } from './key-pool.js';
+import { ModelCatalog, fetchModels } from './models.js';
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -46,6 +47,11 @@ async function main(): Promise<void> {
   const keys = new KeyPool(config, store, messageProbe(ledger));
   await keys.initialize();
   console.log(`API key pool ready: configured=${keys.list().length}; automaticChecks=true.`);
+  // Model list: refreshed at startup when stale and every 12 h; the last good copy or the built-in list is used meanwhile.
+  const models = new ModelCatalog(store, config.modelFamilies, () => fetchModels((keys.selectedConfig() ?? config).apiKey));
+  const refreshModels = () => { if (models.due()) void models.refresh().catch(() => {}); };
+  refreshModels();
+  const modelTimer = setInterval(refreshModels, 60 * 60_000); modelTimer.unref();
   const controller = new Controller(config, store, telegram, new ResilientRunner(config, store, undefined, undefined, keys), ledger, new HaikuTitles(config, ledger, undefined, () => keys.selectedConfig()), keys);
   const shutdown = new AbortController();
   let stopping = false;
@@ -53,6 +59,7 @@ async function main(): Promise<void> {
     if (stopping) return;
     stopping = true;
     shutdown.abort();
+    clearInterval(modelTimer);
     void keys.stop().catch(() => {});
     const forcedExit = setTimeout(() => process.exit(1), 25_000);
     forcedExit.unref();

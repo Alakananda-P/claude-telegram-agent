@@ -6,6 +6,7 @@ import { z } from 'zod';
 import { keyRecordSchema, type KeyRecord } from './key-pool.js';
 import { backgroundJobSchema, type BackgroundJob } from './background.js';
 import { projectRecordSchema, type ProjectRecord } from './project-state.js';
+import type { ModelCatalogState } from './models.js';
 
 const identifier = z.string().regex(/^[a-zA-Z0-9_-]{1,100}$/);
 const projectId = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,47}$/);
@@ -54,6 +55,8 @@ export interface State {
   version: 1; offset: number; project: string; sessions: Record<string, string>;
   active: JobRecord | null; lastJob: JobRecord | null;
   settings?: AgentSettings;
+  /** Last good Models API list (new optional field; older versions ignore it). */
+  modelCatalog?: ModelCatalogState;
   indicatorIds?: number[];
   lastSpeed?: string;
   memoryEnabled?: boolean;

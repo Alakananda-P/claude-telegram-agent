@@ -5,6 +5,8 @@ export interface Config {
   token: string; owner: number; apiKey: string; dataDir: string;
   model: string; effort: Effort; fast: boolean; permissionMode: 'auto';
   maxTurns: number; timeoutMs: number;
+  /** Model families offered in /model (ALLOWED_MODEL_FAMILIES); the newest model of each comes from the Models API. */
+  modelFamilies: string[];
   backupKeys?: string[]; backupEncryptionKey?: string;
   keyLabels?: string[]; elevenLabsKey?: string;
 }
@@ -33,6 +35,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const model = env.CLAUDE_MODEL ?? MODELS.opus;
   if (!Object.values(MODELS).includes(model as typeof MODELS.opus)) throw new Error('CLAUDE_MODEL must be claude-fable-5-1, claude-opus-5-5 or claude-sonnet-5-5.');
   if (!['true', 'false'].includes(env.CLAUDE_FAST_MODE ?? 'true')) throw new Error('CLAUDE_FAST_MODE must be true or false.');
+  const families = (env.ALLOWED_MODEL_FAMILIES ?? 'fable,opus,sonnet').split(',').map(f => f.trim());
+  if (!families.length || families.length > 8 || families.some(f => !/^[a-z]{1,32}$/.test(f))) throw new Error('ALLOWED_MODEL_FAMILIES must be a comma-separated list of model families, e.g. fable,opus,sonnet.');
+  const modelFamilies = [...new Set(families)];
   const maxTurns = positive('MAX_TURNS', 50);
   if (!Number.isInteger(maxTurns)) throw new Error('MAX_TURNS must be an integer.');
   let backupKeys: string[] = [];
@@ -46,7 +51,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
   if (backupEncryptionKey && !/^[a-f0-9]{64}$/i.test(backupEncryptionKey)) throw new Error('Set BACKUP_ENCRYPTION_KEY to 32 random bytes encoded as hex.');
   return { token, owner, apiKey: required('ANTHROPIC_API_KEY'), model, backupKeys, backupEncryptionKey, keyLabels, elevenLabsKey: env.ELEVENLABS_API_KEY?.trim() || undefined,
-    effort, fast: (env.CLAUDE_FAST_MODE ?? 'true') === 'true', permissionMode: 'auto', maxTurns,
+    effort, fast: (env.CLAUDE_FAST_MODE ?? 'true') === 'true', permissionMode: 'auto', maxTurns, modelFamilies,
     timeoutMs: positive('JOB_TIMEOUT_MINUTES', 20) * 60_000,
     dataDir: path.resolve(env.DATA_DIR ?? './data') };
 }
