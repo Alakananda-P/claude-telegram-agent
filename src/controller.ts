@@ -932,6 +932,11 @@ export class Controller {
         : abort.signal.aborted ? 'Task stopped.'
         : error instanceof AgentError || error instanceof TranscriptionError ? error.message : 'The task could not finish. Check API access and storage, or try a smaller task.';
       await this.say(notice + (pendingHelpers ? '\nPending SDK helpers stopped with this task; their completion is unconfirmed. No work was replayed.' : ''));
+      if (error instanceof AgentApiError) {
+        // W47-05/06: the reason is in the notice above; offer the retry right here.
+        await this.panel(`Claude API problem: ${error.kind.replace(/_/g, ' ')}. Retry this task when it is fixed (for a busy or overloaded API, after a minute). The queue is paused; /queue resumes it.`,
+          [[button('Retry task', 'taskretry ' + task.id)], [button('Queue', 'queue'), button('Key status', 'keys')], ...BACK]);
+      }
       if (error instanceof AgentSafetyError) {
         // H-01: resuming the stopped transcript tends to stop again. If this is the selected chat,
         // switch it to a fresh conversation seeded with a summary of earlier completed work.

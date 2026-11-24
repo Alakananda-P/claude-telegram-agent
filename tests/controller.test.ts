@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { ChatArchive } from '../src/chats.js';
 import { Controller, extendedDeadline } from '../src/controller.js';
-import { AgentSafetyError, type Runner, type AgentRequest } from '../src/agent.js';
+import { AgentSafetyError, AgentApiError, type Runner, type AgentRequest } from '../src/agent.js';
 import { loadConfig } from '../src/config.js';
 import { StateStore } from '../src/state.js';
 import type { Message } from '../src/safety.js';
@@ -570,6 +570,15 @@ test('a progress indicator that cannot be deleted is neutralised, so no helper t
   sender.remove = async () => { throw new Error('message can\'t be deleted'); };
   await bot.handle(message('audit the chats')); await bot.idle();
   assert.equal(indicators.at(-1), 'Finished.');
+});
+
+test('an API failure tells the owner the reason and offers a Retry button for that task', async () => {
+  const { bot, replies, panels, store } = await setup({ async run(_r, emit) { await emit({ type: 'session', id: 'api-chat' }); throw new AgentApiError('billing_error', 'Claude API billing or credits blocked this request. Check the Anthropic account balance and billing settings.'); } });
+  await bot.handle(message('make the sheet')); await bot.idle();
+  assert.match(replies.join('\n'), /billing or credits/);
+  const id = store.data.tasks![0].id;
+  assert.ok(panels.at(-1)!.buttons.flat().some(b => b.callback_data === 'taskretry ' + id));
+  assert.match(panels.at(-1)!.text, /Retry/);
 });
 
 test('work continues beyond the former daily cap without budget reservations', async () => {
