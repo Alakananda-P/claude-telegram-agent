@@ -170,6 +170,19 @@ export class Controller {
   /** Model list; main.ts replaces it with one that fetches the Models API. */
   models: ModelCatalog;
   private get settings(): AgentSettings { return this.store.data.settings ?? { model: this.config.model, ...(this.config.modelFamily ? { family: this.config.modelFamily } : {}), effort: this.config.effort, fast: this.config.fast }; }
+  /** W47-08: after an unexpected restart, name the stopped task(s) and the likely cause. Says nothing on a normal start. */
+  async restartNotice(): Promise<void> {
+    const tasks = this.store.interruptedAtStart.map(id => this.store.data.tasks!.find(t => t.id === id)).filter((t): t is Task => !!t);
+    if (!tasks.length) return;
+    const lines = tasks.slice(0, 5).map(t => {
+      const chat = this.store.data.conversations?.find(c => c.id === this.resolveChat(t.chatKey));
+      return `• “${privatePreview(t.displayPrompt ?? t.prompt, configSecrets(this.config), 80)}”${chat ? ' · ' + sessionTitle(chat) : t.interactive === false ? ' · scheduled run' : ''}`;
+    });
+    await this.say(`The bot restarted while work was running, so ${tasks.length > 1 ? 'these tasks' : 'this task'} stopped:\n${lines.join('\n')}${tasks.length > 5 ? `\n…and ${tasks.length - 5} more.` : ''}\n\n`
+      + 'Likely reason: the server ran out of memory (Render plan: 1 CPU / 2 GB) or the process crashed; large jobs such as video renders or many helpers use the most memory. '
+      + 'Files already made are kept and nothing was retried. Retry from /queue when ready.', true);
+  }
+
   /** Tells the owner once when the newest model of the chosen family changes, e.g. Fable 5.1 -> Fable 5.2. */
   async announceModelChanges(): Promise<void> {
     const s = this.settings; const family = settingsFamily(s);

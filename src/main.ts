@@ -167,7 +167,7 @@ async function main(): Promise<void> {
     if (updated) await controller.reportUpdate(runningCommit, agentPassed);
     await announce();
     void checkPrices();
-    if (store.data.lastJob?.status === 'interrupted') await telegram.send(config.owner, 'The previous task was interrupted by a restart. Review its files before retrying.').catch(() => {});
+    await controller.restartNotice().catch(() => {});
     console.log('Private Telegram worker started.');
     controller.start();
     keys.start();

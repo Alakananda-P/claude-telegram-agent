@@ -84,6 +84,8 @@ export interface State {
 
 export class StateStore {
   private saving: Promise<void> = Promise.resolve();
+  /** Tasks that were running when the previous process died (W47-08); not persisted. */
+  interruptedAtStart: string[] = [];
   private constructor(readonly file: string, public data: State) {}
 
   static async open(file: string): Promise<StateStore> {
@@ -125,7 +127,8 @@ export class StateStore {
     }
     // A queued handoff may have been staged in the middle of a selection or
     // cancellation transaction. Never replay that uncertain continuation.
-    for (const task of data.tasks!) if (task.status === 'running' || (task.status === 'queued' && task.handoffFrom)) { task.status = 'interrupted'; task.failureKind = 'worker_restart'; task.finishedAt = new Date().toISOString(); }
+    const interrupted: string[] = [];
+    for (const task of data.tasks!) if (task.status === 'running' || (task.status === 'queued' && task.handoffFrom)) { if (task.status === 'running') interrupted.push(task.id); task.status = 'interrupted'; task.failureKind = 'worker_restart'; task.finishedAt = new Date().toISOString(); }
     for (const job of data.backgroundJobs ?? []) if (['starting', 'running'].includes(job.status)) { job.status = 'interrupted'; job.finishedAt = new Date().toISOString(); }
     data.bindings = Object.assign(Object.create(null), data.bindings ?? {});
     data.drafts = Object.assign(Object.create(null), data.drafts ?? {});
@@ -140,6 +143,7 @@ export class StateStore {
       data.active = null;
     }
     const store = new StateStore(file, data);
+    store.interruptedAtStart = interrupted;
     await store.save();
     return store;
   }
