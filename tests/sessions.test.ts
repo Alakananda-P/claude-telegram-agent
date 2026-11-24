@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { StateStore } from '../src/state.js';
 import { ChatArchive } from '../src/chats.js';
-import { SessionCatalog, sessionTools, sessionServer } from '../src/sessions.js';
+import { SessionCatalog, sessionTools, sessionServer, toolResult } from '../src/sessions.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 
@@ -197,4 +197,13 @@ test('a task sees its own chat as currentSession, not the chat the owner has sel
   assert.equal(catalog.scoped('schedule-7', 'bills').context().currentSession, 'old-id', 'a bound schedule chat resolves to its session');
   const fresh = catalog.scoped('schedule-new', 'default').context();
   assert.equal(fresh.currentSession, null); assert.equal(fresh.currentTitle, 'New chat');
+});
+
+test('an unreadable file gives the clear permission message instead of a generic error', async () => {
+  for (const code of ['EACCES', 'EPERM']) {
+    const result = await toolResult(async () => { throw Object.assign(new Error('EACCES: permission denied, open /data/secret/path'), { code }); });
+    assert.equal(result.isError, true); assert.equal(result.content[0].text, 'File access was denied by storage permissions.');
+  }
+  const other = await toolResult(async () => { throw new Error('boom /private/path'); });
+  assert.equal(other.content[0].text, 'Saved data could not be accessed. No raw service details are exposed.');
 });

@@ -235,7 +235,10 @@ export class SessionCatalog {
 export async function toolResult(action: () => unknown | Promise<unknown>, secrets: string[] = []) {
   try { return { content: [{ type: 'text' as const, text: safeJson(await action(), secrets) }] }; }
   catch (error) { return { isError: true, content: [{ type: 'text' as const,
-    text: error instanceof SessionAccessError || error instanceof PathAccessError || error instanceof ProjectError ? redact(error.message, secrets) : 'Saved data could not be accessed. No raw service details are exposed.' }] }; }
+    text: error instanceof SessionAccessError || error instanceof PathAccessError || error instanceof ProjectError ? redact(error.message, secrets)
+      // H-25: e.g. deliver_file reading a file without read permission. Never echo the raw path.
+      : ['EACCES', 'EPERM'].includes((error as NodeJS.ErrnoException)?.code ?? '') ? 'File access was denied by storage permissions.'
+      : 'Saved data could not be accessed. No raw service details are exposed.' }] }; }
 }
 export const SESSION_TOOL_NAMES = ['list_sessions', 'read_session', 'rename_session', 'search_sessions', 'request_delete_session', 'restore_session', 'list_trash'].map(name => `mcp__sessions__${name}`);
 export function sessionTools(catalog: SessionCatalog) {
