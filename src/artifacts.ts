@@ -4,7 +4,7 @@ import { secretPath } from './safety.js';
 
 const deliverable = /\.(xlsx?|csv|pdf|png|jpe?g|webp|docx|pptx|zip|txt|md|json|html)$/i;
 // Filename screening for automatic delivery only, not a content classifier.
-const privateDocument = (name: string) => name.split('/').some(part => /(?:^|[._ -])(?:aadhaar|aadhar|adhaar|passport|pan(?:[_ -]?card)?|voter[_ -]?id|driving[_ -]?licen[cs]e|identity|id[_ -]?proof|api[_ -]?keys?|access[_ -]?tokens?|passwords?|secrets?)(?:[._ -]|$)/i.test(part));
+export const privateDocument = (name: string) => name.split('/').some(part => /(?:^|[._ -])(?:aadhaar|aadhar|adhaar|passport|pan(?:[_ -]?card)?|voter[_ -]?id|driving[_ -]?licen[cs]e|identity|id[_ -]?proof|api[_ -]?keys?|access[_ -]?tokens?|passwords?|secrets?)(?:[._ -]|$)/i.test(part));
 export async function artifactSnapshot(root: string): Promise<Record<string, string>> {
   const out: Record<string, string> = Object.create(null);
   let visited = 0;

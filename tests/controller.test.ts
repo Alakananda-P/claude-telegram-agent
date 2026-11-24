@@ -549,6 +549,19 @@ test('an image Telegram refuses as a photo is sent as a document instead of bein
   assert.ok(!replies.some(r => /automatic delivery failed/.test(r)));
 });
 
+test('/files shows a short list, output first, and never names private-looking documents', async () => {
+  const { bot, replies, dataDir } = await setup();
+  const root = path.join(dataDir, 'workspaces', 'default'); await mkdir(path.join(root, 'output'), { recursive: true }); await mkdir(path.join(root, 'data'), { recursive: true });
+  for (let i = 0; i < 60; i++) await writeFile(path.join(root, 'data', `row-${String(i).padStart(2, '0')}.csv`), 'x');
+  await writeFile(path.join(root, 'output', 'report.xlsx'), 'x'); await writeFile(path.join(root, 'output', 'aadhaar_front.jpg'), 'x');
+  await bot.handle(message('/files'));
+  const text = replies.at(-1)!;
+  assert.ok(text.split('\n').filter(l => /\.(csv|xlsx|jpg)$/.test(l)).length <= 25, 'capped');
+  assert.match(text, /^output\/report\.xlsx/m); assert.ok(text.indexOf('output/report.xlsx') < text.indexOf('data/'), 'output first');
+  assert.doesNotMatch(text, /aadhaar/i); assert.match(text, /1 private-looking file/);
+  assert.match(text, /more file/);
+});
+
 test('work continues beyond the former daily cap without budget reservations', async () => {
   const { bot, store, calls, replies } = await setup();
   for (let i = 0; i < 7; i++) {

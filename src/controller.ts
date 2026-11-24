@@ -18,7 +18,7 @@ import { TitleAccountingError, type TitleGenerator } from './titles.js';
 import { Automation, clockInfo, type Task, type Batch, type SteerRecord, type TelegramMessageContext } from './automation.js';
 import type { MessageListOptions, MessageDeletion } from './telegram.js';
 import { SteeringInput } from './steering.js';
-import { artifactSnapshot, changedArtifactReport } from './artifacts.js';
+import { artifactSnapshot, changedArtifactReport, privateDocument } from './artifacts.js';
 import { Backups } from './backup.js';
 import { KeyPool } from './key-pool.js';
 import { Transcriber, TranscriptionError, type TranscriptionService } from './transcription.js';
@@ -490,7 +490,15 @@ export class Controller {
         const selected = await this.projects.select(name);
         return this.panel(`Active project: ${selected.name}. Its saved conversation will resume.`, HOME);
       }
-      if (command === 'files') return this.say((await this.listFiles(root)).join('\n') || 'No files yet.');
+      if (command === 'files') {
+        // W47-03: a short list (output/ first), never naming private-looking documents.
+        const all = await this.listFiles(root); const hidden = all.filter(f => privateDocument(f)).length;
+        const shown = all.filter(f => !privateDocument(f)).sort((a, b) => Number(!a.startsWith('output/')) - Number(!b.startsWith('output/')) || a.localeCompare(b));
+        const more = shown.length - 25;
+        return this.say(!all.length ? 'No files yet.' : shown.slice(0, 25).join('\n')
+          + (more > 0 ? `\n…and ${more}${all.length >= 100 ? '+' : ''} more file(s). Ask Claude to find a file, or use /projects > Files to browse.` : '')
+          + (hidden ? `\n${hidden} private-looking file(s) are not listed; ask for them by name with /get.` : ''));
+      }
       if (command === 'get') {
         const file = await safeFile(root, argument);
         if ((await lstat(file)).size > 49_000_000) return this.say('File exceeds the 49 MB download limit.');
