@@ -258,7 +258,8 @@ export class ClaudeRunner implements Runner {
           initialized = true;
           await emit({ type: 'session', id: event.session_id });
           if (event.fast_mode_state) await emit({ type: 'speed', state: event.fast_mode_state });
-        } else if (event.type === 'system' && event.subtype === 'status' && event.permissionMode && event.permissionMode !== 'auto') {
+        } else if (event.type === 'system' && event.subtype === 'status' && event.permissionMode && !['auto', 'plan'].includes(event.permissionMode)) {
+          // Plan mode is read-only, so it is stricter than auto. Every other mode stops the job.
           throw new AgentError('Claude configuration changed away from auto; job stopped.');
         } else if (event.type === 'assistant' && !event.parent_tool_use_id) {
           if (event.message.stop_reason === 'refusal') safetyError = new AgentSafetyError();

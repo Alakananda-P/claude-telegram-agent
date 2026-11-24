@@ -337,6 +337,16 @@ test('runner rejects model or permission fallback and incomplete streams', async
   await assert.rejects(new ClaudeRunner(config, factory([init])).run({ prompt: 'x', cwd: '/work' }, () => {}, new AbortController()), /result/i);
 });
 
+test('plan mode is the only permission change that keeps the job alive', async () => {
+  const status = (permissionMode: string) => ({ type: 'system', subtype: 'status', status: null, permissionMode, session_id: 'session-1', uuid: 'status-' + permissionMode });
+  const planned = new ClaudeRunner(config, factory([init, status('plan'), status('auto'), result]));
+  assert.equal((await planned.run({ prompt: 'x', cwd: '/work' }, () => {}, new AbortController())).text, result.result);
+  for (const mode of ['bypassPermissions', 'acceptEdits', 'default', 'dontAsk']) {
+    const runner = new ClaudeRunner(config, factory([init, status('plan'), status(mode), result]));
+    await assert.rejects(runner.run({ prompt: 'x', cwd: '/work' }, () => {}, new AbortController()), /changed away from auto/i);
+  }
+});
+
 test('runner reports SDK failures without exposing raw error text', async () => {
   const seen: AgentEvent[] = [];
   const failure = { ...result, subtype: 'error_during_execution', is_error: true, errors: ['secret-value'], result: undefined };
