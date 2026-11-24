@@ -237,6 +237,26 @@ test('idle watchdog closes a silent turn after the answer when a helper never re
   assert.ok(events.some(e => e.type === 'commentary' && /did not report back/.test(e.text)));
 });
 
+test('idle watchdog never closes a task that is waiting for a plan approval', async () => {
+  const events: AgentEvent[] = []; let options!: Options;
+  const make: QueryFactory = request => { options = request.options; return { async *[Symbol.asyncIterator]() {
+    const incoming = (request.prompt as AsyncIterable<import('@anthropic-ai/claude-agent-sdk').SDKUserMessage>)[Symbol.asyncIterator]();
+    const first = (await incoming.next()).value!; yield init as SDKMessage;
+    yield { type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: 'audit', run_id: 'run-1', task_type: 'local_agent', description: 'Audit' }] } as unknown as SDKMessage;
+    yield { ...result, result: 'Plan drafted', user_message_uuids: [first.uuid] } as unknown as SDKMessage;
+    // The approval prompt stays open longer than both idle limits.
+    const decision = await options.canUseTool!('ExitPlanMode', { plan: 'Step 1' }, { signal: new AbortController().signal, toolUseID: 't', requestId: 'r' });
+    assert.equal(decision?.behavior, 'allow');
+    yield { type: 'system', subtype: 'task_notification', task_id: 'audit', run_id: 'run-1', status: 'completed', summary: 'done' } as unknown as SDKMessage;
+    yield { type: 'system', subtype: 'background_tasks_changed', tasks: [] } as unknown as SDKMessage;
+    yield { ...result, uuid: 'r2', result: 'Approved and done', origin: { kind: 'task-notification', runId: 'run-1' } } as unknown as SDKMessage;
+  }, close() {} }; };
+  const output = await new ClaudeRunner(config, make, fastIdle).run({ prompt: 'Plan it', cwd: '/work',
+    planApproval: () => new Promise(resolve => setTimeout(() => resolve({ approved: true }), fastIdle.helperMs * 3)) }, e => { events.push(e); }, new AbortController());
+  assert.equal(output.text, 'Approved and done');
+  assert.deepEqual(events.filter(e => e.type === 'idle_closed'), []);
+});
+
 test('idle watchdog never closes while an owner message is unanswered or the main turn is still running', async () => {
   const steering = new SteeringInput(); const events: AgentEvent[] = [];
   const make: QueryFactory = ({ prompt }) => ({ async *[Symbol.asyncIterator]() {
