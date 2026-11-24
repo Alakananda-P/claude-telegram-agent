@@ -581,6 +581,20 @@ test('an API failure tells the owner the reason and offers a Retry button for th
   assert.match(panels.at(-1)!.text, /Retry/);
 });
 
+test('an album and its caption start one task together, and a pending caption is kept when the instruction comes later', async () => {
+  const { bot, calls } = await setup();
+  bot.albumDelayMs = 20;
+  await bot.handle({ ...photo('a', 'album-1'), caption: 'MAY DATA' }); await bot.handle(photo('b', 'album-1'));
+  for (let i = 0; i < 200 && !calls.length; i++) await new Promise(r => setTimeout(r, 5));
+  await bot.idle();
+  assert.equal(calls.length, 1, 'one task for the whole album');
+  assert.match(calls[0].prompt, /MAY DATA/); assert.equal((calls[0].prompt.match(/uploads\//g) ?? []).length, 2);
+  assert.equal((calls[0].prompt.match(/MAY DATA/g) ?? []).length, 1, 'caption once');
+  await bot.handle(message('/batch')); await bot.handle({ ...photo('c'), caption: 'June bills' });
+  await bot.handle(message('make the sheet')); await bot.idle();
+  assert.match(calls.at(-1)!.prompt, /June bills/); assert.match(calls.at(-1)!.prompt, /make the sheet/);
+});
+
 test('work continues beyond the former daily cap without budget reservations', async () => {
   const { bot, store, calls, replies } = await setup();
   for (let i = 0; i < 7; i++) {

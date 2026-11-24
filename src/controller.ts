@@ -131,6 +131,9 @@ export class Controller {
   /** GitHub + Render access for /update; undefined means not configured. Set by main.ts. */
   updates?: Updates;
   updatePollMs = 15_000;
+  /** Wait after the last album item before starting a captioned album (H-18). */
+  albumDelayMs = 2500;
+  private albumTimers = new Map<string, NodeJS.Timeout>();
   private pendingUpdate?: { token: string; live: Deploy; target: string; expires: number };
   private pendingRollback?: { token: string; expires: number };
 
@@ -304,6 +307,7 @@ export class Controller {
   async stop(): Promise<void> {
     this.shuttingDown = true;
     clearInterval(this.timer);
+    for (const timer of this.albumTimers.values()) clearTimeout(timer);
     this.running?.abort.abort();
     await this.idle();
     await this.background.stop();
@@ -1071,18 +1075,31 @@ export class Controller {
       await this.uploadReceipt();
       if (message.voice) await this.processBatches(this.pendingBatches(), 'Voice instruction', relative, messageContext);
       else if (message.caption?.trim() && !batch.manual && !batch.groupId) await this.processBatches([batch], batch.prompt!, undefined, messageContext);
+      // H-18: an album arrives as one message per item. Once it has a caption, start it shortly after its last item.
+      else if (batch.groupId && batch.prompt && !batch.manual) this.scheduleAlbum(batch.id, messageContext);
     } catch {
       await this.say('Upload could not be accepted. Check file size/format and send it again. No processing started.');
     } finally {
       if (indicator !== undefined) await this.messenger.remove(this.config.owner, indicator).catch(() => this.messenger.edit(this.config.owner, indicator, success ? 'Received.' : 'Upload failed.').catch(() => {}));
     }
   }
+  private scheduleAlbum(batchId: string, messageContext: TelegramMessageContext): void {
+    clearTimeout(this.albumTimers.get(batchId));
+    const timer = setTimeout(() => {
+      this.albumTimers.delete(batchId);
+      const batch = this.store.data.batches!.find(b => b.id === batchId && b.status === 'collecting');
+      if (batch && !this.shuttingDown) void this.processBatches([batch], batch.prompt, undefined, messageContext).catch(() => this.say('The album could not be started. Its files are saved; send your instruction again.'));
+    }, this.albumDelayMs);
+    timer.unref?.(); this.albumTimers.set(batchId, timer);
+  }
   private async processBatches(batches: Batch[], instruction?: string, voiceInput?: string, messageContext?: TelegramMessageContext): Promise<void> {
     if (!batches.length || !batches.some(b => b.uploadIds.length)) return this.say('No files waiting in this chat. Send photos, videos or documents first.');
     if (this.store.data.queuePaused && !this.conversation?.input.accepting) return this.say('Processing is paused. Files are saved; resume from /queue, then send your instruction.');
     const ids = new Set(batches.flatMap(b => b.uploadIds));
     const files = this.store.data.uploads!.filter(u => ids.has(u.id));
-    const prompt = instruction ?? (batches.map(b => b.prompt).filter(Boolean).join('\n') || 'Inspect these files. For bill photos, extract only clear values, check arithmetic, and ask about unclear fields with relevant crops. If the desired output is unclear, ask the owner.');
+    // H-18: captions sent with the files stay part of the task when the instruction comes later.
+    const captions = batches.map(b => b.prompt).filter(Boolean).join('\n');
+    const prompt = (instruction && captions && !voiceInput && instruction !== captions ? captions + '\n' + instruction : instruction) ?? (captions || 'Inspect these files. For bill photos, extract only clear values, check arithmetic, and ask about unclear fields with relevant crops. If the desired output is unclear, ask the owner.');
     for (const batch of batches) batch.status = 'queued';
     await this.launch(prompt + '\n\nAttached project files:\n' + files.map(f => f.path).join('\n'), await this.workspace(batches[0].project), prompt + `\n[${files.length} attached files]`, voiceInput, voiceInput ? files.filter(f => f.path !== voiceInput).map(f => f.path) : undefined, messageContext);
     for (const batch of batches) await this.dismiss('batch-' + batch.id);
