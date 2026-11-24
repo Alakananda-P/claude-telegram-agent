@@ -469,14 +469,8 @@ export class Controller {
         return this.panel('New chat ready. Your previous chat is in Sessions. Files and shared memory are kept.', HOME);
       }
       if (command === 'fresh') {
-        const source = this.resolveChat(this.chatKey());
-        const summary = await completedWorkSummary(root, this.store.data.tasks!.filter(t => t.project === this.store.data.project && this.resolveChat(t.chatKey) === source), configSecrets(this.config));
-        const draft = 'draft-' + randomUUID();
-        await this.chats.append(draft, { role: 'assistant', text: summary });
-        delete this.store.data.sessions[this.store.data.project];
-        (this.store.data.drafts ??= {})[this.store.data.project] = draft;
-        (this.store.data.freshContexts ??= {})[draft] = summary;
-        await this.store.save(); await this.clearScreen();
+        const summary = await this.openFresh(root);
+        await this.clearScreen();
         return this.panel('Fresh chat ready.\n\n' + summary + '\n\nSend your next instruction. The previous chat remains in Sessions; stopped requests and raw attachments have not been replayed.', HOME);
       }
       if (command === 'project') {
@@ -529,6 +523,19 @@ export class Controller {
     await this.automation.enqueue({ kind: 'agent', messageContext, project: this.store.data.project, chatKey: this.chatKey(), prompt, displayPrompt, voiceInput, attachedFiles, settings: { ...this.settings }, interactive: true, ...(planMode ? { planMode: true } : {}) });
     this.kick();
     if (otherChat) await this.say('Another chat is running. This message is queued for this chat and starts when that task finishes. See /queue.');
+  }
+
+  /** Opens a fresh draft chat seeded with a summary of the selected chat's completed work (used by /fresh and after a safety stop). */
+  private async openFresh(root: string): Promise<string> {
+    const source = this.resolveChat(this.chatKey());
+    const summary = await completedWorkSummary(root, this.store.data.tasks!.filter(t => t.project === this.store.data.project && this.resolveChat(t.chatKey) === source), configSecrets(this.config));
+    const draft = 'draft-' + randomUUID();
+    await this.chats.append(draft, { role: 'assistant', text: summary });
+    delete this.store.data.sessions[this.store.data.project];
+    (this.store.data.drafts ??= {})[this.store.data.project] = draft;
+    (this.store.data.freshContexts ??= {})[draft] = summary;
+    await this.store.save();
+    return summary;
   }
 
   /** /update: show live -> new main with the commit titles; on the owner's Confirm tap, back up the
@@ -881,7 +888,17 @@ export class Controller {
         : abort.signal.aborted ? 'Task stopped.'
         : error instanceof AgentError || error instanceof TranscriptionError ? error.message : 'The task could not finish. Check API access and storage, or try a smaller task.';
       await this.say(notice + (pendingHelpers ? '\nPending SDK helpers stopped with this task; their completion is unconfirmed. No work was replayed.' : ''));
-      if (error instanceof AgentSafetyError) await this.panel('Start a separate conversation when ready. A fresh summary includes only earlier completed work; the stopped request is not retried.', [[button('Continue fresh with summary', 'fresh'), button('Empty new chat', 'new chat')], ...BACK]);
+      if (error instanceof AgentSafetyError) {
+        // H-01: resuming the stopped transcript tends to stop again. If this is the selected chat,
+        // switch it to a fresh conversation seeded with a summary of earlier completed work.
+        const reason = error.category ? `Reason reported: ${error.category.replace(/_/g, ' ')}.\n` : '';
+        const selected = task.project === this.store.data.project && this.resolveChat(task.chatKey) === this.resolveChat(this.chatKey());
+        const fresh = selected ? await this.openFresh(cwd).then(() => true, () => false) : false;
+        await this.panel(`Claude's safety system stopped that request.\n${reason}` + (fresh
+          ? 'Your next message here starts a fresh conversation with a short summary of earlier completed work. The stopped request is not retried; the old chat stays in Sessions.'
+          : 'Start a separate conversation when ready. A fresh summary includes only earlier completed work; the stopped request is not retried.'),
+          [...(fresh ? [] : [[button('Continue fresh with summary', 'fresh')]]), [button('Empty new chat', 'new chat')], ...BACK]);
+      }
     } finally {
       ready(); active.input.close(); await active.serial;
       clearTimeout(timeout); clearInterval(heartbeat);

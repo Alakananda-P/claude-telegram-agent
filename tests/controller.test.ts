@@ -715,8 +715,9 @@ test('/fresh seeds only verified successful work and waits for a new instruction
   } });
   await bot.handle(message('Prepare invoice')); await bot.idle();
   await bot.handle(message('REFUSED_REQUEST_WITH_RAW_ATTACHMENT')); await bot.idle();
-  assert.ok(panels.some(p => p.buttons.flat().some(b => b.callback_data === 'fresh')));
-  await bot.handle(message('/fresh'));
+  assert.ok(panels.some(p => /safety system stopped/.test(p.text)));
+  // The stopped chat was already switched to a fresh one; /fresh still works from the original chat.
+  await bot.handle(message('/session source-session')); await bot.handle(message('/fresh'));
   assert.equal(n, 2); assert.equal(store.data.sessions.default, undefined);
   assert.match(panels.at(-1)!.text, /invoice workbook/); assert.ok(!panels.at(-1)!.text.includes('REFUSED_REQUEST'));
   const reopened = await StateStore.open(store.file); assert.ok(Object.values(reopened.data.freshContexts ?? {}).some(c => c.includes('invoice workbook')));
@@ -726,6 +727,24 @@ test('/fresh seeds only verified successful work and waits for a new instruction
   assert.equal(store.data.memoryEnabled, true); assert.equal(store.data.sessions.default, 'fresh-session');
   const old = await new ChatArchive(path.join(dataDir, 'bot/chats'), []).read('source-session');
   assert.ok(old.some(t => t.text.includes('REFUSED_REQUEST'))); assert.ok(store.data.conversations!.some(c => c.id === 'source-session'));
+});
+
+test('after a safety stop the next message in that chat starts fresh with a summary, without resuming the stopped transcript', async () => {
+  const requests: AgentRequest[] = []; let n = 0;
+  const { bot, store, panels } = await setup({ async run(request, emit) {
+    requests.push(request); n++; await emit({ type: 'session', id: n <= 2 ? 'source-session' : 'fresh-session' });
+    if (n === 2) throw new AgentSafetyError('cyber');
+    return { session: n <= 2 ? 'source-session' : 'fresh-session', text: n === 1 ? 'Completed the invoice workbook in output/invoice.xlsx.' : 'Continuing with the totals.', cumulativeCost: 0 };
+  } });
+  await bot.handle(message('Prepare invoice')); await bot.idle();
+  await bot.handle(message('REFUSED_REQUEST_TEXT')); await bot.idle();
+  assert.match(panels.at(-1)!.text, /Reason reported: cyber/);
+  assert.match(panels.at(-1)!.text, /next message here starts a fresh conversation/i);
+  await bot.handle(message('Continue with totals')); await bot.idle();
+  assert.equal(requests[2].session, undefined, 'the stopped transcript is not resumed');
+  assert.match(requests[2].prompt, /invoice workbook/);
+  assert.ok(!requests[2].prompt.includes('REFUSED_REQUEST')); assert.ok(!requests[2].resumeContext?.includes('REFUSED_REQUEST'));
+  assert.equal(store.data.sessions.default, 'fresh-session');
 });
 
 test('background work remains alive after the model turn and a new chat, then notifies its source session', async () => {
