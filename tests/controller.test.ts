@@ -562,6 +562,16 @@ test('/files shows a short list, output first, and never names private-looking d
   assert.match(text, /more file/);
 });
 
+test('a progress indicator that cannot be deleted is neutralised, so no helper text stays behind as a message', async () => {
+  const { bot, sender, indicators } = await setup({ async run(_request, emit) {
+    await emit({ type: 'session', id: 'helper-chat' }); await emit({ type: 'progress', text: 'Review tuition chat (Nov 16)' });
+    return { text: 'Done', session: 'helper-chat', cumulativeCost: 0 };
+  } });
+  sender.remove = async () => { throw new Error('message can\'t be deleted'); };
+  await bot.handle(message('audit the chats')); await bot.idle();
+  assert.equal(indicators.at(-1), 'Finished.');
+});
+
 test('work continues beyond the former daily cap without budget reservations', async () => {
   const { bot, store, calls, replies } = await setup();
   for (let i = 0; i < 7; i++) {

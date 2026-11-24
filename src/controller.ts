@@ -812,7 +812,11 @@ export class Controller {
       try {
         await this.messenger.remove(this.config.owner, indicator);
         this.store.data.indicatorIds = this.store.data.indicatorIds?.filter(id => id !== indicator);
-      } catch { /* Kept in state for cleanup on restart. */ }
+      } catch {
+        // W47-01: an undeletable indicator must not keep showing helper or progress text as if it were a
+        // message. Kept in state for cleanup on restart.
+        await this.messenger.edit(this.config.owner, indicator, 'Finished.').catch(() => {});
+      }
       indicator = undefined;
     };
     try {
