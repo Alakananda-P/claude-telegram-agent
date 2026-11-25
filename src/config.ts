@@ -5,13 +5,14 @@ export interface Config {
   token: string; owner: number; apiKey: string; dataDir: string;
   /** Claude Code OAuth is intentionally separate from API-key credentials. */
   oauthToken?: string;
+  upgradeGithubToken?: string; upgradeRenderToken?: string; upgradeRenderServiceId?: string;
   model: string; effort: Effort; fast: boolean; permissionMode: 'auto';
   maxTurns: number; timeoutMs: number;
   backupKeys?: string[]; backupEncryptionKey?: string;
   keyLabels?: string[]; elevenLabsKey?: string;
 }
 
-export function configSecrets(c: Config): string[] { return [c.token, c.apiKey, ...(c.oauthToken ? [c.oauthToken] : []), ...(c.backupKeys ?? []), ...(c.backupEncryptionKey ? [c.backupEncryptionKey] : []), ...(c.elevenLabsKey ? [c.elevenLabsKey] : [])].filter(Boolean); }
+export function configSecrets(c: Config): string[] { return [c.token, c.apiKey, ...(c.oauthToken ? [c.oauthToken] : []), ...(c.upgradeGithubToken ? [c.upgradeGithubToken] : []), ...(c.upgradeRenderToken ? [c.upgradeRenderToken] : []), ...(c.backupKeys ?? []), ...(c.backupEncryptionKey ? [c.backupEncryptionKey] : []), ...(c.elevenLabsKey ? [c.elevenLabsKey] : [])].filter(Boolean); }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const required = (key: string) => {
@@ -51,7 +52,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     catch { throw new Error('Set ANTHROPIC_KEY_LABELS to unique non-secret labels for each unique configured key.'); }
   }
   if (backupEncryptionKey && !/^[a-f0-9]{64}$/i.test(backupEncryptionKey)) throw new Error('Set BACKUP_ENCRYPTION_KEY to 32 random bytes encoded as hex.');
-  return { token, owner, apiKey, oauthToken: oauthToken || undefined, model, backupKeys, backupEncryptionKey, keyLabels, elevenLabsKey: env.ELEVENLABS_API_KEY?.trim() || undefined,
+  return { token, owner, apiKey, oauthToken: oauthToken || undefined, upgradeGithubToken: env.BOT_UPGRADE_GITHUB_TOKEN?.trim() || undefined, upgradeRenderToken: env.BOT_UPGRADE_RENDER_API_KEY?.trim() || undefined, upgradeRenderServiceId: env.BOT_UPGRADE_RENDER_SERVICE_ID?.trim() || undefined, model, backupKeys, backupEncryptionKey, keyLabels, elevenLabsKey: env.ELEVENLABS_API_KEY?.trim() || undefined,
     effort, fast: (env.CLAUDE_FAST_MODE ?? 'true') === 'true', permissionMode: 'auto', maxTurns,
     timeoutMs: positive('JOB_TIMEOUT_MINUTES', 20) * 60_000,
     dataDir: path.resolve(env.DATA_DIR ?? './data') };
