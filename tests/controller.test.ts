@@ -970,3 +970,18 @@ test('M2: billing failures still pause the queue', async () => {
   await bot.handle(message('make the sheet')); await bot.idle();
   assert.equal(store.data.queuePaused, true); assert.equal(store.data.tasks!.length, 1);
 });
+
+test('N-a: a scheduled run keeps its in-between commentary out of Telegram and sends only the final answer', async () => {
+  const { bot, replies, store } = await setup({ async run(_r, emit) {
+    await emit({ type: 'session', id: 'sched-chat' }); await emit({ type: 'commentary', id: 'c1', text: '2d done, starting 2e' });
+    await emit({ type: 'commentary', id: 'c2', text: 'Mutation check passed' }); return { text: 'Bot fix: 2e done', session: 'sched-chat', cumulativeCost: 0 };
+  } });
+  const automation = (bot as unknown as { automation: { enqueue(t: object): Promise<unknown> } }).automation;
+  await automation.enqueue({ kind: 'agent', project: 'default', chatKey: 'schedule-abc', prompt: 'Scheduled work', interactive: false });
+  await bot.tick(); await bot.idle();
+  assert.equal(store.data.tasks!.at(-1)!.status, 'completed');
+  assert.ok(replies.includes('Bot fix: 2e done'), replies.join(' | '));
+  assert.ok(!replies.some(r => /2d done|Mutation check/.test(r)), replies.join(' | '));
+  const archive = await new ChatArchive(path.join((bot as unknown as { config: { dataDir: string } }).config.dataDir, 'bot/chats'), []).read('sched-chat');
+  assert.ok(archive.some(t => t.text === 'Mutation check passed'), 'commentary stays in the saved chat');
+});

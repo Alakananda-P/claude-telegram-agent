@@ -972,8 +972,12 @@ export class Controller {
           const text = redact(event.text, configSecrets(this.config)).trim();
           const key = event.id + ':' + text;
           if (text && !published.has(key)) {
-            published.add(key); lastPublished = text; await this.chats.append(archiveKey, { role: 'assistant', text });
-            await this.say(text.length > 12000 ? text.slice(0, 12000) + '\n\nFull text is saved in this chat history.' : text, true);
+            published.add(key); await this.chats.append(archiveKey, { role: 'assistant', text });
+            // N-a: a scheduled run only sends its final answer; its commentary stays in the saved chat.
+            if (task.interactive) {
+              lastPublished = text;
+              await this.say(text.length > 12000 ? text.slice(0, 12000) + '\n\nFull text is saved in this chat history.' : text, true);
+            }
           }
         } else if (event.type === 'steered') {
           for (const record of task.steers ?? []) if (active.input.messages.some(m => m.id === record.id && m.answered)) record.status = 'answered';
