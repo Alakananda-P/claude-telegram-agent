@@ -175,6 +175,8 @@ export class Controller {
   private get settings(): AgentSettings { return this.store.data.settings ?? { model: this.config.model, ...(this.config.modelFamily ? { family: this.config.modelFamily } : {}), effort: this.config.effort, fast: this.config.fast }; }
   /** W47-08: after an unexpected restart, name the stopped task(s) and the likely cause. Says nothing on a normal start. */
   async restartNotice(): Promise<void> {
+    // H3: damaged task records were moved aside at startup instead of stopping the bot.
+    if (this.store.quarantinedAtStart) await this.say(`Some saved task records were damaged, so they were moved to ${path.basename(this.store.quarantinedAtStart)} next to the bot state and were not run. Everything else loaded normally.`, true);
     const tasks = this.store.interruptedAtStart.map(id => this.store.data.tasks!.find(t => t.id === id)).filter((t): t is Task => !!t);
     if (!tasks.length) return;
     const lines = tasks.slice(0, 5).map(t => {
@@ -540,6 +542,8 @@ export class Controller {
   }
 
   private async launch(prompt: string, cwd: string, displayPrompt = prompt, voiceInput?: string, attachedFiles?: string[], messageContext?: TelegramMessageContext, planMode = false): Promise<void> {
+    // H3: check the size before anything is saved; an oversized record would stop the next start.
+    if (!prompt.trim() || prompt.length > 30000 || displayPrompt.length > 30000) return this.say('This instruction is too long (limit 30,000 characters, including the list of attached files). Send a shorter message or fewer files. Nothing was queued.');
     await this.dismiss('controls');
     // claim() persists before execute() opens its inbox. Wait only for that small
     // startup window so rapid consecutive messages join the very first task.
@@ -694,8 +698,10 @@ export class Controller {
       if (record.voiceInput) {
         const transcript = await this.transcriber.transcribe(active.cwd, record.voiceInput, undefined, active.abort.signal);
         if (!transcript.hasSpeech) throw new TranscriptionError('No speech was detected. Please record the voice instruction again.');
-        record.text = transcript.text + (record.attachedFiles?.length ? '\n\nAttached project files:\n' + record.attachedFiles.join('\n') : '');
-        record.displayText = transcript.text; delete record.voiceInput;
+        // H3: validate in a local first; the failed record is saved and must stay loadable.
+        const text = transcript.text + (record.attachedFiles?.length ? '\n\nAttached project files:\n' + record.attachedFiles.join('\n') : '');
+        if (!text.trim() || text.length > 30000) throw new TranscriptionError('This voice instruction is too long. Send a shorter one or fewer files. The transcript is saved.');
+        record.text = text; record.displayText = transcript.text; delete record.voiceInput;
       }
       if (!record.text.trim() || record.text.length > 30000) throw new AgentError('This instruction is too long. Send a shorter message.');
       active.abort.signal.throwIfAborted();
