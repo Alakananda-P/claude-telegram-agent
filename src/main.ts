@@ -16,6 +16,9 @@ import { SharedMemory } from './memory.js';
 import { diagnoseFailedSessions } from './diagnostics.js';
 import { Automation } from './automation.js';
 import { KeyPool, messageProbe } from './key-pool.js';
+import { ModelCatalog, fetchModels } from './models.js';
+import { PriceBook, fetchPricingPage } from './pricing.js';
+import { UpdateClient, updateConfig } from './updater.js';
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -46,13 +49,26 @@ async function main(): Promise<void> {
   const keys = new KeyPool(config, store, messageProbe(ledger));
   await keys.initialize();
   console.log(`API key pool ready: configured=${keys.list().length}; automaticChecks=true.`);
+  // Model list: refreshed at startup when stale and every 12 h; the last good copy or the built-in list is used meanwhile.
+  const models = new ModelCatalog(store, config.modelFamilies, () => fetchModels((keys.selectedConfig() ?? config).apiKey));
+  // Prices: the pricing page is read only when a current model has no saved price; a failure retries at the next check.
+  ledger.prices = new PriceBook(store, () => fetchPricingPage());
+  const checkPrices = () => ledger.prices.ensure([...models.current().values()].map(m => m.id)).catch(() => false);
+  let announce = () => Promise.resolve();
+  const refreshModels = () => { if (models.due()) void models.refresh().then(() => Promise.all([announce(), checkPrices()])).catch(() => {}); };
+  refreshModels();
+  const modelTimer = setInterval(refreshModels, 60 * 60_000); modelTimer.unref();
   const controller = new Controller(config, store, telegram, new ResilientRunner(config, store, undefined, undefined, keys), ledger, new HaikuTitles(config, ledger, undefined, () => keys.selectedConfig()), keys);
+  controller.models = models;
+  const updates = updateConfig(process.env); if (updates) controller.updates = new UpdateClient(updates);
+  announce = () => controller.announceModelChanges().catch(() => {});
   const shutdown = new AbortController();
   let stopping = false;
   const stop = () => {
     if (stopping) return;
     stopping = true;
     shutdown.abort();
+    clearInterval(modelTimer);
     void keys.stop().catch(() => {});
     const forcedExit = setTimeout(() => process.exit(1), 25_000);
     forcedExit.unref();
@@ -63,8 +79,12 @@ async function main(): Promise<void> {
   try {
     await controller.prepareSessions(shutdown.signal);
     const checkId = process.env.VERIFY_AGENT_CHECK_ID ?? 'initial-upgrade';
+    // The new version after /update: Render sets RENDER_GIT_COMMIT for the running deploy.
+    const runningCommit = process.env.RENDER_GIT_COMMIT?.trim();
+    const updated = !!runningCommit && store.data.update?.targetCommit === runningCommit && !store.data.update.reportedAt;
+    let agentPassed: boolean | undefined;
     if (process.env.VERIFY_AGENT_ON_UPGRADE === 'true'
-      && (!store.data.upgradeCheck?.attempted || (store.data.upgradeCheck.checkId ?? 'initial-upgrade') !== checkId)) {
+      && (updated || !store.data.upgradeCheck?.attempted || (store.data.upgradeCheck.checkId ?? 'initial-upgrade') !== checkId)) {
       // Explicit rollout acceptance check; one short request, once per data disk.
       // Count its usage in the same ledger and never poll Telegram twice.
       store.data.upgradeCheck = { attempted: true, passed: false, checkId };
@@ -94,6 +114,8 @@ async function main(): Promise<void> {
         store.data.upgradeCheck.passed = store.data.upgradeCheck.actualSpeed === 'fast' && calledTools.has('mcp__workspace__clock') && calledTools.has('mcp__workspace__validate_bill');
       } catch { console.warn('Upgrade model check did not complete; inspect /status before a larger task.'); }
       finally { clearTimeout(timer); await store.save(); }
+      // Self-check after /update: the agent must have run both workspace tools (speed is not required).
+      if (updated) agentPassed = calledTools.has('mcp__workspace__clock') && calledTools.has('mcp__workspace__validate_bill');
       console.log(`Upgrade model check: passed=${store.data.upgradeCheck.passed}; model=${config.model}; effort=${config.effort}; actualSpeed=${store.data.upgradeCheck.actualSpeed ?? 'unconfirmed'}.`);
       console.log(`Upgrade workspace tools: clock=${calledTools.has('mcp__workspace__clock')}; billValidation=${calledTools.has('mcp__workspace__validate_bill')}.`);
     }
@@ -102,7 +124,7 @@ async function main(): Promise<void> {
       { command: 'menu', description: 'Open control panel' },
       { command: 'model', description: 'Choose Fable, Opus or Sonnet' },
       { command: 'efforts', description: 'Choose reasoning effort' },
-      { command: 'fast', description: 'Opus Fast mode on or off' },
+      { command: 'fast', description: 'Fast mode on or off (supported models)' },
       { command: 'session', description: 'Saved chats and resume' },
       { command: 'rename', description: 'Rename the current chat' },
       { command: 'memory', description: 'Shared long-term memory' },
@@ -110,6 +132,9 @@ async function main(): Promise<void> {
       { command: 'cost', description: 'Lifetime estimated Claude cost' },
       { command: 'status', description: 'Current task and execution limits' },
       { command: 'stop', description: 'Stop current task' },
+      { command: 'plan', description: 'Plan a task first, approve before changes' },
+      { command: 'update', description: 'Update the bot to the newest main' },
+      { command: 'de_update', description: 'Roll back the last update' },
       { command: 'new', description: 'Fresh conversation, keep files' },
       { command: 'fresh', description: 'New conversation with completed-work summary' },
       { command: 'project', description: 'Create or switch project' },
@@ -138,7 +163,11 @@ async function main(): Promise<void> {
       if (!cleared) await telegram.send(config.owner, 'Your new chat is ready. Telegram could not remove some older messages. Saved chats are in Sessions.');
     }
     await controller.menu();
-    if (store.data.lastJob?.status === 'interrupted') await telegram.send(config.owner, 'The previous task was interrupted by a restart. Review its files before retrying.').catch(() => {});
+    // Config, state and Telegram checks passed to get here.
+    if (updated) await controller.reportUpdate(runningCommit, agentPassed);
+    await announce();
+    void checkPrices();
+    await controller.restartNotice().catch(() => {});
     console.log('Private Telegram worker started.');
     controller.start();
     keys.start();

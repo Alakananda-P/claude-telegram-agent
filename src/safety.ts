@@ -101,3 +101,19 @@ export async function safeFile(root: string, relative: string): Promise<string> 
       : code === 'EACCES' || code === 'EPERM' ? 'File access was denied by storage permissions.' : 'Project file storage is unavailable. Check storage and try again.', code);
   }
 }
+
+/** H-11 / R-05: well-known token shapes an owner might paste by mistake. */
+const TOKEN_PATTERNS: [string, RegExp][] = [
+  ['Anthropic API key', /\bsk-ant-[A-Za-z0-9_-]{20,}/g],
+  ['GitHub token', /\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})/g],
+  ['Telegram bot token', /\b\d{8,10}:[A-Za-z0-9_-]{35}\b/g],
+  ['OpenAI key', /\bsk-(?:proj-)?[A-Za-z0-9_-]{32,}/g],
+  ['Google API key', /\bAIza[0-9A-Za-z_-]{35}\b/g],
+  ['AWS access key', /\bAKIA[0-9A-Z]{16}\b/g],
+  ['Render API key', /\brnd_[A-Za-z0-9]{20,}/g],
+  ['Slack token', /\bxox[abposr]-[A-Za-z0-9-]{10,}/g],
+];
+/** Names of the token kinds found in a text (no values). */
+export function detectTokens(text: string): string[] { return TOKEN_PATTERNS.filter(([, re]) => { re.lastIndex = 0; return re.test(text); }).map(([name]) => name); }
+/** The text with every recognizable token replaced by a label, for archives and previews. */
+export function maskTokens(text: string): string { return TOKEN_PATTERNS.reduce((t, [name, re]) => t.replace(re, `[hidden ${name}]`), text); }

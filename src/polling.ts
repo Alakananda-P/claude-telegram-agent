@@ -56,8 +56,15 @@ export async function poll(client: PollClient, store: StateStore, handle: (messa
       store.data.offset = update.update_id + 1;
       // At-most-once dispatch: never blindly replay a destructive task after restart.
       await store.save();
-      if (update.message) await handle(update.message);
-      if (update.callback_query && handleCallback) await handleCallback(update.callback_query);
+      // M1: one failing update must not end polling (and with it the running task).
+      try {
+        if (update.message) await handle(update.message);
+        if (update.callback_query && handleCallback) await handleCallback(update.callback_query);
+      } catch (error) {
+        if (error instanceof TelegramError && [401, 403, 409].includes(error.code)) throw error;
+        if (signal.aborted) return;
+        console.warn(`Update ${update.update_id} could not be handled (${error instanceof TelegramError ? safeReason(error) : error instanceof Error ? error.name : 'unknown'}); polling continues.`);
+      }
     }
   }
 }

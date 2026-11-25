@@ -4,12 +4,14 @@ import { mkdtemp, readFile, readdir, mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { ChatArchive } from '../src/chats.js';
-import { Controller } from '../src/controller.js';
-import { AgentSafetyError, type Runner, type AgentRequest } from '../src/agent.js';
+import { Controller, extendedDeadline } from '../src/controller.js';
+import { AgentSafetyError, AgentApiError, type Runner, type AgentRequest } from '../src/agent.js';
 import { loadConfig } from '../src/config.js';
 import { StateStore } from '../src/state.js';
 import type { Message } from '../src/safety.js';
 import type { Buttons } from '../src/ui.js';
+import { parseModels } from '../src/models.js';
+import { UpdateError } from '../src/updater.js';
 import { TranscriptionError, type TranscriptionService } from '../src/transcription.js';
 
 const message = (text: string): Message => ({ from: { id: 123 }, chat: { id: 123, type: 'private' }, text });
@@ -242,6 +244,18 @@ test('download failure shows failure and creates no false upload or job', async 
   await bot.handle(photo('broken'));
   assert.equal(store.data.uploads!.length, 0); assert.equal(calls.length, 0); assert.match(replies.at(-1)!, /Upload could not be accepted/); assert.ok(!replies.join('').includes('private-network-detail'));
 });
+test('/plan starts the task in plan mode; plain messages and retries keep their own mode', async () => {
+  const { bot, calls, store } = await setup();
+  await bot.handle(message('/plan sort the bills')); await bot.idle();
+  await bot.handle(message('plain work')); await bot.idle();
+  assert.equal(calls[0].prompt.includes('sort the bills'), true); assert.equal(calls[0].planMode, true);
+  assert.equal(calls[1].planMode, undefined);
+  assert.equal(store.data.tasks![0].planMode, true);
+  assert.equal((await StateStore.open(store.file)).data.tasks![0].planMode, true);
+  store.data.tasks![0].status = 'failed'; const retried = await bot.automation.retryTask(store.data.tasks![0].id);
+  assert.equal(retried.planMode, true);
+});
+
 test('new messages steer the running conversation instead of becoming separate queued tasks', async () => {
   let release!: () => void; let began!: () => void;
   const ready = new Promise<void>(resolve => { began = resolve; }); const wait = new Promise<void>(resolve => { release = resolve; }); const calls: AgentRequest[] = [];
@@ -350,7 +364,7 @@ test('busy task accepts steering, blocks project changes, /status stays responsi
   await bot.handle(message('first'));
   await ready;
   await bot.handle(message('second'));
-  await bot.handle(message('/project forbidden'));
+  await bot.handle(message('/model sonnet'));
   await bot.handle(message('/status'));
   assert.equal(calls, 1);
   assert.equal(store.data.project, 'default');
@@ -361,6 +375,235 @@ test('busy task accepts steering, blocks project changes, /status stays responsi
   assert.equal(store.data.active, null);
   assert.equal(store.data.queuePaused, true);
   assert.equal(store.data.tasks!.filter(t => t.status === 'queued').length, 0);
+});
+
+test('while a task runs the owner can switch chats and projects; work for another chat is queued, not refused', async () => {
+  const prompts: string[] = []; let release!: () => void; const hold = new Promise<void>(resolve => { release = resolve; });
+  let started!: () => void; const ready = new Promise<void>(resolve => { started = resolve; });
+  const runner: Runner = { async run(request, emit) {
+    prompts.push(request.prompt); await emit({ type: 'session', id: 'chat-' + prompts.length });
+    if (prompts.length === 1) { started(); await hold; }
+    return { text: 'Done ' + prompts.length, session: 'chat-' + prompts.length, cumulativeCost: 0 };
+  } };
+  const { bot, replies, store } = await setup(runner);
+  await bot.handle(message('long job')); await ready;
+  try {
+    await bot.handle(message('/new'));
+    assert.ok(!replies.some(r => /busy/i.test(r)), 'chat switching is not blocked');
+    await bot.handle(message('quick question in the new chat'));
+    assert.ok(replies.some(r => /queued/i.test(r)));
+    assert.ok(!replies.some(r => /not queued/i.test(r)));
+    const queued = store.data.tasks!.filter(t => t.status === 'queued');
+    assert.equal(queued.length, 1); assert.match(queued[0].prompt, /quick question/);
+    await bot.handle(message('/project side-work'));
+    assert.equal(store.data.project, 'side-work');
+  } finally { release(); await bot.idle(); }
+  assert.equal(prompts.length, 2); assert.match(prompts[1], /quick question/);
+  assert.equal(store.data.tasks!.filter(t => t.status === 'completed').length, 2);
+});
+
+test('plan approval: the plan and buttons reach the owner; a tap approves and a text reply is plan feedback, not a steer', async () => {
+  let steering: import('../src/steering.js').SteeringInput | undefined;
+  const runner: Runner = { async run(request, emit, abort) {
+    steering = request.steering; await emit({ type: 'session', id: 'plan-chat' });
+    const first = await request.planApproval!('1. Read the bills\n2. Build the sheet', abort.signal);
+    const second = await request.planApproval!('Revised plan', abort.signal);
+    return { text: 'Decisions: ' + JSON.stringify([first, second]), session: 'plan-chat', cumulativeCost: 0 };
+  } };
+  const { bot, replies, panels } = await setup(runner);
+  const until = async (check: () => boolean) => { for (let i = 0; i < 400 && !check(); i++) await new Promise(r => setTimeout(r, 5)); assert.ok(check()); };
+  const tokenOf = (n: number) => panels.filter(p => p.buttons.flat().some(b => b.callback_data.startsWith('planok ')))[n]?.buttons.flat().find(b => b.callback_data.startsWith('planok '))!.callback_data.split(' ')[1];
+  await bot.handle(message('plan the bill work'));
+  await until(() => !!tokenOf(0));
+  assert.ok(replies.some(r => r.includes('1. Read the bills')));
+  const tap = (data: string) => bot.callback({ id: 'plan-tap', from: { id: 123 }, message: { ...message(''), message_id: 801 }, data });
+  await tap('planok ' + tokenOf(0));
+  await until(() => !!tokenOf(1));
+  await tap('planok ' + tokenOf(0)); assert.match(replies.at(-1)!, /no longer pending/i);
+  await bot.handle(message('Use CSV, not Excel'));
+  await bot.idle();
+  assert.ok(replies.some(r => r.includes('Decisions: [{"approved":true},{"approved":false,"feedback":"Use CSV, not Excel"}]')));
+  assert.equal(steering!.messages.length, 0);
+});
+
+test('/update: not configured, confirm backs up then deploys, a failed build is reported, a failed backup deploys nothing', async () => {
+  const { bot, replies, panels, store } = await setup();
+  await bot.handle(message('/update')); assert.match(replies.at(-1)!, /not configured/i);
+  const live = { id: 'dep-live', commit: 'a'.repeat(40), status: 'live' }; const target = 'b'.repeat(40);
+  const done: string[] = []; let backupFails = false;
+  bot.updates = { liveDeploy: async () => live, mainCommit: async () => target, changes: async () => ['Fix the hang'],
+    backup: async commit => { done.push('backup ' + commit.slice(0, 1)); if (backupFails) throw new UpdateError('GitHub returned HTTP 500.'); return 'snap'; },
+    deploy: async commit => { done.push('deploy ' + commit.slice(0, 1)); return 'dep-new'; },
+    deployStatus: async id => ({ id, commit: target, status: 'build_failed' }), rollback: async () => 'never' };
+  bot.updatePollMs = 5;
+  const tokenOf = () => panels.at(-1)!.buttons.flat().find(b => b.callback_data.startsWith('updateok '))!.callback_data.split(' ')[1];
+  const tap = (data: string, from = 123) => bot.callback({ id: 'u', from: { id: from }, message: { ...message(''), message_id: 70 }, data });
+  await bot.handle(message('/update'));
+  assert.match(panels.at(-1)!.text, /Live: aaaaaaa\nNew: bbbbbbb/); assert.match(panels.at(-1)!.text, /Fix the hang/);
+  await tap('updateok ' + tokenOf(), 999); assert.deepEqual(done, [], 'only the owner can confirm');
+  await tap('updateok deadbeef'); assert.deepEqual(done, []); assert.match(replies.at(-1)!, /expired/);
+  await bot.handle(message('/update')); await tap('updateok ' + tokenOf());
+  assert.deepEqual(done, ['backup a', 'deploy b']);
+  assert.deepEqual({ ...store.data.update, startedAt: undefined }, { previousDeployId: 'dep-live', previousCommit: live.commit, targetCommit: target, deployId: 'dep-new', startedAt: undefined });
+  for (let i = 0; i < 200 && !replies.some(r => /Update failed/.test(r)); i++) await new Promise(r => setTimeout(r, 5));
+  assert.match(replies.find(r => /Update failed/.test(r))!, /build failed\). The old version keeps running/);
+  assert.equal(store.data.update!.result, 'build_failed');
+  done.length = 0; backupFails = true;
+  await bot.handle(message('/update')); await tap('updateok ' + tokenOf());
+  assert.deepEqual(done, ['backup a'], 'a failed backup stops the update before deploying'); assert.match(replies.at(-1)!, /Backup failed, so nothing was deployed/);
+  await bot.handle(message('/update')); await tap('updateno ' + tokenOf()); assert.match(replies.at(-1)!, /cancelled/);
+});
+
+test('/de_update rolls back to the saved previous deploy after a tap, falling back to a deploy of the previous commit', async () => {
+  const { bot, replies, panels, store } = await setup();
+  const done: string[] = []; let rollbackFails = false;
+  bot.updates = { liveDeploy: async () => ({ id: 'dep-new', commit: 'b'.repeat(40), status: 'live' }), mainCommit: async () => 'b'.repeat(40), changes: async () => [], backup: async () => 'snap',
+    deploy: async commit => { done.push('deploy ' + commit.slice(0, 1)); return 'dep-redeploy'; },
+    deployStatus: async id => ({ id, commit: 'a'.repeat(40), status: 'live' }),
+    rollback: async id => { done.push('rollback ' + id); if (rollbackFails) throw new UpdateError('Render returned HTTP 500.'); return 'dep-rollback'; } };
+  bot.updatePollMs = 5;
+  await bot.handle(message('/de_update')); assert.match(replies.at(-1)!, /nothing to roll back/i);
+  store.data.update = { previousDeployId: 'dep-live', previousCommit: 'a'.repeat(40), targetCommit: 'b'.repeat(40), deployId: 'dep-new', startedAt: new Date().toISOString() };
+  const tokenOf = () => panels.at(-1)!.buttons.flat().find(b => b.callback_data.startsWith('deupdateok '))!.callback_data.split(' ')[1];
+  const tap = (data: string, from = 123) => bot.callback({ id: 'r', from: { id: from }, message: { ...message(''), message_id: 71 }, data });
+  await bot.handle(message('/de_update')); assert.match(panels.at(-1)!.text, /aaaaaaa/);
+  await tap('deupdateok ' + tokenOf(), 999); assert.deepEqual(done, [], 'only the owner can roll back');
+  await tap('deupdateok ' + tokenOf());
+  assert.deepEqual(done, ['rollback dep-live']); assert.match(replies.at(-1)!, /Rollback started/);
+  assert.equal(store.data.update!.rollbackDeployId, 'dep-rollback');
+  done.length = 0; rollbackFails = true;
+  await bot.handle(message('/de_update')); await tap('deupdateok ' + tokenOf());
+  assert.deepEqual(done, ['rollback dep-live', 'deploy a'], 'fallback: deploy the saved previous commit');
+  assert.equal(store.data.update!.rollbackDeployId, 'dep-redeploy');
+  await bot.handle(message('/de_update')); await tap('deupdateno ' + tokenOf()); assert.match(replies.at(-1)!, /cancelled/i);
+});
+
+test('after /update the new version reports itself live once, or rolls back by itself when its self-check fails', async () => {
+  const { bot, replies, store } = await setup();
+  const done: string[] = [];
+  bot.updates = { liveDeploy: async () => ({ id: 'dep-new', commit: 'b'.repeat(40), status: 'live' }), mainCommit: async () => 'b'.repeat(40), changes: async () => [], backup: async () => 'snap',
+    deploy: async commit => { done.push('deploy ' + commit.slice(0, 1)); return 'dep-redeploy'; }, deployStatus: async id => ({ id, commit: 'a'.repeat(40), status: 'live' }),
+    rollback: async id => { done.push('rollback ' + id); return 'dep-rollback'; } };
+  bot.updatePollMs = 5;
+  const record = () => ({ previousDeployId: 'dep-live', previousCommit: 'a'.repeat(40), targetCommit: 'b'.repeat(40), deployId: 'dep-new', startedAt: new Date().toISOString() });
+  store.data.update = record();
+  await bot.reportUpdate('c'.repeat(40)); assert.equal(replies.length, 0, 'another commit is not this update');
+  await bot.reportUpdate(undefined); assert.equal(replies.length, 0);
+  await bot.reportUpdate('b'.repeat(40), true);
+  assert.match(replies.at(-1)!, /Update live: bbbbbbb \(was aaaaaaa\)\. Self-check passed: config, state, Telegram, agent test/);
+  assert.equal(store.data.update!.result, 'live'); assert.ok(store.data.update!.reportedAt);
+  await bot.reportUpdate('b'.repeat(40), true); assert.equal(replies.length, 1, 'reported once');
+  assert.deepEqual(done, []);
+  store.data.update = record(); replies.length = 0;
+  await bot.reportUpdate('b'.repeat(40), false);
+  assert.deepEqual(done, ['rollback dep-live']); assert.match(replies.join('\n'), /failed its self-check.*Rolling back to aaaaaaa/s);
+  assert.equal(store.data.update!.result, 'self_check_failed'); assert.equal(store.data.update!.rollbackDeployId, 'dep-rollback');
+});
+
+test('Render and GitHub keys never reach Telegram, even if an error text carried one', async () => {
+  const { bot, replies, panels, config } = await setup();
+  config.updateKeys = ['rnd_secret_test_value', 'github_pat_secret_test_value'];
+  bot.updates = { liveDeploy: async () => { throw new UpdateError('Render said rnd_secret_test_value is wrong'); }, mainCommit: async () => 'b'.repeat(40), changes: async () => [],
+    backup: async () => 'snap', deploy: async () => 'd', deployStatus: async id => ({ id, commit: '', status: 'live' }), rollback: async () => 'r' };
+  await bot.handle(message('/update'));
+  bot.updates.liveDeploy = async () => ({ id: 'dep', commit: 'a'.repeat(40), status: 'live' });
+  bot.updates.changes = async () => ['Use github_pat_secret_test_value here'];
+  await bot.handle(message('/update'));
+  const shown = JSON.stringify([replies, panels]);
+  assert.doesNotMatch(shown, /rnd_secret_test_value|github_pat_secret_test_value/);
+  assert.ok(replies.length + panels.length >= 2);
+});
+
+test('changed files are sent in the background, so the next owner message starts at once', async () => {
+  const prompts: string[] = []; let release!: () => void; const gate = new Promise<void>(resolve => { release = resolve; });
+  const { bot, sender, replies, files } = await setup({ async run(request, emit) {
+    prompts.push(request.prompt); await emit({ type: 'session', id: 'files-chat' });
+    if (prompts.length === 1) { await mkdir(path.join(request.cwd, 'output'), { recursive: true }); await writeFile(path.join(request.cwd, 'output', 'report.csv'), 'a,b'); }
+    return { text: 'Done ' + prompts.length, session: 'files-chat', cumulativeCost: 0 };
+  } });
+  const send = sender.sendFile.bind(sender);
+  sender.sendFile = async (chat: number, name: string, bytes: Uint8Array) => { await gate; return send(chat, name, bytes); };
+  const until = async (check: () => boolean) => { for (let i = 0; i < 400 && !check(); i++) await new Promise(r => setTimeout(r, 5)); return check(); };
+  try {
+    await bot.handle(message('make the report'));
+    assert.ok(await until(() => replies.some(r => r.includes('Done 1'))));
+    assert.ok(await until(() => replies.some(r => /Sending .*file/.test(r))));
+    await bot.handle(message('next question'));
+    assert.ok(await until(() => prompts.length === 2), 'the next task starts while the file is still uploading');
+    assert.equal(files.length, 0);
+  } finally { release(); }
+  assert.ok(await until(() => files.includes('report.csv')));
+  await bot.idle();
+});
+
+test('an image Telegram refuses as a photo is sent as a document instead of being dropped', async () => {
+  const { bot, sender, files, replies } = await setup({ async run(request, emit) {
+    await emit({ type: 'session', id: 'png-chat' }); await mkdir(path.join(request.cwd, 'output'), { recursive: true });
+    await writeFile(path.join(request.cwd, 'output', 'chart.png'), 'not-really-a-png');
+    return { text: 'Chart ready', session: 'png-chat', cumulativeCost: 0 };
+  } });
+  const photos: string[] = [];
+  (sender as { sendPhoto?: (c: number, name: string) => Promise<void> }).sendPhoto = async (_c, name) => { photos.push(name); throw new Error('Bad Request: PHOTO_INVALID_DIMENSIONS'); };
+  await bot.handle(message('draw the chart')); await bot.idle();
+  assert.deepEqual(photos, ['chart.png']); assert.deepEqual(files, ['chart.png']);
+  assert.ok(!replies.some(r => /automatic delivery failed/.test(r)));
+});
+
+test('/files shows a short list, output first, and never names private-looking documents', async () => {
+  const { bot, replies, dataDir } = await setup();
+  const root = path.join(dataDir, 'workspaces', 'default'); await mkdir(path.join(root, 'output'), { recursive: true }); await mkdir(path.join(root, 'data'), { recursive: true });
+  for (let i = 0; i < 60; i++) await writeFile(path.join(root, 'data', `row-${String(i).padStart(2, '0')}.csv`), 'x');
+  await writeFile(path.join(root, 'output', 'report.xlsx'), 'x'); await writeFile(path.join(root, 'output', 'aadhaar_front.jpg'), 'x');
+  await bot.handle(message('/files'));
+  const text = replies.at(-1)!;
+  assert.ok(text.split('\n').filter(l => /\.(csv|xlsx|jpg)$/.test(l)).length <= 25, 'capped');
+  assert.match(text, /^output\/report\.xlsx/m); assert.ok(text.indexOf('output/report.xlsx') < text.indexOf('data/'), 'output first');
+  assert.doesNotMatch(text, /aadhaar/i); assert.match(text, /1 private-looking file/);
+  assert.match(text, /more file/);
+});
+
+test('a progress indicator that cannot be deleted is neutralised, so no helper text stays behind as a message', async () => {
+  const { bot, sender, indicators } = await setup({ async run(_request, emit) {
+    await emit({ type: 'session', id: 'helper-chat' }); await emit({ type: 'progress', text: 'Review tuition chat (Nov 16)' });
+    return { text: 'Done', session: 'helper-chat', cumulativeCost: 0 };
+  } });
+  sender.remove = async () => { throw new Error('message can\'t be deleted'); };
+  await bot.handle(message('audit the chats')); await bot.idle();
+  assert.equal(indicators.at(-1), 'Finished.');
+});
+
+test('an API failure tells the owner the reason and offers a Retry button for that task', async () => {
+  const { bot, replies, panels, store } = await setup({ async run(_r, emit) { await emit({ type: 'session', id: 'api-chat' }); throw new AgentApiError('billing_error', 'Claude API billing or credits blocked this request. Check the Anthropic account balance and billing settings.'); } });
+  await bot.handle(message('make the sheet')); await bot.idle();
+  assert.match(replies.join('\n'), /billing or credits/);
+  const id = store.data.tasks![0].id;
+  assert.ok(panels.at(-1)!.buttons.flat().some(b => b.callback_data === 'taskretry ' + id));
+  assert.match(panels.at(-1)!.text, /Retry/);
+});
+
+test('an album and its caption start one task together, and a pending caption is kept when the instruction comes later', async () => {
+  const { bot, calls } = await setup();
+  bot.albumDelayMs = 20;
+  await bot.handle({ ...photo('a', 'album-1'), caption: 'MAY DATA' }); await bot.handle(photo('b', 'album-1'));
+  for (let i = 0; i < 200 && !calls.length; i++) await new Promise(r => setTimeout(r, 5));
+  await bot.idle();
+  assert.equal(calls.length, 1, 'one task for the whole album');
+  assert.match(calls[0].prompt, /MAY DATA/); assert.equal((calls[0].prompt.match(/uploads\//g) ?? []).length, 2);
+  assert.equal((calls[0].prompt.match(/MAY DATA/g) ?? []).length, 1, 'caption once');
+  await bot.handle(message('/batch')); await bot.handle({ ...photo('c'), caption: 'June bills' });
+  await bot.handle(message('make the sheet')); await bot.idle();
+  assert.match(calls.at(-1)!.prompt, /June bills/); assert.match(calls.at(-1)!.prompt, /make the sheet/);
+});
+
+test('a message carrying a recognizable token gets a delete warning and the token is masked in the archive and preview', async () => {
+  const { bot, calls, replies, store, dataDir } = await setup();
+  const token = 'ghp_' + 'A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8';
+  await bot.handle(message('use this token ' + token + ' for the repo')); await bot.idle();
+  assert.match(replies.join('\n'), /looks like a GitHub token/i); assert.match(replies.join('\n'), /Delete/);
+  assert.ok(calls[0].prompt.includes(token), 'the agent still gets what the owner sent');
+  assert.ok(!store.data.tasks![0].displayPrompt!.includes(token));
+  const archive = await new ChatArchive(path.join(dataDir, 'bot/chats'), []).read(store.data.sessions.default);
+  assert.ok(!JSON.stringify(archive).includes(token)); assert.match(JSON.stringify(archive), /\[hidden GitHub token\]/);
 });
 
 test('work continues beyond the former daily cap without budget reservations', async () => {
@@ -404,6 +647,28 @@ test('project names matching Object prototype properties start without a phantom
   assert.equal(calls[0].session, undefined);
 });
 
+test('each owner steer moves the task deadline forward, capped at three time limits from the start', async () => {
+  let abortedAt = 0; let began!: () => void; const started = new Promise<void>(resolve => { began = resolve; });
+  const runner: Runner = { async run(_request, _emit, abort) {
+    began();
+    await new Promise<void>((_resolve, reject) => abort.signal.addEventListener('abort', () => { abortedAt = Date.now(); reject(new Error('aborted')); }, { once: true }));
+    throw new Error('unreachable');
+  } };
+  const { bot, config, store } = await setup(runner);
+  config.timeoutMs = 150;
+  await bot.handle(message('work')); await started;
+  const first = store.data.tasks![0].deadlineAt!;
+  await new Promise(resolve => setTimeout(resolve, 100));
+  const steeredAt = Date.now(); await bot.handle(message('one more thing')); await bot.idle();
+  assert.ok(Date.parse(store.data.tasks![0].deadlineAt!) > Date.parse(first));
+  assert.ok(abortedAt - steeredAt >= 140, 'the time limit restarts from the latest owner message');
+  assert.equal(store.data.tasks![0].failureKind, 'timeout');
+  const start = '2026-11-24T10:00:00.000Z', limit = 20 * 60_000;
+  assert.equal(extendedDeadline(start, '2026-11-24T10:20:00.000Z', limit, Date.parse('2026-11-24T10:15:00.000Z')), '2026-11-24T10:35:00.000Z');
+  assert.equal(extendedDeadline(start, '2026-11-24T10:50:00.000Z', limit, Date.parse('2026-11-24T10:55:00.000Z')), '2026-11-24T11:00:00.000Z');
+  assert.equal(extendedDeadline(start, '2026-11-24T10:20:00.000Z', limit, Date.parse('2026-11-24T10:01:00.000Z')), '2026-11-24T10:21:00.000Z');
+});
+
 test('timeout still aborts bounded work without a spending cap', async () => {
   const runner: Runner = { async run(_request, _emit, abort) {
     abort.signal.throwIfAborted();
@@ -417,6 +682,44 @@ test('timeout still aborts bounded work without a spending cap', async () => {
   assert.ok(replies.some(r => r.includes('time limit')));
   assert.equal(store.data.tasks![0].failureKind, 'timeout');
   assert.equal((await StateStore.open(store.file)).data.tasks![0].failureKind, 'timeout');
+});
+
+test('/model buttons come from the model list by family; state only ever stores ids the previous version accepts', async () => {
+  const { bot, calls, store, panels, config } = await setup();
+  const page = JSON.parse(await readFile(path.join(import.meta.dirname, 'fixtures-models-2026-11-25.json'), 'utf8'));
+  store.data.modelCatalog = { fetchedAt: new Date().toISOString(), models: parseModels(page) };
+  config.modelFamilies.push('haiku');
+  await bot.handle(message('/model'));
+  const buttons = panels.at(-1)!.buttons.flat();
+  assert.deepEqual(buttons.filter(b => b.callback_data.startsWith('model ')).map(b => [b.text.replace('✓ ', ''), b.callback_data]),
+    [['Fable 5.2', 'model fable'], ['Opus 5.5', 'model opus'], ['Sonnet 5.5', 'model sonnet'], ['Haiku 5.5', 'model haiku']]);
+  await bot.callback({ id: 'm', from: { id: 123 }, message: { ...message(''), message_id: 90 }, data: 'model haiku' });
+  assert.deepEqual(store.data.settings && { model: store.data.settings.model, family: store.data.settings.family }, { model: 'claude-opus-5-5', family: 'haiku' });
+  await bot.handle(message('haiku work')); await bot.idle();
+  assert.equal(calls[0].settings?.model, 'claude-haiku-5-5');
+  await bot.handle(message('/model claude-fable-5-2'));
+  assert.equal(store.data.settings?.model, 'claude-fable-5-1'); assert.equal(store.data.settings?.family, undefined);
+  const legacy = ['claude-fable-5-1', 'claude-opus-5-5', 'claude-sonnet-5-5'];
+  const saved = JSON.parse(await readFile(store.file, 'utf8'));
+  assert.ok(legacy.includes(saved.settings.model)); assert.ok(saved.tasks.every((t: { settings?: { model: string } }) => !t.settings || legacy.includes(t.settings.model)));
+});
+
+test('fast mode follows the fast price table and effort buttons follow the model\'s supported levels', async () => {
+  const { bot, calls, store, panels, replies } = await setup();
+  await bot.handle(message('/model sonnet')); await bot.handle(message('/fast on'));
+  await bot.handle(message('/fast'));
+  assert.match(replies.at(-1)!, /Fast mode applies to: Fable 5\.2, Opus 5\.5/);
+  await bot.handle(message('sonnet work')); await bot.idle();
+  assert.equal(calls[0].settings?.fast, false, 'Sonnet 5.5 has no fast price');
+  store.data.modelCatalog = { fetchedAt: new Date().toISOString(), models: [{ id: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6', family: 'sonnet', createdAt: '2027-02-17T00:00:00Z', efforts: ['low', 'medium', 'high', 'max'] }] };
+  await bot.handle(message('/efforts xhigh'));
+  assert.match(replies.at(-1)!, /low, medium, high, max/);
+  store.data.settings!.effort = 'xhigh';
+  await bot.handle(message('/efforts'));
+  assert.deepEqual(panels.at(-1)!.buttons.flat().filter(b => b.callback_data.startsWith('efforts ')).map(b => b.callback_data), ['efforts low', 'efforts medium', 'efforts high', 'efforts max']);
+  await bot.handle(message('effort work')); await bot.idle();
+  assert.equal(calls[1].settings?.effort, 'high', 'an unsupported saved level runs at the nearest lower supported level');
+  assert.equal(store.data.settings!.effort, 'xhigh', 'the saved choice is kept');
 });
 
 test('model controls persist across restarts, validate choices, and reach each job', async () => {
@@ -434,8 +737,9 @@ test('model controls persist across restarts, validate choices, and reach each j
   assert.equal(calls[1].settings?.fast, true);
   await bot.handle(message('/model fable'));
   await bot.handle(message('fable task')); await bot.idle();
-  assert.equal(calls[2].settings?.model, 'claude-fable-5-1');
-  assert.equal(calls[2].settings?.fast, false);
+  assert.equal(calls[2].settings?.model, 'claude-fable-5-2', 'the newest Fable runs');
+  assert.equal(store.data.settings?.model, 'claude-fable-5-1', 'state keeps the old id so a rolled-back version still loads it');
+  assert.equal(calls[2].settings?.fast, true, 'Fable 5.2 is in the fast-mode price table');
   assert.equal(store.data.settings?.fast, true);
   await bot.handle(message('/efforts nonsense'));
   assert.match(replies.at(-1)!, /low.*medium.*high/i);
@@ -503,8 +807,9 @@ test('/fresh seeds only verified successful work and waits for a new instruction
   } });
   await bot.handle(message('Prepare invoice')); await bot.idle();
   await bot.handle(message('REFUSED_REQUEST_WITH_RAW_ATTACHMENT')); await bot.idle();
-  assert.ok(panels.some(p => p.buttons.flat().some(b => b.callback_data === 'fresh')));
-  await bot.handle(message('/fresh'));
+  assert.ok(panels.some(p => /safety system stopped/.test(p.text)));
+  // The stopped chat was already switched to a fresh one; /fresh still works from the original chat.
+  await bot.handle(message('/session source-session')); await bot.handle(message('/fresh'));
   assert.equal(n, 2); assert.equal(store.data.sessions.default, undefined);
   assert.match(panels.at(-1)!.text, /invoice workbook/); assert.ok(!panels.at(-1)!.text.includes('REFUSED_REQUEST'));
   const reopened = await StateStore.open(store.file); assert.ok(Object.values(reopened.data.freshContexts ?? {}).some(c => c.includes('invoice workbook')));
@@ -514,6 +819,24 @@ test('/fresh seeds only verified successful work and waits for a new instruction
   assert.equal(store.data.memoryEnabled, true); assert.equal(store.data.sessions.default, 'fresh-session');
   const old = await new ChatArchive(path.join(dataDir, 'bot/chats'), []).read('source-session');
   assert.ok(old.some(t => t.text.includes('REFUSED_REQUEST'))); assert.ok(store.data.conversations!.some(c => c.id === 'source-session'));
+});
+
+test('after a safety stop the next message in that chat starts fresh with a summary, without resuming the stopped transcript', async () => {
+  const requests: AgentRequest[] = []; let n = 0;
+  const { bot, store, panels } = await setup({ async run(request, emit) {
+    requests.push(request); n++; await emit({ type: 'session', id: n <= 2 ? 'source-session' : 'fresh-session' });
+    if (n === 2) throw new AgentSafetyError('cyber');
+    return { session: n <= 2 ? 'source-session' : 'fresh-session', text: n === 1 ? 'Completed the invoice workbook in output/invoice.xlsx.' : 'Continuing with the totals.', cumulativeCost: 0 };
+  } });
+  await bot.handle(message('Prepare invoice')); await bot.idle();
+  await bot.handle(message('REFUSED_REQUEST_TEXT')); await bot.idle();
+  assert.match(panels.at(-1)!.text, /Reason reported: cyber/);
+  assert.match(panels.at(-1)!.text, /next message here starts a fresh conversation/i);
+  await bot.handle(message('Continue with totals')); await bot.idle();
+  assert.equal(requests[2].session, undefined, 'the stopped transcript is not resumed');
+  assert.match(requests[2].prompt, /invoice workbook/);
+  assert.ok(!requests[2].prompt.includes('REFUSED_REQUEST')); assert.ok(!requests[2].resumeContext?.includes('REFUSED_REQUEST'));
+  assert.equal(store.data.sessions.default, 'fresh-session');
 });
 
 test('background work remains alive after the model turn and a new chat, then notifies its source session', async () => {

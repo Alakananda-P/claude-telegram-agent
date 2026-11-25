@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { StateStore } from '../src/state.js';
 import { ChatArchive } from '../src/chats.js';
-import { SessionCatalog, sessionTools, sessionServer } from '../src/sessions.js';
+import { SessionCatalog, sessionTools, sessionServer, toolResult } from '../src/sessions.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 
@@ -185,4 +185,25 @@ test('trash expires after 48 hours, restore cancels expiry and purge prevents tr
   assert.ok(store.data.purgedSessions!.includes('old-id'));
   assert.equal(store.data.sessions.default, 'active-id');
   assert.equal(store.data.memoryEnabled, true);
+});
+
+test('a task sees its own chat as currentSession, not the chat the owner has selected', async () => {
+  const { catalog, store } = await setup();
+  const scheduled = catalog.scoped('old-id', 'bills');
+  assert.equal(scheduled.context().currentSession, 'old-id');
+  assert.equal(scheduled.list().currentSession, 'old-id');
+  assert.equal(catalog.context().currentSession, 'active-id', 'the owner selection is unchanged');
+  store.data.bindings = { 'schedule-7': 'old-id' };
+  assert.equal(catalog.scoped('schedule-7', 'bills').context().currentSession, 'old-id', 'a bound schedule chat resolves to its session');
+  const fresh = catalog.scoped('schedule-new', 'default').context();
+  assert.equal(fresh.currentSession, null); assert.equal(fresh.currentTitle, 'New chat');
+});
+
+test('an unreadable file gives the clear permission message instead of a generic error', async () => {
+  for (const code of ['EACCES', 'EPERM']) {
+    const result = await toolResult(async () => { throw Object.assign(new Error('EACCES: permission denied, open /data/secret/path'), { code }); });
+    assert.equal(result.isError, true); assert.equal(result.content[0].text, 'File access was denied by storage permissions.');
+  }
+  const other = await toolResult(async () => { throw new Error('boom /private/path'); });
+  assert.equal(other.content[0].text, 'Saved data could not be accessed. No raw service details are exposed.');
 });

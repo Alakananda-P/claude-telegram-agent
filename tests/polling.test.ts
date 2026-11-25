@@ -70,3 +70,18 @@ test('polling dispatches callbacks only after durably recording the update offse
     abort.abort();
   });
 });
+
+test('M1: a handler that throws does not stop polling; only 401/403/409 from a handler end it', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'tg-agent-poll-throw-'));
+  const store = await StateStore.open(path.join(dir, 'state.json'));
+  const abort = new AbortController(); let calls = 0; const seen: string[] = [];
+  const client = { async call<T>(): Promise<T> {
+    calls++; if (calls > 1) abort.abort();
+    return calls === 1 ? [{ update_id: 1, message: { chat: { id: 123, type: 'private' }, text: 'boom' } }, { update_id: 2, callback_query: { id: 'c', data: 'boom' } }, { update_id: 3, message: { chat: { id: 123, type: 'private' }, text: 'next' } }] as T : [] as T;
+  } };
+  await poll(client, store, async m => { seen.push(m.text!); if (m.text === 'boom') throw new Error('corrupt chat archive'); }, abort.signal, async () => { seen.push('callback'); throw new Error('bad'); });
+  assert.deepEqual(seen, ['boom', 'callback', 'next']); assert.equal(store.data.offset, 4);
+  const stop = new AbortController();
+  const fatal = { async call<T>(): Promise<T> { return [{ update_id: 4, message: { chat: { id: 123, type: 'private' }, text: 'x' } }] as T; } };
+  await assert.rejects(poll(fatal, store, async () => { throw new TelegramError(409); }, stop.signal), (e: unknown) => e instanceof TelegramError && e.code === 409);
+});

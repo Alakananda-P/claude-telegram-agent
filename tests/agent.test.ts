@@ -172,6 +172,116 @@ test('late steering survives the first result and finishes in the same SDK conve
   assert.deepEqual(events.filter(e => e.type === 'usage').map(e => e.cost), [0.1, 0.15]);
 });
 
+test('a result that keeps the turn open reports why, without any message text', async () => {
+  const steering = new SteeringInput(); const events: AgentEvent[] = [];
+  const make: QueryFactory = ({ prompt }) => ({ async *[Symbol.asyncIterator]() {
+    const incoming = (prompt as AsyncIterable<import('@anthropic-ai/claude-agent-sdk').SDKUserMessage>)[Symbol.asyncIterator]();
+    const first = (await incoming.next()).value!; yield init as SDKMessage;
+    // An owner follow-up arrives after the first turn started; the result answers only the first prompt.
+    const release = steering.reserve()!; const later = steering.add('private follow-up'); release();
+    yield { ...result, result: 'Private answer', user_message_uuids: [first.uuid] } as unknown as SDKMessage;
+    await incoming.next();
+    yield { ...result, uuid: 'result-two', result: 'Private second answer', user_message_uuids: [later.id] } as unknown as SDKMessage;
+  }, close() {} });
+  const output = await new ClaudeRunner(config, make).run({ prompt: 'Private request', cwd: '/work', steering }, e => { events.push(e); }, new AbortController());
+  assert.equal(output.text, 'Private second answer');
+  const held = events.filter(e => e.type === 'held_open');
+  assert.deepEqual(held, [{ type: 'held_open', initialAnswered: true, helpers: 0, unanswered: 1, preparing: 0, ackIds: 1, initialInAck: true }]);
+  assert.doesNotMatch(JSON.stringify(held), /Private/);
+});
+
+test('a steer folded into the first turn also acknowledges the first prompt and closes the turn', async () => {
+  const steering = new SteeringInput(); const events: AgentEvent[] = [];
+  const make: QueryFactory = ({ prompt }) => ({ async *[Symbol.asyncIterator]() {
+    const incoming = (prompt as AsyncIterable<import('@anthropic-ai/claude-agent-sdk').SDKUserMessage>)[Symbol.asyncIterator]();
+    await incoming.next(); yield init as SDKMessage;
+    const release = steering.reserve()!; const folded = steering.add('also add totals'); release();
+    // The SDK reports only the latest consumed uuid for a folded turn.
+    yield { ...result, result: 'Done with totals', user_message_uuids: [folded.id] } as unknown as SDKMessage;
+  }, close() {} });
+  const output = await new ClaudeRunner(config, make).run({ prompt: 'Make the sheet', cwd: '/work', steering }, e => { events.push(e); }, new AbortController());
+  assert.equal(output.text, 'Done with totals');
+  assert.equal(steering.accepting, false);
+  assert.deepEqual(events.filter(e => e.type === 'held_open'), []);
+});
+
+test('a helper hand-back consumed by a later non-notification result stops holding the turn open', async () => {
+  const steering = new SteeringInput();
+  const make: QueryFactory = ({ prompt }) => ({ async *[Symbol.asyncIterator]() {
+    const incoming = (prompt as AsyncIterable<import('@anthropic-ai/claude-agent-sdk').SDKUserMessage>)[Symbol.asyncIterator]();
+    const first = (await incoming.next()).value!; yield init as SDKMessage;
+    yield { type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: 'audit', run_id: 'run-1', task_type: 'local_agent', description: 'Audit' }] } as unknown as SDKMessage;
+    yield { ...result, result: 'Helper is running.', origin: { kind: 'human' }, user_message_uuids: [first.uuid] } as unknown as SDKMessage;
+    const update = steering.add('Status?'); const next = (await incoming.next()).value!;
+    yield { type: 'system', subtype: 'task_notification', task_id: 'audit', run_id: 'run-1', status: 'completed', summary: 'Audit done' } as unknown as SDKMessage;
+    yield { type: 'system', subtype: 'background_tasks_changed', tasks: [] } as unknown as SDKMessage;
+    // This turn was already running when the hand-back was queued.
+    yield { ...result, uuid: 'r2', result: 'Still waiting for the audit.', origin: { kind: 'human' }, user_message_uuids: [next.uuid] } as unknown as SDKMessage;
+    assert.equal(update.answered, true); assert.equal(steering.accepting, true);
+    // The SDK folds the hand-back into a later turn whose origin is not task-notification.
+    yield { ...result, uuid: 'r3', result: 'Audit report: all good', origin: { kind: 'human' } } as unknown as SDKMessage;
+  }, close() {} });
+  const answer = await new ClaudeRunner(config, make).run({ prompt: 'Audit', cwd: '/work', steering }, () => {}, new AbortController());
+  assert.equal(answer.text, 'Audit report: all good'); assert.equal(steering.accepting, false);
+});
+
+const fastIdle = { answerMs: 20, helperMs: 80 };
+const forever = () => new Promise<never>(() => {});
+
+test('idle watchdog closes a silent turn after the answer when a helper never reports, and says so', async () => {
+  const events: AgentEvent[] = []; const steering = new SteeringInput();
+  const make: QueryFactory = ({ prompt }) => ({ async *[Symbol.asyncIterator]() {
+    const incoming = (prompt as AsyncIterable<import('@anthropic-ai/claude-agent-sdk').SDKUserMessage>)[Symbol.asyncIterator]();
+    const first = (await incoming.next()).value!; yield init as SDKMessage;
+    yield { type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: 'audit', run_id: 'run-1', task_type: 'local_agent', description: 'Audit' }] } as unknown as SDKMessage;
+    yield { ...result, result: 'Main answer', user_message_uuids: [first.uuid] } as unknown as SDKMessage;
+    await forever(); // The SDK goes silent and never ends the stream.
+  }, close() {} });
+  const started = Date.now();
+  const output = await new ClaudeRunner(config, make, fastIdle).run({ prompt: 'Audit', cwd: '/work', steering }, e => { events.push(e); }, new AbortController());
+  assert.equal(output.text, 'Main answer'); assert.equal(steering.accepting, false);
+  assert.ok(Date.now() - started >= fastIdle.helperMs, 'pending helpers get the longer wait');
+  assert.deepEqual(events.filter(e => e.type === 'idle_closed'), [{ type: 'idle_closed', helpers: 1 }]);
+  assert.ok(events.some(e => e.type === 'commentary' && /did not report back/.test(e.text)));
+});
+
+test('idle watchdog never closes a task that is waiting for a plan approval', async () => {
+  const events: AgentEvent[] = []; let options!: Options;
+  const make: QueryFactory = request => { options = request.options; return { async *[Symbol.asyncIterator]() {
+    const incoming = (request.prompt as AsyncIterable<import('@anthropic-ai/claude-agent-sdk').SDKUserMessage>)[Symbol.asyncIterator]();
+    const first = (await incoming.next()).value!; yield init as SDKMessage;
+    yield { type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: 'audit', run_id: 'run-1', task_type: 'local_agent', description: 'Audit' }] } as unknown as SDKMessage;
+    yield { ...result, result: 'Plan drafted', user_message_uuids: [first.uuid] } as unknown as SDKMessage;
+    // The approval prompt stays open longer than both idle limits.
+    const decision = await options.canUseTool!('ExitPlanMode', { plan: 'Step 1' }, { signal: new AbortController().signal, toolUseID: 't', requestId: 'r' });
+    assert.equal(decision?.behavior, 'allow');
+    yield { type: 'system', subtype: 'task_notification', task_id: 'audit', run_id: 'run-1', status: 'completed', summary: 'done' } as unknown as SDKMessage;
+    yield { type: 'system', subtype: 'background_tasks_changed', tasks: [] } as unknown as SDKMessage;
+    yield { ...result, uuid: 'r2', result: 'Approved and done', origin: { kind: 'task-notification', runId: 'run-1' } } as unknown as SDKMessage;
+  }, close() {} }; };
+  const output = await new ClaudeRunner(config, make, fastIdle).run({ prompt: 'Plan it', cwd: '/work',
+    planApproval: () => new Promise(resolve => setTimeout(() => resolve({ approved: true }), fastIdle.helperMs * 3)) }, e => { events.push(e); }, new AbortController());
+  assert.equal(output.text, 'Approved and done');
+  assert.deepEqual(events.filter(e => e.type === 'idle_closed'), []);
+});
+
+test('idle watchdog never closes while an owner message is unanswered or the main turn is still running', async () => {
+  const steering = new SteeringInput(); const events: AgentEvent[] = [];
+  const make: QueryFactory = ({ prompt }) => ({ async *[Symbol.asyncIterator]() {
+    const incoming = (prompt as AsyncIterable<import('@anthropic-ai/claude-agent-sdk').SDKUserMessage>)[Symbol.asyncIterator]();
+    const first = (await incoming.next()).value!; yield init as SDKMessage;
+    const release = steering.reserve()!; const later = steering.add('one more thing'); release();
+    yield { ...result, result: 'First answer', user_message_uuids: [first.uuid] } as unknown as SDKMessage;
+    await new Promise(resolve => setTimeout(resolve, 60)); // Silent, but the owner message is still pending.
+    await incoming.next();
+    yield { type: 'stream_event', parent_tool_use_id: null, session_id: 'session-1', uuid: 's1', event: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } } } as unknown as SDKMessage;
+    await new Promise(resolve => setTimeout(resolve, 60)); // A long tool run inside the open main turn.
+    yield { ...result, uuid: 'r2', result: 'Second answer', user_message_uuids: [later.id] } as unknown as SDKMessage;
+  }, close() {} });
+  const output = await new ClaudeRunner(config, make, fastIdle).run({ prompt: 'Start', cwd: '/work', steering }, e => { events.push(e); }, new AbortController());
+  assert.equal(output.text, 'Second answer'); assert.deepEqual(events.filter(e => e.type === 'idle_closed'), []);
+});
+
 test('a notification-only completion cannot finish the pending human turn', async () => {
   const make: QueryFactory = ({ prompt }) => ({ async *[Symbol.asyncIterator]() {
     const incoming = (prompt as AsyncIterable<import('@anthropic-ai/claude-agent-sdk').SDKUserMessage>)[Symbol.asyncIterator]();
@@ -223,6 +333,14 @@ test('a failed input preparation racing with the last result cannot leave the co
   assert.equal(steering.accepting, false);
 });
 
+test('a plan-mode request starts the SDK in plan mode and the init guard follows the requested mode', async () => {
+  let options!: Options;
+  const planned = await new ClaudeRunner(config, factory([{ ...init, permissionMode: 'plan' }, result], o => { options = o; })).run({ prompt: 'x', cwd: '/work', planMode: true }, () => {}, new AbortController());
+  assert.equal(options.permissionMode, 'plan'); assert.equal(planned.text, result.result);
+  await assert.rejects(new ClaudeRunner(config, factory([init, result])).run({ prompt: 'x', cwd: '/work', planMode: true }, () => {}, new AbortController()), /configuration/i);
+  await assert.rejects(new ClaudeRunner(config, factory([{ ...init, permissionMode: 'plan' }, result])).run({ prompt: 'x', cwd: '/work' }, () => {}, new AbortController()), /configuration/i);
+});
+
 test('runner passes exact requested settings, resume, limits and a filtered child environment', async () => {
   const events: AgentEvent[] = [];
   let options!: Options;
@@ -253,6 +371,16 @@ test('runner rejects model or permission fallback and incomplete streams', async
     await assert.rejects(runner.run({ prompt: 'x', cwd: '/work' }, () => {}, new AbortController()), /configuration/i);
   }
   await assert.rejects(new ClaudeRunner(config, factory([init])).run({ prompt: 'x', cwd: '/work' }, () => {}, new AbortController()), /result/i);
+});
+
+test('plan mode is the only permission change that keeps the job alive', async () => {
+  const status = (permissionMode: string) => ({ type: 'system', subtype: 'status', status: null, permissionMode, session_id: 'session-1', uuid: 'status-' + permissionMode });
+  const planned = new ClaudeRunner(config, factory([init, status('plan'), status('auto'), result]));
+  assert.equal((await planned.run({ prompt: 'x', cwd: '/work' }, () => {}, new AbortController())).text, result.result);
+  for (const mode of ['bypassPermissions', 'acceptEdits', 'default', 'dontAsk']) {
+    const runner = new ClaudeRunner(config, factory([init, status('plan'), status(mode), result]));
+    await assert.rejects(runner.run({ prompt: 'x', cwd: '/work' }, () => {}, new AbortController()), /changed away from auto/i);
+  }
 });
 
 test('runner reports SDK failures without exposing raw error text', async () => {
@@ -308,6 +436,25 @@ test('unresolved prompts deny instead of disabling auto safeguards', async () =>
   await new ClaudeRunner(config, factory([init, result], o => { options = o; })).run({ prompt: 'x', cwd: '/work' }, () => {}, new AbortController());
   const decision = await options.canUseTool!('Bash', { command: 'anything' }, { signal: new AbortController().signal, toolUseID: '1', requestId: '1' });
   assert.equal(decision?.behavior, 'deny');
+});
+
+test('ExitPlanMode waits for the owner: approval switches back to auto, rejection returns the feedback', async () => {
+  const asked: string[] = []; const decisions = [{ approved: true as const }, { approved: false as const, feedback: 'Use CSV, not Excel' }, { approved: false as const }];
+  let options!: Options;
+  await new ClaudeRunner(config, factory([init, result], o => { options = o; })).run({ prompt: 'x', cwd: '/work',
+    planApproval: async plan => { asked.push(plan); return decisions.shift()!; } }, () => {}, new AbortController());
+  const ask = async () => (await options.canUseTool!('ExitPlanMode', { plan: '1. Read bills\n2. Build sheet' }, { signal: new AbortController().signal, toolUseID: '1', requestId: '1' })) as { behavior: string; message?: string; updatedPermissions?: unknown };
+  const approved = await ask();
+  assert.equal(approved.behavior, 'allow');
+  assert.deepEqual(approved.updatedPermissions, [{ type: 'setMode', mode: 'auto', destination: 'session' }]);
+  const rejected = await ask();
+  assert.equal(rejected.behavior, 'deny'); assert.match(rejected.message ?? '', /Use CSV, not Excel/);
+  const kept = await ask();
+  assert.equal(kept.behavior, 'deny'); assert.match(kept.message ?? '', /keep planning/i);
+  assert.deepEqual(asked, ['1. Read bills\n2. Build sheet', '1. Read bills\n2. Build sheet', '1. Read bills\n2. Build sheet']);
+  // Without an owner channel (scheduled runs), the plan is never auto-approved.
+  await new ClaudeRunner(config, factory([init, result], o => { options = o; })).run({ prompt: 'x', cwd: '/work' }, () => {}, new AbortController());
+  assert.equal((await ask()).behavior, 'deny');
 });
 
 test('runner rejects a main-agent model change after initialization', async () => {

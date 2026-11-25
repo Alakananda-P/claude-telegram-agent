@@ -4,6 +4,7 @@ import { createInterface } from 'node:readline';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { modelLabel } from './settings.js';
+import { PriceBook } from './pricing.js';
 
 export interface Counts {
   inputTokens: number; outputTokens: number; cacheReadInputTokens: number;
@@ -34,6 +35,8 @@ export class UsageLedger {
   private steps = new Map<string, Extract<Entry, { kind: 'step' }>>();
   private saving: Promise<void> = Promise.resolve();
   historyIncomplete = false;
+  /** Step cost estimates; main.ts swaps in the book backed by the pricing page. The SDK total stays the primary cost. */
+  prices = new PriceBook();
   private constructor(readonly file: string) {}
 
   static async open(file: string): Promise<UsageLedger> {
@@ -118,13 +121,15 @@ export class UsageLedger {
     // rows carry placeholders, so historical output is left explicitly partial.
     const counts = { ...empty(), inputTokens: n(usage.input_tokens), outputTokens: complete ? n(usage.output_tokens) : 0,
       cacheReadInputTokens: n(usage.cache_read_input_tokens), cacheCreationInputTokens: n(usage.cache_creation_input_tokens) };
-    const price = model === 'claude-fable-5-1' ? [10, 50, 0.25] : model === 'claude-opus-5-5' ? [4, 20, 0.2] : model === 'claude-sonnet-5-5' ? [2, 10, 0.1] : undefined;
+    const price = this.prices.price(model)?.price;
     if (price) {
-      const factor = (usage.speed === 'fast' ? 2 : 1) * (usage.inference_geo === 'us' ? 1.1 : 1);
+      // Fast mode is a flat premium on the model's prices (2x when the page lists no fast price).
+      const fast = usage.speed === 'fast' ? this.prices.fastPrice(model) : undefined;
+      const factor = (usage.speed === 'fast' ? (fast ? fast.input / price.input : 2) : 1) * (usage.inference_geo === 'us' ? 1.1 : 1);
       const oneHour = n((usage.cache_creation as Record<string, unknown> | undefined)?.ephemeral_1h_input_tokens);
-      counts.costUSD = factor * (counts.inputTokens * price[0] + counts.outputTokens * price[1]
-        + counts.cacheReadInputTokens * price[2]
-        + (counts.cacheCreationInputTokens - oneHour) * price[0] * 1.25 + oneHour * price[0] * 2) / 1e6;
+      counts.costUSD = factor * (counts.inputTokens * price.input + counts.outputTokens * price.output
+        + counts.cacheReadInputTokens * price.cacheRead
+        + (counts.cacheCreationInputTokens - oneHour) * price.write5m + oneHour * price.write1h) / 1e6;
       counts.webSearchRequests = n((usage.server_tool_use as Record<string, unknown> | undefined)?.web_search_requests);
       counts.costUSD += counts.webSearchRequests * 0.01;
     }
@@ -153,7 +158,7 @@ export class UsageLedger {
     const t = this.totals();
     const total = Object.values(t.models).reduce((s, v) => s + v.inputTokens + v.outputTokens + v.cacheReadInputTokens + v.cacheCreationInputTokens, 0);
     const rows = Object.entries(t.models).sort((a, b) => b[1].costUSD - a[1].costUSD).map(([m, v]) => kind === 'cost'
-      ? `${modelLabel(m)}: $${v.costUSD.toFixed(4)}`
+      ? `${modelLabel(m)}: $${v.costUSD.toFixed(4)}${this.prices.price(m)?.estimated ? ' (estimated)' : ''}`
       : `${modelLabel(m)}\nInput: ${v.inputTokens.toLocaleString('en-US')} · Output: ${v.outputTokens.toLocaleString('en-US')}\nCache read: ${v.cacheReadInputTokens.toLocaleString('en-US')} · Cache write: ${v.cacheCreationInputTokens.toLocaleString('en-US')}`);
     return (kind === 'cost' ? `Claude cost so far ≈ $${t.costUSD.toFixed(4)} USD` : `Overall recorded tokens: ${total.toLocaleString('en-US')}`)
       + '\n\n' + (rows.join('\n\n') || 'No recorded usage yet.')

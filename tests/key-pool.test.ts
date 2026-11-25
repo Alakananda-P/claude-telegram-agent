@@ -202,3 +202,42 @@ test('a retired primary key cannot make a legacy session resume under a differen
   await runner.run({ session: 'legacy-unmapped', prompt: 'Continue', resumeContext: 'Verified old work', cwd: '.' }, () => {}, new AbortController());
   assert.equal(resumed, undefined);
 });
+
+test('dead keys that are no longer configured are removed at start; configured and active keys never are', async () => {
+  const { config, store, keys } = await setup();
+  const ids = Object.keys(store.data.keyRecords!);
+  // Key 5 is retired and gone from the env; key 4 is gone but only out of credit; key 3 is retired but still configured.
+  store.data.keyRecords![ids[4]].status = 'retired'; store.data.keyRecords![ids[4]].retiredAt = '2026-11-02T00:00:00.000Z';
+  store.data.keyRecords![ids[3]].status = 'no_credit';
+  store.data.keyRecords![ids[2]].status = 'retired';
+  store.data.activeKeyId = ids[0];
+  const fewer = loadConfig({ TELEGRAM_BOT_TOKEN: '123456:abcdefghijklmnopqrstuvw', TELEGRAM_OWNER_ID: '123', ANTHROPIC_API_KEY: keys[0], ANTHROPIC_BACKUP_KEYS: JSON.stringify(keys.slice(1, 3)), DATA_DIR: config.dataDir });
+  const pool = new KeyPool(fewer, store, async () => ({ ok: true })); await pool.initialize();
+  assert.equal(store.data.keyRecords![ids[4]], undefined, 'retired + unconfigured is removed');
+  assert.ok(store.data.keyRecords![ids[3]], 'an unconfigured no-credit key waits for the owner');
+  assert.ok(store.data.keyRecords![ids[2]], 'a configured key is never removed automatically');
+  assert.ok(store.data.keyRecords![ids[0]]); assert.equal(store.data.activeKeyId, ids[0]);
+  assert.deepEqual(store.data.removedKeys!.map(k => [k.label, k.reason]), [['Key 5', 'retired and no longer configured']]);
+  assert.ok(!JSON.stringify(store.data).includes('sk-ant-five'), 'no key in state');
+  // The owner's Remove button: retired or unconfigured keys only.
+  const view = pool.panel('retired');
+  assert.deepEqual(view.buttons.flat().filter(b => b.callback_data.startsWith('keyremove ')).map(b => b.callback_data).sort(), [`keyremove ${ids[2]}`, `keyremove ${ids[3]}`].sort());
+  await pool.remove(ids[3]); assert.equal(store.data.keyRecords![ids[3]], undefined);
+  await assert.rejects(pool.remove(ids[0]), /Only retired or unconfigured keys/);
+  await assert.rejects(pool.remove(ids[1]), /Only retired or unconfigured keys/);
+  assert.equal(store.data.removedKeys!.length, 2);
+  assert.equal((await StateStore.open(store.file)).data.removedKeys!.length, 2);
+});
+
+test('the Remove button works from Telegram for the owner only', async () => {
+  const { Controller } = await import('../src/controller.js');
+  const { config, store } = await setup();
+  const ids = Object.keys(store.data.keyRecords!); store.data.keyRecords![ids[1]].status = 'retired';
+  const panels: string[] = [];
+  const messenger = { async send(_c: number, t: string) { panels.push(t); }, async panel(_c: number, t: string) { panels.push(t); }, async temporary() { return 1; }, async edit() {}, async remove() {}, async typing() {}, async acknowledge() {} };
+  const pool = new KeyPool(config, store, async () => ({ ok: true }));
+  const bot = new Controller(config, store, messenger as never, { async run() { throw new Error('unused'); } }, undefined, undefined, pool);
+  const tap = (from: number) => bot.callback({ id: 'k', from: { id: from }, message: { from: { id: 123 }, chat: { id: 123, type: 'private' }, text: '', message_id: 5 }, data: 'keyremove ' + ids[1] });
+  await tap(999); assert.ok(store.data.keyRecords![ids[1]], 'not the owner');
+  await tap(123); assert.equal(store.data.keyRecords![ids[1]], undefined); assert.match(panels.at(-1)!, /Key removed/);
+});

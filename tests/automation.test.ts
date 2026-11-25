@@ -60,8 +60,11 @@ test('DST recurrence follows local time and editing atomically replaces pending 
   await assert.rejects(engine.editSchedule(s.id, { name: 'Broken', kind: 'reminder', prompt: 'No', project: 'default', cron: 'invalid' }));
   assert.equal(store.data.schedules![0].name, 'Edited');
 });
-test('corrupt persisted queue records fail closed instead of executing malformed work', async () => {
+test('corrupt persisted queue records are quarantined instead of executing malformed work', async () => {
   const { store } = await setup();
   await writeFile(store.file, JSON.stringify({ ...store.data, tasks: [{ id: 'bad', status: 'queued', project: '../outside', prompt: 'run' }] }));
+  const reopened = await StateStore.open(store.file);
+  assert.deepEqual(reopened.data.tasks, []); assert.ok(reopened.quarantinedAtStart);
+  await writeFile(store.file, JSON.stringify({ ...store.data, schedules: [{ id: 'bad' }] }));
   await assert.rejects(StateStore.open(store.file), /invalid automation/);
 });
