@@ -24,7 +24,7 @@ export type AgentEvent = { type: 'session'; id: string } | { type: 'progress'; t
 export type PlanDecision = { approved: true } | { approved: false; feedback?: string };
 /** Asks the owner to approve a plan (ExitPlanMode). Absent when no owner can answer, e.g. scheduled runs. */
 export type PlanApproval = (plan: string, signal: AbortSignal) => Promise<PlanDecision>;
-export interface AgentRequest { prompt: string; cwd: string; session?: string; settings?: AgentSettings; memoryEnabled?: boolean; sessions?: SessionCatalog; projects?: ProjectToolContext; workspace?: WorkspaceContext; resumeContext?: string; steering?: SteeringInput; planApproval?: PlanApproval; planMode?: boolean }
+export interface AgentRequest { prompt: string; cwd: string; session?: string; settings?: AgentSettings; memoryEnabled?: boolean; sessions?: SessionCatalog; projects?: ProjectToolContext; workspace?: WorkspaceContext; resumeContext?: string; steering?: SteeringInput; planApproval?: PlanApproval; planMode?: boolean; attachedFiles?: string[] }
 export interface AgentResult { text: string; session: string; cumulativeCost: number }
 export interface Runner {
   run(request: AgentRequest, emit: (event: AgentEvent) => void | Promise<void>, abort: AbortController): Promise<AgentResult>;

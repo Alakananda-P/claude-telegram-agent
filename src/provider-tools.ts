@@ -14,14 +14,35 @@ import { workspaceServer } from './workspace-tools.js';
 
 const execFileAsync = promisify(execFile);
 
+/** An image the model can actually look at. `data` is raw base64 without a data-URL prefix. */
+export interface ToolImage { mimeType: string; data: string }
+export interface AgentToolResult { text: string; isError?: boolean; images?: ToolImage[] }
 export interface AgentTool {
   name: string;
   description: string;
   parameters: Record<string, unknown>;
   mutating: boolean;
   progressLabel: string;
-  execute(args: Record<string, unknown>, signal: AbortSignal): Promise<{ text: string; isError?: boolean }>;
+  execute(args: Record<string, unknown>, signal: AbortSignal): Promise<AgentToolResult>;
 }
+
+/** Largest image passed to a provider in one part (8 MB). */
+export const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+/** Formats Gemini, OpenRouter and xAI accept as image parts. Other image types are not sent raw. */
+const VISION_MIME: Record<string, string> = {
+  '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp', '.gif': 'image/gif',
+};
+const IMAGE_MIME: Record<string, string> = {
+  ...VISION_MIME,
+  '.bmp': 'image/bmp', '.avif': 'image/avif', '.heic': 'image/heic', '.heif': 'image/heif', '.tif': 'image/tiff', '.tiff': 'image/tiff',
+};
+/** Files that are never readable as text; they need a script instead of a text dump. */
+const BINARY_EXT = new Set(['.pdf', '.xlsx', '.xls', '.docx', '.doc', '.pptx', '.ppt', '.zip', '.7z', '.rar', '.gz', '.tar', '.mp3', '.mp4', '.mov', '.wav', '.woff', '.woff2', '.ttf', '.otf', '.exe', '.dll', '.so', '.dmg', '.apk', '.db', '.sqlite']);
+
+export const imageMimeType = (file: string): string | undefined => IMAGE_MIME[path.extname(file).toLowerCase()];
+/** Mime type only when the provider APIs can take the picture directly. */
+export const visionMimeType = (file: string): string | undefined => VISION_MIME[path.extname(file).toLowerCase()];
+export const isBinaryPath = (file: string): boolean => BINARY_EXT.has(path.extname(file).toLowerCase());
 
 interface RegisteredToolEntry {
   description?: string;
@@ -88,6 +109,20 @@ async function resolveProjectPath(cwd: string, rawPath: string, allowMissing = f
   return candidate;
 }
 
+/** Reads a project image as base64. Missing, secret, symlink, non-image, or oversized files are skipped. */
+export async function readProjectImage(cwd: string, relative: string): Promise<ToolImage | undefined> {
+  const mimeType = visionMimeType(relative);
+  if (!mimeType) return undefined;
+  try {
+    const file = await resolveProjectPath(cwd, relative);
+    const bytes = await readFile(file);
+    if (bytes.length > MAX_IMAGE_BYTES) return undefined;
+    return { mimeType, data: bytes.toString('base64') };
+  } catch {
+    return undefined;
+  }
+}
+
 function globToRegex(pattern: string): RegExp {
   const escaped = pattern.replace(/\\/g, '/').replace(/[.+^${}()|[\]\\]/g, '\\$&')
     .replace(/\*\*\//g, '(?:.+/)?')
@@ -131,7 +166,14 @@ function zodTool(
       try {
         const args = schema.parse(rawArgs) as Record<string, unknown>;
         const res = await run(args, signal);
-        return { text: typeof res === 'string' ? redact(res, secrets) : safeJson(res, secrets) };
+        // A tool may hand back pictures the model can look at; the text part stays a summary.
+        const images = res && typeof res === 'object' && Array.isArray((res as { images?: ToolImage[] }).images)
+          ? (res as { images: ToolImage[] }).images : undefined;
+        const body = res && typeof res === 'object' && 'images' in (res as object)
+          ? Object.fromEntries(Object.entries(res as Record<string, unknown>).filter(([key]) => key !== 'images'))
+          : res;
+        const text = typeof body === 'string' ? redact(body, secrets) : safeJson(body, secrets);
+        return images?.length ? { text, images } : { text };
       } catch (error) {
         const msg = error instanceof Error ? error.message : 'Tool execution failed.';
         return { isError: true, text: redact(msg, secrets) };
@@ -170,16 +212,31 @@ function extractMcpTools(serverName: string, server: { instance: unknown }, secr
 export function createProviderTools(request: AgentRequest, config: Config): AgentTool[] {
   const secrets = configSecrets(config);
   const tools: AgentTool[] = [
-    zodTool('Read', 'Read a file in the current project with line numbers. Use offset and limit for large files.',
+    zodTool('Read', 'Read a file in the current project with line numbers. Use offset and limit for large files. Images are returned as pictures you can look at directly.',
       z.object({ file_path: z.string().min(1), offset: z.number().int().min(1).default(1), limit: z.number().int().min(1).max(500).default(200) }),
       false, async args => {
         const file = await resolveProjectPath(request.cwd, String(args.file_path));
+        const relative = path.relative(request.cwd, file).replace(/\\/g, '/');
+        const mimeType = imageMimeType(file);
+        if (mimeType) {
+          const bytes = await readFile(file);
+          if (!visionMimeType(file)) {
+            return { file: relative, mimeType, bytes: bytes.length, error: 'This image format cannot be sent to the model. Convert it to JPEG or PNG with Bash, then read that file.' };
+          }
+          if (bytes.length > MAX_IMAGE_BYTES) {
+            return { file: relative, mimeType, bytes: bytes.length, error: `Image is ${(bytes.length / 1048576).toFixed(1)} MB, over the ${MAX_IMAGE_BYTES / 1048576} MB limit. Resize or crop it with Bash/sharp, then read it again.` };
+          }
+          return { file: relative, mimeType, bytes: bytes.length, content: 'Image attached. Look at it directly.', images: [{ mimeType, data: bytes.toString('base64') }] };
+        }
+        if (isBinaryPath(file)) {
+          return { file: relative, error: 'This is a binary file, not text. Inspect it with a script (for example Python, pdftotext or ffmpeg) through Bash instead of reading it as text.' };
+        }
         const raw = await readFile(file, 'utf8');
         const lines = raw.split(/\r?\n/);
         const offset = Number(args.offset ?? 1);
         const limit = Number(args.limit ?? 200);
         const slice = lines.slice(offset - 1, offset - 1 + limit).map((l, i) => `${offset + i}: ${l}`).join('\n');
-        return { file: path.relative(request.cwd, file).replace(/\\/g, '/'), totalLines: lines.length, content: slice.slice(0, 24000) };
+        return { file: relative, totalLines: lines.length, content: slice.slice(0, 24000) };
       }, secrets),
 
     zodTool('Write', 'Create or overwrite a file in the current project.',

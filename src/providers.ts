@@ -2,34 +2,36 @@ import { randomUUID } from 'node:crypto';
 import { AgentApiError, type AgentEvent, type AgentRequest, type AgentResult, type Runner } from './agent.js';
 import { configSecrets, type Config } from './config.js';
 import { SharedMemory } from './memory.js';
-import { cleanJsonSchema, createProviderTools, type AgentTool } from './provider-tools.js';
+import { cleanJsonSchema, createProviderTools, imageMimeType, readProjectImage, visionMimeType, type AgentTool, type AgentToolResult, type ToolImage } from './provider-tools.js';
 import { redact } from './safety.js';
 import type { StateStore } from './state.js';
 
 export type Provider = 'gemini' | 'xai' | 'minimax' | 'openrouter';
 export type HealthProvider = Provider | 'anthropic';
-export interface ProviderModel { id: string; label: string; provider: Provider; fast?: boolean; fallbackOnly?: boolean }
+export interface ProviderModel { id: string; label: string; provider: Provider; fast?: boolean; fallbackOnly?: boolean; supportsVision?: boolean }
 
 export const PROVIDER_MODELS: ProviderModel[] = [
-  { id: 'gemini-4-neon', label: 'Gemini 4 Neon', provider: 'gemini' },
-  { id: 'gemini-4-argon', label: 'Gemini 4 Argon', provider: 'gemini' },
-  { id: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash', provider: 'gemini', fast: true },
-  { id: 'gemma-4-31b-it', label: 'Gemma 4 31B IT', provider: 'gemini', fast: true },
-  { id: 'grok-4.7', label: 'Grok 4.7', provider: 'xai' },
-  { id: 'MiniMax-M3', label: 'MiniMax M3', provider: 'minimax' },
+  { id: 'gemini-4-neon', label: 'Gemini 4 Neon', provider: 'gemini', supportsVision: true },
+  { id: 'gemini-4-argon', label: 'Gemini 4 Argon', provider: 'gemini', supportsVision: true },
+  { id: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash', provider: 'gemini', fast: true, supportsVision: true },
+  { id: 'gemma-4-31b-it', label: 'Gemma 4 31B IT', provider: 'gemini', fast: true, supportsVision: true },
+  { id: 'grok-4.7', label: 'Grok 4.7', provider: 'xai', supportsVision: true },
+  { id: 'MiniMax-M3', label: 'MiniMax M3', provider: 'minimax', supportsVision: true },
   { id: 'MiniMax-M3.1-Flash', label: 'MiniMax M3.1 Flash', provider: 'minimax', fast: true },
-  { id: 'openai/gpt-6.2-sol', label: 'GPT 6.2 Sol', provider: 'openrouter' },
+  { id: 'openai/gpt-6.2-sol', label: 'GPT 6.2 Sol', provider: 'openrouter', supportsVision: true },
   { id: 'deepseek/deepseek-v4.1-flash-1017', label: 'DeepSeek V4.1 Flash', provider: 'openrouter', fast: true },
 ];
 
 export const FALLBACK_MODELS: ProviderModel[] = [
-  { id: 'anthropic/claude-opus-5.5', label: 'Claude Opus 5.5', provider: 'openrouter', fallbackOnly: true },
-  { id: 'anthropic/claude-sonnet-5.5', label: 'Claude Sonnet 5.5', provider: 'openrouter', fallbackOnly: true },
-  { id: 'anthropic/claude-fable-5.2', label: 'Claude Fable 5.2', provider: 'openrouter', fallbackOnly: true },
-  { id: 'google/gemma-4-31b-it:free', label: 'Gemma 4 31B IT Free', provider: 'openrouter', fast: true, fallbackOnly: true },
+  { id: 'anthropic/claude-opus-5.5', label: 'Claude Opus 5.5', provider: 'openrouter', fallbackOnly: true, supportsVision: true },
+  { id: 'anthropic/claude-sonnet-5.5', label: 'Claude Sonnet 5.5', provider: 'openrouter', fallbackOnly: true, supportsVision: true },
+  { id: 'anthropic/claude-fable-5.2', label: 'Claude Fable 5.2', provider: 'openrouter', fallbackOnly: true, supportsVision: true },
+  { id: 'google/gemma-4-31b-it:free', label: 'Gemma 4 31B IT Free', provider: 'openrouter', fast: true, fallbackOnly: true, supportsVision: true },
 ];
 
 export const providerModel = (id: string) => PROVIDER_MODELS.find(m => m.id === id) ?? FALLBACK_MODELS.find(m => m.id === id);
+/** Text-only models get a clear note instead of an image part that their API would reject. */
+export const modelSupportsVision = (id: string): boolean => providerModel(id)?.supportsVision === true;
 export const configuredProviderModels = (config: ProviderConfig): ProviderModel[] =>
   PROVIDER_MODELS.filter(m => (config.keys[m.provider]?.length ?? 0) > 0);
 
@@ -148,6 +150,27 @@ function classifyHttpError(status: number): string {
     : 'invalid_request';
 }
 
+const NO_VISION_NOTE = 'This model cannot look at pictures. The image was not sent. Switch to a vision model if the task needs the picture.';
+
+/** Loads every image the owner attached to this turn. Non-images and unreadable files are skipped. */
+async function loadAttachedImages(cwd: string, files: string[] | undefined): Promise<ToolImage[]> {
+  if (!files?.length) return [];
+  const images: ToolImage[] = [];
+  for (const file of files.slice(0, 10)) {
+    const image = await readProjectImage(cwd, file);
+    if (image) images.push(image);
+  }
+  return images;
+}
+
+/** Drops picture bytes for a text-only model and says so in the tool text. */
+function toolResultForModel(res: AgentToolResult, vision: boolean): AgentToolResult {
+  if (vision || !res.images?.length) return res;
+  const text = res.text.includes('cannot look at pictures') ? res.text : `${res.text}
+${NO_VISION_NOTE}`;
+  return { text, isError: res.isError };
+}
+
 export class ProviderRunner implements Runner {
   private next: Partial<Record<Provider, number>> = {};
   constructor(
@@ -198,6 +221,8 @@ export class ProviderRunner implements Runner {
           await emit(ev);
         }, abort.signal);
         this.next[model.provider] = (start + offset + 1) % keys.length;
+        // Keep the bot chat id. Minting a new id on every turn made a new chat version
+        // each reply. A provider id is only for a chat that has no session yet.
         const session = request.session ?? `provider-${randomUUID()}`;
         await emit({ type: 'session', id: session });
         return { text, session, cumulativeCost: 0 };
@@ -222,14 +247,24 @@ export class ProviderRunner implements Runner {
     signal: AbortSignal,
   ): Promise<string> {
     const toolMap = new Map(tools.map(t => [t.name, t]));
+    const vision = modelSupportsVision(model.id);
+    const attachedImageFiles = (request.attachedFiles ?? []).filter(file => imageMimeType(file) || visionMimeType(file));
+    const attachedImages = vision ? await loadAttachedImages(request.cwd, attachedImageFiles) : [];
+    if (attachedImageFiles.length && !vision) {
+      await emit({ type: 'commentary', id: randomUUID(), text: `${model.label} cannot look at pictures. Image attachments were not sent to this model; switch to a vision model if the task needs them.` });
+    } else if (vision && attachedImageFiles.length > attachedImages.length) {
+      await emit({ type: 'commentary', id: randomUUID(), text: 'One or more attached pictures could not be sent (missing, too large, unsupported format, or not inside the project). JPEG, PNG, WEBP and GIF are sent directly.' });
+    }
     if (model.provider === 'gemini') {
       const declarations = tools.map(t => ({
         name: t.name,
         description: t.description.slice(0, 500),
         parameters: cleanJsonSchema(t.parameters, true),
       }));
+      const firstParts: unknown[] = [{ text: request.prompt }];
+      for (const image of attachedImages) firstParts.push({ inlineData: { mimeType: image.mimeType, data: image.data } });
       const contents: Array<{ role: 'user' | 'model'; parts: unknown[] }> = [
-        { role: 'user', parts: [{ text: request.prompt }] },
+        { role: 'user', parts: firstParts },
       ];
       for (let turn = 0; turn < maxTurns; turn++) {
         signal.throwIfAborted();
@@ -266,8 +301,10 @@ export class ProviderRunner implements Runner {
           if (tool) {
             await emit({ type: 'progress', text: tool.progressLabel });
             if (tool.mutating) await emit({ type: 'effect', tool: tool.name });
-            const res = await tool.execute(fc.args ?? {}, signal);
+            const res = toolResultForModel(await tool.execute(fc.args ?? {}, signal), vision);
             responses.push({ functionResponse: { name: fc.name, response: { result: res.text, isError: !!res.isError } } });
+            // A picture returned by a tool is passed on as a real image part, not as text.
+            for (const image of res.images ?? []) responses.push({ inlineData: { mimeType: image.mimeType, data: image.data } });
           } else {
             responses.push({ functionResponse: { name: fc.name, response: { error: `Unknown tool: ${fc.name}` } } });
           }
@@ -292,7 +329,9 @@ export class ProviderRunner implements Runner {
     }));
     const messages: Array<Record<string, unknown>> = [
       { role: 'system', content: systemPrompt },
-      { role: 'user', content: request.prompt },
+      { role: 'user', content: attachedImages.length
+        ? [{ type: 'text', text: request.prompt }, ...attachedImages.map(image => ({ type: 'image_url', image_url: { url: `data:${image.mimeType};base64,${image.data}` } }))]
+        : request.prompt },
     ];
 
     for (let turn = 0; turn < maxTurns; turn++) {
@@ -325,6 +364,7 @@ export class ProviderRunner implements Runner {
       }
 
       messages.push({ role: 'assistant', content: msg?.content ?? null, tool_calls: toolCalls });
+      const toolImages: ToolImage[] = [];
       for (const tc of toolCalls) {
         const name = tc.function?.name ?? '';
         let args: Record<string, unknown> = {};
@@ -333,11 +373,20 @@ export class ProviderRunner implements Runner {
         if (tool) {
           await emit({ type: 'progress', text: tool.progressLabel });
           if (tool.mutating) await emit({ type: 'effect', tool: tool.name });
-          const res = await tool.execute(args, signal);
+          const res = toolResultForModel(await tool.execute(args, signal), vision);
           messages.push({ role: 'tool', tool_call_id: tc.id, content: res.text });
+          if (vision) toolImages.push(...(res.images ?? []));
         } else {
           messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify({ error: `Unknown tool: ${name}` }) });
         }
+      }
+      // Many OpenAI-compatible endpoints reject image parts inside a tool message,
+      // so a picture from a tool is sent as a separate user message.
+      if (toolImages.length) {
+        messages.push({ role: 'user', content: [
+          { type: 'text', text: 'Image returned by the tool above:' },
+          ...toolImages.map(image => ({ type: 'image_url', image_url: { url: `data:${image.mimeType};base64,${image.data}` } })),
+        ] });
       }
       const steered = this.drainSteering(request);
       if (steered.length) {
@@ -425,7 +474,7 @@ export class RoutedRunner implements Runner {
       let hadEffect = false;
       try {
         return await this.providers.run(
-          { ...request, session: undefined, settings: { ...(request.settings ?? { effort: 'high', fast: false, model: target.id }), model: target.id, fast: false } },
+          { ...request, settings: { ...(request.settings ?? { effort: 'high', fast: false, model: target.id }), model: target.id, fast: false } },
           async ev => { if (ev.type === 'effect') hadEffect = true; await emit(ev); },
           abort,
         );

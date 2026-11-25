@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { AgentApiError, type Runner } from '../src/agent.js';
@@ -11,9 +11,11 @@ import {
   ProviderRunner,
   RoutedRunner,
   configuredProviderModels,
+  modelSupportsVision,
   providerModel,
   stripThinking,
 } from '../src/providers.js';
+import { MAX_IMAGE_BYTES } from '../src/provider-tools.js';
 
 function testConfig(dataDir: string): Config {
   return {
@@ -243,4 +245,213 @@ test('RoutedRunner falls back Gemma 4 31B IT to OpenRouter free and never replay
     () => routed.run({ prompt: 'edit', cwd: '.', settings: { model: 'claude-opus-5-5', effort: 'high', fast: false } }, () => {}, new AbortController()),
     /Failed mid-task/,
   );
+});
+
+const TINY_PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64');
+
+test('vision flag follows model metadata, not a separate list', () => {
+  assert.equal(modelSupportsVision('gemini-4-argon'), true);
+  assert.equal(modelSupportsVision('grok-4.7'), true);
+  assert.equal(modelSupportsVision('deepseek/deepseek-v4.1-flash-1017'), false);
+  assert.equal(modelSupportsVision('MiniMax-M3.1-Flash'), false);
+  assert.equal(modelSupportsVision('missing-model'), false);
+});
+
+test('ProviderRunner sends attached photos to Gemini and OpenAI-compatible models', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'myra-vis-'));
+  try {
+    await mkdir(path.join(dir, 'uploads'), { recursive: true });
+    await writeFile(path.join(dir, 'uploads', 'photo.png'), TINY_PNG);
+    const seen: Array<{ url: string; body: Record<string, unknown> }> = [];
+    const fakeFetch: typeof fetch = async (url, init) => {
+      seen.push({ url: String(url), body: JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown> });
+      if (String(url).includes('generativelanguage')) {
+        return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: 'Bill dekhi.' }] } }] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'Bill dekhi.' } }] }), { status: 200 });
+    };
+    const cfg = testConfig(dir);
+    const runner = new ProviderRunner(cfg.providers, cfg, fakeFetch);
+    const gemini = await runner.run({
+      prompt: 'Is bill ko dekho', cwd: dir, attachedFiles: ['uploads/photo.png'],
+      settings: { model: 'gemini-4-argon', effort: 'high', fast: false },
+    }, () => {}, new AbortController());
+    assert.equal(gemini.text, 'Bill dekhi.');
+    const parts = ((seen[0].body.contents as Array<{ parts: Array<Record<string, unknown>> }>)[0].parts);
+    assert.equal(parts[0].text, 'Is bill ko dekho');
+    assert.equal((parts[1].inlineData as { mimeType: string }).mimeType, 'image/png');
+    assert.equal((parts[1].inlineData as { data: string }).data, TINY_PNG.toString('base64'));
+
+    const grok = await runner.run({
+      prompt: 'Is bill ko dekho', cwd: dir, attachedFiles: ['uploads/photo.png'],
+      settings: { model: 'grok-4.7', effort: 'high', fast: false },
+    }, () => {}, new AbortController());
+    assert.equal(grok.text, 'Bill dekhi.');
+    const content = (seen[1].body.messages as Array<{ role: string; content: unknown }>).find(m => m.role === 'user')?.content as Array<{ type: string; image_url?: { url: string } }>;
+    assert.equal(content[0].type, 'text');
+    assert.equal(content[1].image_url?.url, `data:image/png;base64,${TINY_PNG.toString('base64')}`);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('Read returns an image the model can see, and a binary file as a hint', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'myra-read-'));
+  try {
+    await mkdir(path.join(dir, 'uploads'), { recursive: true });
+    await writeFile(path.join(dir, 'uploads', 'photo.jpg'), TINY_PNG);
+    await writeFile(path.join(dir, 'notes.pdf'), Buffer.from('%PDF-1.4 not text'));
+    const seen: unknown[] = [];
+    let step = 0;
+    const fakeFetch: typeof fetch = async (_url, init) => {
+      const body = JSON.parse(String(init?.body ?? '{}')) as { contents?: Array<{ parts?: unknown[] }> };
+      step++;
+      if (step === 1) {
+        return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ functionCall: { name: 'Read', args: { file_path: 'uploads/photo.jpg' } } }] } }] }), { status: 200 });
+      }
+      if (step === 2) {
+        seen.push(body.contents?.at(-1)?.parts);
+        return new Response(JSON.stringify({
+          candidates: [{ content: { parts: [{ functionCall: { name: 'Read', args: { file_path: 'notes.pdf' } } }] } }],
+        }), { status: 200 });
+      }
+      seen.push(body.contents?.at(-1)?.parts);
+      return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: 'Dekh liya.' }] } }] }), { status: 200 });
+    };
+    const cfg = testConfig(dir);
+    const runner = new ProviderRunner(cfg.providers, cfg, fakeFetch);
+    const res = await runner.run({
+      prompt: 'Photo aur pdf dekho', cwd: dir,
+      settings: { model: 'gemini-4-neon', effort: 'high', fast: false },
+    }, () => {}, new AbortController());
+    assert.equal(res.text, 'Dekh liya.');
+    const imageTurn = JSON.stringify(seen[0]);
+    assert.match(imageTurn, /inlineData/);
+    assert.match(imageTurn, new RegExp(TINY_PNG.toString('base64')));
+    assert.doesNotMatch(imageTurn, /JFIF/);
+    const pdfTurn = JSON.stringify(seen[1]);
+    assert.match(pdfTurn, /binary file, not text/);
+    assert.doesNotMatch(pdfTurn, /%PDF/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('text-only models are not sent picture bytes', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'myra-novis-'));
+  try {
+    await mkdir(path.join(dir, 'uploads'), { recursive: true });
+    await writeFile(path.join(dir, 'uploads', 'photo.png'), TINY_PNG);
+    const seen: Array<Record<string, unknown>> = [];
+    let step = 0;
+    const notes: string[] = [];
+    const fakeFetch: typeof fetch = async (_url, init) => {
+      seen.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>);
+      step++;
+      if (step === 1) {
+        return new Response(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [{ id: 'tc', type: 'function', function: { name: 'Read', arguments: JSON.stringify({ file_path: 'uploads/photo.png' }) } }] } }] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'Text only reply.' } }] }), { status: 200 });
+    };
+    const cfg = testConfig(dir);
+    const runner = new ProviderRunner(cfg.providers, cfg, fakeFetch);
+    const res = await runner.run({
+      prompt: 'Photo padho', cwd: dir, attachedFiles: ['uploads/photo.png'],
+      settings: { model: 'deepseek/deepseek-v4.1-flash-1017', effort: 'high', fast: false },
+    }, ev => { if (ev.type === 'commentary') notes.push(ev.text); }, new AbortController());
+    assert.equal(res.text, 'Text only reply.');
+    assert.match(notes.join('\n'), /cannot look at pictures/);
+    const firstUser = (seen[0].messages as Array<{ role: string; content: unknown }>).find(m => m.role === 'user');
+    assert.equal(typeof firstUser?.content, 'string');
+    const second = JSON.stringify(seen[1]);
+    assert.doesNotMatch(second, /image_url/);
+    assert.doesNotMatch(second, new RegExp(TINY_PNG.toString('base64')));
+    assert.match(second, /cannot look at pictures/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('fallback keeps the existing chat id instead of minting a new one each turn', async () => {
+  const fakeFetch: typeof fetch = async () => new Response(JSON.stringify({ choices: [{ message: { content: 'via fallback' } }] }), { status: 200 });
+  const providers = new ProviderRunner({ keys: { openrouter: ['or-1'] } }, undefined, fakeFetch);
+  const claude: Runner = { async run() { throw new AgentApiError('billing_error', 'Out of credits'); } };
+  const routed = new RoutedRunner(claude, providers);
+  const ids: string[] = [];
+  const emit = async (ev: { type: string; id?: string }) => { if (ev.type === 'session' && ev.id) ids.push(ev.id); };
+  const settings = { model: 'claude-opus-5-5', effort: 'high' as const, fast: false };
+  const first = await routed.run({ prompt: 'hi', cwd: '.', session: 'office-chat', settings }, emit, new AbortController());
+  const second = await routed.run({ prompt: 'again', cwd: '.', session: 'office-chat', settings }, emit, new AbortController());
+  assert.equal(first.session, 'office-chat');
+  assert.equal(second.session, 'office-chat');
+  assert.deepEqual(ids, ['office-chat', 'office-chat']);
+});
+
+test('a new provider chat gets one id and the next turn reuses it', async () => {
+  const fakeFetch: typeof fetch = async () => new Response(JSON.stringify({ choices: [{ message: { content: 'ok' } }] }), { status: 200 });
+  const cfg = testConfig(await mkdtemp(path.join(os.tmpdir(), 'myra-ses-')));
+  try {
+    const runner = new ProviderRunner(cfg.providers, cfg, fakeFetch);
+    const settings = { model: 'grok-4.7', effort: 'high' as const, fast: false };
+    const first = await runner.run({ prompt: 'hi', cwd: cfg.dataDir, settings }, () => {}, new AbortController());
+    const second = await runner.run({ prompt: 'next', cwd: cfg.dataDir, session: first.session, settings }, () => {}, new AbortController());
+    assert.match(first.session, /^provider-/);
+    assert.equal(second.session, first.session);
+  } finally {
+    await rm(cfg.dataDir, { recursive: true, force: true });
+  }
+});
+
+test('unsupported image formats are not sent as picture bytes', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'myra-heic-'));
+  try {
+    await mkdir(path.join(dir, 'uploads'), { recursive: true });
+    await writeFile(path.join(dir, 'uploads', 'bill.heic'), TINY_PNG);
+    const seen: string[] = [];
+    const fakeFetch: typeof fetch = async (_url, init) => {
+      seen.push(String(init?.body ?? ''));
+      return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: 'No picture.' }] } }] }), { status: 200 });
+    };
+    const cfg = testConfig(dir);
+    const runner = new ProviderRunner(cfg.providers, cfg, fakeFetch);
+    await runner.run({
+      prompt: 'Heic bill', cwd: dir, attachedFiles: ['uploads/bill.heic'],
+      settings: { model: 'gemini-4-argon', effort: 'high', fast: false },
+    }, () => {}, new AbortController());
+    assert.doesNotMatch(seen[0], /inlineData/);
+    assert.doesNotMatch(seen[0], new RegExp(TINY_PNG.toString('base64')));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('an oversized image is not sent and Read says so', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'myra-big-'));
+  try {
+    await mkdir(path.join(dir, 'uploads'), { recursive: true });
+    await writeFile(path.join(dir, 'uploads', 'big.png'), Buffer.alloc(MAX_IMAGE_BYTES + 1, 1));
+    const seen: string[] = [];
+    let step = 0;
+    const notes: string[] = [];
+    const fakeFetch: typeof fetch = async (_url, init) => {
+      seen.push(String(init?.body ?? ''));
+      step++;
+      if (step === 1) {
+        return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ functionCall: { name: 'Read', args: { file_path: 'uploads/big.png' } } }] } }] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: 'Too big.' }] } }] }), { status: 200 });
+    };
+    const cfg = testConfig(dir);
+    const runner = new ProviderRunner(cfg.providers, cfg, fakeFetch);
+    await runner.run({
+      prompt: 'Badi photo', cwd: dir, attachedFiles: ['uploads/big.png'],
+      settings: { model: 'gemini-4-argon', effort: 'high', fast: false },
+    }, ev => { if (ev.type === 'commentary') notes.push(ev.text); }, new AbortController());
+    assert.doesNotMatch(seen[0], /inlineData/);
+    assert.match(notes.join('\n'), /could not be sent/);
+    assert.match(seen[1], /over the 8 MB limit/);
+    assert.doesNotMatch(seen[1], /inlineData/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
