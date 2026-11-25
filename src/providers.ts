@@ -51,11 +51,11 @@ export class ProviderRunner implements Runner {
     let url: string, headers: Record<string, string>, body: unknown, read: (v: any) => string | undefined;
     if (model.provider === 'gemini') {
       url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model.id)}:generateContent?key=${encodeURIComponent(key)}`;
-      headers = { 'Content-Type': 'application/json' }; body = { contents: [{ parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: 8192 } };
+      headers = { 'Content-Type': 'application/json' }; body = { systemInstruction: { parts: [{ text: 'You are a fallback text assistant inside a Telegram bot. You do not receive the bot\'s persistent memory, saved chats, files or tools in this request. Never claim that you can access or use them. State this briefly if asked.' }] }, contents: [{ parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: 8192 } };
       read = v => v?.candidates?.[0]?.content?.parts?.map((p: any) => p.text ?? '').join('');
     } else {
       url = model.provider === 'xai' ? 'https://api.x.ai/v1/chat/completions' : model.provider === 'minimax' ? 'https://api.minimax.io/v1/chat/completions' : 'https://openrouter.ai/api/v1/chat/completions';
-      headers = { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' }; body = { model: model.id, messages: [{ role: 'user', content: prompt }], max_tokens: 8192 };
+      headers = { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' }; body = { model: model.id, messages: [{ role: 'system', content: 'You are a fallback text assistant inside a Telegram bot. You do not receive the bot\'s persistent memory, saved chats, files or tools in this request. Never claim that you can access or use them. State this briefly if asked.' }, { role: 'user', content: prompt }], max_tokens: 8192 };
       read = v => v?.choices?.[0]?.message?.content;
     }
     let response: Response; try { response = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal: AbortSignal.any([signal, AbortSignal.timeout(120_000)]) }); } catch { throw new AgentApiError('network_error', 'Fallback provider could not be reached.'); }
