@@ -17,6 +17,7 @@ import { SessionCatalog, sessionTitle } from './sessions.js';
 import { TitleAccountingError, type TitleGenerator } from './titles.js';
 import { Automation, clockInfo, type Task, type Batch, type SteerRecord, type TelegramMessageContext } from './automation.js';
 import type { MessageListOptions, MessageDeletion } from './telegram.js';
+import { TelegramError } from './telegram.js';
 import { SteeringInput } from './steering.js';
 import { artifactSnapshot, changedArtifactReport, privateDocument } from './artifacts.js';
 import { Backups } from './backup.js';
@@ -234,6 +235,10 @@ export class Controller {
       if (data === 'memory confirm-clear') {
         await this.panel('Clear shared memory? Saved conversations and files will stay.', [[button('Clear memory', 'memory clear')], ...BACK]);
       } else await this.handle({ ...callback.message, from: callback.from, text: '/' + data, reply_to_message: undefined, document: undefined, photo: undefined, video: undefined, video_note: undefined, animation: undefined, voice: undefined, audio: undefined, media_group_id: undefined, caption: undefined });
+    } catch (error) {
+      if (error instanceof TelegramError && [401, 403, 409].includes(error.code)) throw error;
+      console.warn(`Button could not be handled (${error instanceof Error ? error.name : 'unknown'}); the bot keeps running.`);
+      await this.say('That action failed, but the bot is still running and saved work is kept. Try again, or check /status.').catch(() => {});
     } finally { this.panelId = undefined; }
   }
 
@@ -377,7 +382,17 @@ export class Controller {
       [button('➕ New chat', 'new chat'), button('Trash', 'trash')], ...BACK]);
   }
 
+  /** M1: a failing command answers with an error instead of ending polling; only Telegram auth/conflict errors escape. */
   async handle(message: Message): Promise<void> {
+    try { await this.dispatch(message); }
+    catch (error) {
+      if (error instanceof TelegramError && [401, 403, 409].includes(error.code)) throw error;
+      console.warn(`Owner message could not be handled (${error instanceof Error ? error.name : 'unknown'}); the bot keeps running.`);
+      await this.say('That action failed, but the bot is still running and saved work is kept. Try again, or check /status.').catch(() => {});
+    }
+  }
+
+  private async dispatch(message: Message): Promise<void> {
     if (!authorized(message, this.config.owner) || this.shuttingDown) return;
     const text = message.text?.trim() ?? '';
     const match = /^\/(\w+)(?:@\w+)?(?:\s+([\s\S]*))?$/.exec(text);

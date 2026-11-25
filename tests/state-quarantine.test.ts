@@ -71,3 +71,14 @@ test('H3: open() moves invalid task and steer records to a quarantine file inste
   await new Controller(config, store, { async send(_c: number, t: string) { sent.push(t); } } as never, { async run() { throw new Error('unused'); } }).restartNotice();
   assert.equal(sent.length, 1); assert.match(sent[0], /quarantine/); assert.match(sent[0], /not run/);
 });
+
+test('M1: a corrupt chat archive makes /history answer with an error instead of throwing', async () => {
+  const { bot, store, replies, dataDir, release } = await running(); release();
+  store.data.conversations = [{ id: 'chat-x', project: 'default', updatedAt: new Date().toISOString(), title: 'Broken' }]; store.data.sessions.default = 'chat-x';
+  const { createHash } = await import('node:crypto'); const { mkdir } = await import('node:fs/promises');
+  const chats = path.join(dataDir, 'bot', 'chats'); await mkdir(chats, { recursive: true });
+  await writeFile(path.join(chats, createHash('sha256').update('chat-x').digest('hex') + '.json'), '{not json');
+  await bot.handle(message('/history chat-x'));
+  await bot.callback({ id: 'cb', from: { id: 123 }, message: { ...message(''), message_id: 7 }, data: 'history chat-x 0' });
+  assert.ok(replies.filter(r => /still running/i.test(r)).length >= 2, replies.join(' | '));
+});
