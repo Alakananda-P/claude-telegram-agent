@@ -25,7 +25,7 @@ export class ResilientRunner implements Runner {
         await this.pool.begin(credential.id);
         let result;
         try {
-          result = await this.factory({ ...this.config, apiKey: credential.key }).run(current, async event => {
+          result = await this.factory(this.pool.configFor(credential)).run(current, async event => {
             if (event.type === 'effect') effects = true;
             if (event.type === 'session') { d.sessionCredentials![event.id] = credential.id; await this.store.save(); }
             await emit(event);

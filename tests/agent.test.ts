@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { SDKMessage, Options } from '@anthropic-ai/claude-agent-sdk';
-import { ClaudeRunner, type AgentEvent, type QueryFactory } from '../src/agent.js';
+import { agentEnvironment, ClaudeRunner, type AgentEvent, type QueryFactory } from '../src/agent.js';
 import { loadConfig } from '../src/config.js';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -16,6 +16,14 @@ import { ProjectCatalog } from '../src/projects.js';
 import { PROJECT_TOOL_NAMES, type ProjectToolContext } from '../src/project-tools.js';
 
 const config = loadConfig({ TELEGRAM_BOT_TOKEN: '123456:abcdefghijklmnopqrstuvw', TELEGRAM_OWNER_ID: '123', ANTHROPIC_API_KEY: 'test-only-not-real' });
+
+test('OAuth configuration uses Claude Code OAuth only and cannot be mixed with API-key routing', () => {
+  const oauth = loadConfig({ TELEGRAM_BOT_TOKEN: '123456:abcdefghijklmnopqrstuvw', TELEGRAM_OWNER_ID: '123', CLAUDE_CODE_OAUTH_TOKEN: 'test-oauth-token' });
+  const env = agentEnvironment(oauth);
+  assert.equal(oauth.apiKey, ''); assert.equal(oauth.oauthToken, 'test-oauth-token');
+  assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, 'test-oauth-token'); assert.equal(env.ANTHROPIC_API_KEY, undefined);
+  assert.throws(() => loadConfig({ TELEGRAM_BOT_TOKEN: '123456:abcdefghijklmnopqrstuvw', TELEGRAM_OWNER_ID: '123', ANTHROPIC_API_KEY: 'api', CLAUDE_CODE_OAUTH_TOKEN: 'oauth' }), /exactly one/);
+});
 
 test('runner uses an open input stream for conversational steering', async () => {
   const make: QueryFactory = ({ prompt }) => {
