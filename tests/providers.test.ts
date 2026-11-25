@@ -53,9 +53,9 @@ test('configuredProviderModels consolidates Opus/Gemma and hides unconfigured pr
     keys: { gemini: ['g'], xai: ['x'], minimax: ['m'], openrouter: ['o'] },
   });
   assert.ok(all.some(m => m.id === 'gemma-4-31b-it'));
-  assert.ok(!all.some(m => m.id === 'anthropic/claude-opus-latest'));
+  assert.ok(!all.some(m => m.id === 'anthropic/claude-opus-5.5'));
   assert.ok(!all.some(m => m.id === 'google/gemma-4-31b-it:free'));
-  assert.ok(providerModel('anthropic/claude-opus-latest')?.fallbackOnly);
+  assert.ok(providerModel('anthropic/claude-opus-5.5')?.fallbackOnly);
   assert.ok(providerModel('google/gemma-4-31b-it:free')?.fallbackOnly);
 });
 
@@ -188,7 +188,7 @@ test('RoutedRunner sticks to OpenRouter during cooldown and recovers via backgro
   const r1 = await routed.run({ prompt: 'hi', cwd: '.', settings: { model: 'claude-opus-5-5', effort: 'high', fast: false } }, () => {}, new AbortController());
   assert.equal(r1.text, 'Answered via OpenRouter');
   assert.equal(claudeCalls, 1);
-  assert.equal(openrouterModels[0], 'anthropic/claude-opus-latest');
+  assert.equal(openrouterModels[0], 'anthropic/claude-opus-5.5');
   assert.equal(health.isCoolingDown('anthropic'), true);
 
   // 2nd request within cooldown: skips Claude completely!

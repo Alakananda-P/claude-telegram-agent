@@ -37,7 +37,7 @@ export class AgentSafetyError extends AgentError {
   constructor(readonly category?: string) { super('Claude safety system stopped this response. No automatic retry or model switch was accepted. Use /fresh for a separate conversation with a short summary of earlier completed work, or /new chat for an empty conversation. The stopped request is not retried. Existing files, saved chats and memory are kept.'); this.name = 'AgentSafetyError'; }
 }
 export class AgentApiError extends AgentError {
-  constructor(readonly kind: string, message: string) { super(message); }
+  constructor(readonly kind: string, message: string, readonly provider?: string) { super(message); }
 }
 function apiFailure(error: string | undefined, detail: string): AgentApiError {
   // Inspect only SDK-marked error frames, never ordinary model text. Never

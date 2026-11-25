@@ -23,7 +23,9 @@ export const PROVIDER_MODELS: ProviderModel[] = [
 ];
 
 export const FALLBACK_MODELS: ProviderModel[] = [
-  { id: 'anthropic/claude-opus-latest', label: 'Claude Opus Latest', provider: 'openrouter', fallbackOnly: true },
+  { id: 'anthropic/claude-opus-5.5', label: 'Claude Opus 5.5', provider: 'openrouter', fallbackOnly: true },
+  { id: 'anthropic/claude-sonnet-5.5', label: 'Claude Sonnet 5.5', provider: 'openrouter', fallbackOnly: true },
+  { id: 'anthropic/claude-fable-5.2', label: 'Claude Fable 5.2', provider: 'openrouter', fallbackOnly: true },
   { id: 'google/gemma-4-31b-it:free', label: 'Gemma 4 31B IT Free', provider: 'openrouter', fast: true, fallbackOnly: true },
 ];
 
@@ -179,7 +181,7 @@ export class ProviderRunner implements Runner {
     const model = providerModel(request.settings?.model ?? '');
     if (!model) throw new AgentApiError('model_not_found', 'The selected model is not configured.');
     const keys = this.config.keys[model.provider] ?? [];
-    if (!keys.length) throw new AgentApiError('credentials_exhausted', `${model.label} has no configured credential.`);
+    if (!keys.length) throw new AgentApiError('credentials_exhausted', `${model.label} has no configured credential.`, model.label);
     const start = this.next[model.provider] ?? 0;
     let last: AgentApiError | undefined;
     const tools = this.appConfig ? createProviderTools(request, this.appConfig) : [];
@@ -200,7 +202,9 @@ export class ProviderRunner implements Runner {
         await emit({ type: 'session', id: session });
         return { text, session, cumulativeCost: 0 };
       } catch (error) {
-        last = error instanceof AgentApiError ? error : new AgentApiError('unknown', 'Fallback provider request failed.');
+        last = error instanceof AgentApiError
+          ? (error.provider ? error : new AgentApiError(error.kind, error.message, model.label))
+          : new AgentApiError('unknown', 'Fallback provider request failed.', model.label);
         if (usedMutatingTool) throw last;
       }
     }
@@ -398,8 +402,10 @@ export class RoutedRunner implements Runner {
     if (modelId === 'gemma-4-31b-it') {
       addIfConfigured('google/gemma-4-31b-it:free');
     } else if (!providerModel(modelId)) {
-      // Claude primary failed -> prefer OpenRouter Opus/GPT, then Gemini Argon, then other configured models
-      addIfConfigured('anthropic/claude-opus-latest');
+      // Claude primary failed -> prefer matching OpenRouter Claude model, then GPT, Gemini Argon, Grok, MiniMax
+      if (modelId.includes('fable')) addIfConfigured('anthropic/claude-fable-5.2');
+      else if (modelId.includes('sonnet')) addIfConfigured('anthropic/claude-sonnet-5.5');
+      addIfConfigured('anthropic/claude-opus-5.5');
       addIfConfigured('openai/gpt-6.2-sol');
       addIfConfigured('gemini-4-argon');
       addIfConfigured('grok-4.7');

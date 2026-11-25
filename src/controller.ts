@@ -1042,7 +1042,7 @@ export class Controller {
       if (error instanceof AgentSafetyError) { task.failureKind = 'safety_refusal'; console.warn(JSON.stringify({ event: 'claude_safety_stop', task: task.id, session: archiveKey, model: task.settings?.model ?? this.config.model, category: error.category ?? 'unreported', time: new Date().toISOString() })); }
       if (error instanceof AgentApiError) {
         const failedModel = task.settings?.model ?? this.settings.model;
-        const providerLabel = providerModel(failedModel) ? modelLabel(failedModel) : 'Claude API';
+        const providerLabel = error.provider ?? (providerModel(failedModel) ? modelLabel(failedModel) : 'Claude API');
         (this.store.data.health ??= {}).apiError = error.kind; console.warn(`${providerLabel} task failure: ${error.kind}.`);
         // M2: only key or account problems stop the queue; a busy API does not.
         if (PAUSE_API_KINDS.includes(error.kind)) await this.automation.setPaused(true);
@@ -1060,7 +1060,7 @@ export class Controller {
       if (error instanceof AgentApiError) {
         // W47-05/06: the reason is in the notice above; offer the retry right here.
         const failedModel = task.settings?.model ?? this.settings.model;
-        const providerLabel = providerModel(failedModel) ? modelLabel(failedModel) : 'Claude API';
+        const providerLabel = error.provider ?? (providerModel(failedModel) ? modelLabel(failedModel) : 'Claude API');
         const reason = `${providerLabel} problem: ${error.kind.replace(/_/g, ' ')}.`;
         if (autoRetry) await this.panel(`${reason} Nothing was changed, so I will retry this task once automatically in about a minute.`, [[button('Queue', 'queue'), button('Key status', 'keys')], ...BACK]);
         else await this.panel(`${reason} Retry this task when it is fixed (for a busy or overloaded API, after a minute). ${this.store.data.queuePaused ? 'The queue is paused; /queue resumes it.' : 'The queue keeps running.'}`,

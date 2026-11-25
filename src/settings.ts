@@ -13,7 +13,9 @@ const EXTERNAL_LABELS: Record<string, string> = {
   'deepseek/deepseek-v4.1-flash-1017': 'DeepSeek V4.1 Flash',
 };
 const FALLBACK_ONLY_LABELS: Record<string, string> = {
-  'anthropic/claude-opus-latest': 'Claude Opus Latest',
+  'anthropic/claude-opus-5.5': 'Claude Opus 5.5',
+  'anthropic/claude-sonnet-5.5': 'Claude Sonnet 5.5',
+  'anthropic/claude-fable-5.2': 'Claude Fable 5.2',
   'google/gemma-4-31b-it:free': 'Gemma 4 31B IT Free',
 };
 export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
