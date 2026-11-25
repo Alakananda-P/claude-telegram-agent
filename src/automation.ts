@@ -16,6 +16,8 @@ export interface Task {
   status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted';
   createdAt: string; startedAt?: string; finishedAt?: string; scheduleId?: string; occurrence?: string;
   interactive?: boolean; settings?: AgentSettings; displayPrompt?: string;
+  /** W47-06: this task is the one automatic retry of a task that failed on a busy API. */
+  autoRetry?: boolean;
   voiceInput?: string; attachedFiles?: string[];
   steers?: SteerRecord[];
   deadlineAt?: string; handoffFrom?: string;
@@ -71,7 +73,12 @@ export class Automation {
     this.store.data.tasks!.push(task);
     return task;
   }
-  async enqueue(input: Omit<Task, 'id' | 'status' | 'createdAt'>): Promise<Task> { const task = this.insert(input); await this.store.save(); return task; }
+  async enqueue(input: Omit<Task, 'id' | 'status' | 'createdAt'>): Promise<Task> {
+    const before = this.store.data.tasks!.length, task = this.insert(input);
+    // A new task that was not saved must not stay in memory and run on the next tick.
+    try { await this.store.save(); } catch (error) { if (this.store.data.tasks!.length > before) this.store.data.tasks = this.store.data.tasks!.filter(t => t !== task); throw error; }
+    return task;
+  }
   async claim(): Promise<Task | undefined> {
     if (this.store.data.queuePaused || this.store.data.tasks!.some(t => t.status === 'running')) return;
     const task = this.store.data.tasks!.find(t => t.status === 'queued' && projectAcceptsWork(this.store.data, t.project));

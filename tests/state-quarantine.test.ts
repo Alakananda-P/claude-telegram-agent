@@ -82,3 +82,55 @@ test('M1: a corrupt chat archive makes /history answer with an error instead of 
   await bot.callback({ id: 'cb', from: { id: 123 }, message: { ...message(''), message_id: 7 }, data: 'history chat-x 0' });
   assert.ok(replies.filter(r => /still running/i.test(r)).length >= 2, replies.join(' | '));
 });
+
+test('M6: a failing purge does not pause new tasks; a real state save failure still does', async () => {
+  const { bot, store, replies, release } = await running(); release();
+  const internals = bot as unknown as { sessions: { purgeExpired(): Promise<number> }; persistenceFailed: boolean };
+  internals.sessions.purgeExpired = async () => { throw Object.assign(new Error('resource busy'), { code: 'EBUSY' }); };
+  bot.start(); await new Promise(r => setTimeout(r, 30));
+  assert.equal(internals.persistenceFailed, false);
+  await bot.handle(message('New task after a purge error')); await bot.idle();
+  assert.ok(!replies.some(r => /State storage failed/.test(r)), replies.join(' | '));
+  assert.equal(store.data.tasks!.at(-1)!.status, 'completed');
+  await bot.stop();
+  const { StateSaveError } = await import('../src/state.js');
+  const second = await running(); second.release();
+  (second.bot as unknown as { sessions: { purgeExpired(): Promise<number> } }).sessions.purgeExpired = async () => { throw new StateSaveError(new Error('ENOSPC')); };
+  second.bot.start(); await new Promise(r => setTimeout(r, 30));
+  assert.equal((second.bot as unknown as { persistenceFailed: boolean }).persistenceFailed, true);
+  await second.bot.stop();
+});
+
+test('M5: file delivery and title failures after the answer keep the task completed with no Retry', async () => {
+  const dataDir = await mkdtemp(path.join(tmpdir(), 'tg-m5-'));
+  const config = loadConfig({ TELEGRAM_BOT_TOKEN: '123456:abcdefghijklmnopqrstuvw', TELEGRAM_OWNER_ID: '123', ANTHROPIC_API_KEY: 'test-only', DATA_DIR: dataDir });
+  const store = await StateStore.open(path.join(dataDir, 'bot', 'state.json'));
+  const replies: string[] = []; const panels: string[] = [];
+  const { mkdir } = await import('node:fs/promises');
+  const runner: Runner = { async run(r, emit) { await emit({ type: 'session', id: 'm5-chat' }); await mkdir(path.join(r.cwd, 'output'), { recursive: true }); await writeFile(path.join(r.cwd, 'output', 'table.csv'), 'a,b'); return { session: 'm5-chat', text: 'Answer sent', cumulativeCost: 0 }; } };
+  const sender = { async send(_c: number, t: string) { replies.push(t); }, async temporary() { return 9; }, async edit() {}, async remove() {}, async typing() {},
+    async panel(_c: number, t: string) { panels.push(t); }, async acknowledge() {}, async sendFile() { throw new Error('Telegram refused the file'); }, async sendPhoto() { throw new Error('refused'); } };
+  const titles = { async generate() { throw new Error('title model down'); } };
+  const bot = new Controller(config, store, sender as never, runner, undefined, titles as never);
+  await bot.handle(message('Make a table')); await bot.idle();
+  const task = store.data.tasks!.at(-1)!;
+  assert.equal(task.status, 'completed'); assert.equal(task.failureKind, undefined);
+  assert.ok(replies.includes('Answer sent'));
+  assert.ok(replies.some(r => /automatic delivery failed/.test(r)), replies.join(' | '));
+  assert.ok(!replies.some(r => /could not finish/.test(r)) && !panels.some(p => /Retry/.test(p)));
+  assert.equal(store.data.lastJob?.status, 'completed');
+});
+
+test('M4: files stay pending when the instruction could not start a task', async () => {
+  const { bot, store, replies, release } = await running(); release();
+  const photo: Message = { ...message(''), photo: [{ file_id: 'bill-large', width: 1200, height: 900 }] } as Message;
+  await bot.handle(photo);
+  assert.equal(store.data.batches!.at(-1)!.status, 'collecting');
+  await bot.handle(message('x'.repeat(29990)));
+  assert.ok(replies.some(r => /too long/i.test(r)), replies.join(' | '));
+  assert.equal(store.data.tasks!.length, 0);
+  assert.equal(store.data.batches!.at(-1)!.status, 'collecting', 'the photo is still waiting for an instruction');
+  await bot.handle(message('Read this bill')); await bot.idle();
+  assert.equal(store.data.tasks!.length, 1); assert.match(store.data.tasks![0].prompt, /Read this bill[\s\S]*uploads\//);
+  assert.equal(store.data.batches!.at(-1)!.status, 'queued');
+});

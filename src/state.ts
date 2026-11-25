@@ -16,7 +16,7 @@ const isoDate = z.string().datetime();
 const messageContext = z.object({ beforeMessageId: z.number().int().positive().optional(), replyToMessageId: z.number().int().positive().optional() }).optional();
 const outage = z.object({ startedAt: isoDate, failures: z.number().int().positive(), reason: z.string().max(64) });
 const steerSchema = z.object({ messageContext, id: identifier, text: z.string().min(1).max(30000), displayText: z.string().max(30000), status: z.enum(['preparing', 'sent', 'answered', 'failed']), voiceInput: z.string().regex(/^uploads\/[a-zA-Z0-9._-]+$/).optional(), attachedFiles: z.array(z.string().regex(/^uploads\/[a-zA-Z0-9._-]+$/)).optional(), archived: z.boolean().optional() });
-const taskSchema = z.object({ deadlineAt: isoDate.optional(), handoffFrom: identifier.optional(), planMode: z.boolean().optional(), failureKind: z.enum(['safety_refusal', 'timeout', 'owner_cancelled', 'shutdown', 'worker_restart', 'api_failure', 'sdk_error', 'storage_failure', 'transcription_failed']).optional(), messageContext, id: identifier, project: projectId, chatKey: identifier, kind: z.enum(['agent', 'reminder', 'backup']), status: z.enum(['queued', 'running', 'completed', 'failed', 'cancelled', 'interrupted']), prompt: z.string().min(1).max(30000), createdAt: isoDate, settings: z.custom(validSettings).optional(), steers: z.array(steerSchema).optional(), voiceInput: z.string().regex(/^uploads\/[a-zA-Z0-9._-]+$/).optional(), attachedFiles: z.array(z.string().regex(/^uploads\/[a-zA-Z0-9._-]+$/)).optional() });
+const taskSchema = z.object({ autoRetry: z.boolean().optional(), deadlineAt: isoDate.optional(), handoffFrom: identifier.optional(), planMode: z.boolean().optional(), failureKind: z.enum(['safety_refusal', 'timeout', 'owner_cancelled', 'shutdown', 'worker_restart', 'api_failure', 'sdk_error', 'storage_failure', 'transcription_failed']).optional(), messageContext, id: identifier, project: projectId, chatKey: identifier, kind: z.enum(['agent', 'reminder', 'backup']), status: z.enum(['queued', 'running', 'completed', 'failed', 'cancelled', 'interrupted']), prompt: z.string().min(1).max(30000), createdAt: isoDate, settings: z.custom(validSettings).optional(), steers: z.array(steerSchema).optional(), voiceInput: z.string().regex(/^uploads\/[a-zA-Z0-9._-]+$/).optional(), attachedFiles: z.array(z.string().regex(/^uploads\/[a-zA-Z0-9._-]+$/)).optional() });
 const automationState = z.object({
   projects: z.array(projectRecordSchema).refine(records => new Set(records.map(p => p.id)).size === records.length).optional(),
   backgroundJobs: z.array(backgroundJobSchema).optional(),
@@ -96,6 +96,11 @@ function quarantineInvalidTasks(data: State): { kind: 'task' | 'steer'; taskId?:
   }
   (data as { tasks?: unknown[] }).tasks = tasks.filter(task => taskSchema.safeParse(task).success || (removed.push({ kind: 'task', record: task }), false));
   return removed;
+}
+
+/** M6: writing state.json failed. Only this kind of error pauses new tasks. */
+export class StateSaveError extends Error {
+  constructor(cause: unknown) { super('Bot state could not be saved.', { cause }); this.name = 'StateSaveError'; }
 }
 
 export class StateStore {
@@ -184,7 +189,7 @@ export class StateStore {
       const tmp = this.file + '.tmp';
       await writeFile(tmp, snapshot, { mode: 0o600 });
       await rename(tmp, this.file);
-    });
+    }).catch(error => { throw new StateSaveError(error); });
     this.saving = task.catch(() => {});
     return task;
   }

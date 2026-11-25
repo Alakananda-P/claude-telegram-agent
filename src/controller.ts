@@ -5,7 +5,8 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { configSecrets, type Config } from './config.js';
 import { AgentError, AgentApiError, AgentSafetyError, type Runner, type PlanDecision } from './agent.js';
-import { StateStore } from './state.js';
+import { BUSY_API_KINDS, PAUSE_API_KINDS } from './recovery.js';
+import { StateStore, StateSaveError } from './state.js';
 import { authorized, projectName, redact, privatePreview, safeFile, secretPath, detectTokens, maskTokens, PathAccessError, type Message, type Callback } from './safety.js';
 import { EFFORTS, effectiveSettings, settingsLabel, modelLabel, familyOf, familySettings, settingsFamily, type AgentSettings, type Effort } from './settings.js';
 import { ModelCatalog, type CatalogModel } from './models.js';
@@ -126,6 +127,19 @@ export class Controller {
   private projectPurgeRequests = new Map<string, { id: string; expires: number }>();
   /** File delivery and titles that run after an answer was sent (W47-02). */
   private postAnswer = new Set<Promise<void>>();
+  /** W47-06: queue the one automatic retry if a key is still usable (Claude Code OAuth always counts as usable). */
+  private scheduleAutoRetry(id: string): void {
+    const timer = setTimeout(() => {
+      this.autoRetryTimers.delete(id);
+      if (this.shuttingDown || this.persistenceFailed) return;
+      void (async () => {
+        let ready = false; try { ready = this.keys.available(true).length > 0; } catch { ready = false; }
+        if (!ready) { await this.say('The automatic retry was skipped because no Claude key is ready. Retry from /queue when it is fixed.'); return; }
+        const retried = await this.automation.retryTask(id); retried.autoRetry = true; await this.store.save(); this.kick();
+      })().catch(() => console.warn('Automatic retry could not be queued; the Retry button in /queue still works.'));
+    }, this.autoRetryDelayMs);
+    timer.unref?.(); this.autoRetryTimers.set(id, timer);
+  }
   private afterAnswer(work: () => Promise<void>): void {
     const job: Promise<void> = work().catch(error => {
       if (error instanceof TitleAccountingError) this.persistenceFailed = true;
@@ -138,6 +152,10 @@ export class Controller {
   updatePollMs = 15_000;
   /** Wait after the last album item before starting a captioned album (H-18). */
   albumDelayMs = 2500;
+  /** W47-06: wait before the one automatic retry of a task that failed on a busy API. */
+  autoRetryDelayMs = 60_000;
+  /** Pending automatic retries by failed task id; a manual Retry cancels the automatic one. */
+  private autoRetryTimers = new Map<string, NodeJS.Timeout>();
   private albumTimers = new Map<string, NodeJS.Timeout>();
   private pendingUpdate?: { token: string; live: Deploy; target: string; expires: number };
   private pendingRollback?: { token: string; expires: number };
@@ -337,7 +355,10 @@ export class Controller {
 
   async tick(now = new Date()): Promise<void> {
     if (this.ticking || this.shuttingDown) return;
-    void this.background.tick(+now).catch(() => { this.persistenceFailed = true; console.error('Background notification storage failed; new tasks paused.'); });
+    void this.background.tick(+now).catch(error => {
+      if (error instanceof StateSaveError) { this.persistenceFailed = true; console.error('Background notification storage failed; new tasks paused.'); }
+      else console.warn(`Background job check failed (${error instanceof Error ? error.name : 'unknown'}); retrying on the next tick.`);
+    });
     if (!this.cleaningUi && this.messenger.cleanup) {
       this.cleaningUi = this.messenger.cleanup(this.config.owner, +now).catch(() => { console.warn('Temporary UI cleanup deferred; conversation data is unchanged.'); }).finally(() => { this.cleaningUi = undefined; });
     }
@@ -347,7 +368,11 @@ export class Controller {
   }
   start(): void {
     if (this.timer) return;
-    const tick = () => void this.tick().catch(() => { this.persistenceFailed = true; console.error('Automation storage failed; queue stopped.'); });
+    // M6: only a failed state save pauses new tasks; any other tick error is logged and retried in 5 s.
+    const tick = () => void this.tick().catch(error => {
+      if (error instanceof StateSaveError) { this.persistenceFailed = true; console.error('Automation storage failed; queue stopped.'); }
+      else console.warn(`Automation tick failed (${error instanceof Error ? error.name : 'unknown'}); retrying on the next tick.`);
+    });
     this.timer = setInterval(tick, 5000); this.timer.unref(); tick();
   }
 
@@ -355,6 +380,7 @@ export class Controller {
     this.shuttingDown = true;
     clearInterval(this.timer);
     for (const timer of this.albumTimers.values()) clearTimeout(timer);
+    for (const timer of this.autoRetryTimers.values()) clearTimeout(timer);
     this.running?.abort.abort();
     await this.idle();
     await this.background.stop();
@@ -596,9 +622,10 @@ export class Controller {
     }
   }
 
-  private async launch(prompt: string, cwd: string, displayPrompt = prompt, voiceInput?: string, attachedFiles?: string[], messageContext?: TelegramMessageContext, planMode = false): Promise<void> {
+  /** Starts, steers or queues the instruction. Returns false when nothing was started (M4). */
+  private async launch(prompt: string, cwd: string, displayPrompt = prompt, voiceInput?: string, attachedFiles?: string[], messageContext?: TelegramMessageContext, planMode = false): Promise<boolean> {
     // H3: check the size before anything is saved; an oversized record would stop the next start.
-    if (!prompt.trim() || prompt.length > 30000 || displayPrompt.length > 30000) return this.say('This instruction is too long (limit 30,000 characters, including the list of attached files). Send a shorter message or fewer files. Nothing was queued.');
+    if (!prompt.trim() || prompt.length > 30000 || displayPrompt.length > 30000) { await this.say('This instruction is too long (limit 30,000 characters, including the list of attached files). Send a shorter message or fewer files. Nothing was queued.'); return false; }
     await this.dismiss('controls');
     // claim() persists before execute() opens its inbox. Wait only for that small
     // startup window so rapid consecutive messages join the very first task.
@@ -609,19 +636,22 @@ export class Controller {
       if (active.planWait && !voiceInput && !attachedFiles?.length) {
         // A text reply while a plan waits for approval is feedback on that plan.
         await this.chats.append(this.resolveChat(active.task.chatKey), { role: 'user', text: displayPrompt });
-        active.planWait.resolve({ approved: false, feedback: prompt }); return;
+        active.planWait.resolve({ approved: false, feedback: prompt }); return true;
       }
       const release = active.input.reserve()!;
       const record: SteerRecord = { messageContext, id: randomUUID(), text: prompt, displayText: displayPrompt, voiceInput, attachedFiles, status: 'preparing' };
       (active.task.steers ??= []).push(record); active.extendDeadline?.();
-      try { await this.store.save(); } catch (error) { release(); throw error; }
+      // A steer that was not saved must not stay in memory and run anyway.
+      try { await this.store.save(); } catch (error) { active.task.steers = active.task.steers.filter(r => r !== record); release(); throw error; }
       this.prepareSteer(active, record, release);
-      return;
+      return true;
     }
-    if (this.store.data.queuePaused) return this.say('Processing is paused. Resume from /queue, then send your instruction. Your message was not queued.');
+    if (this.store.data.queuePaused) { await this.say('Processing is paused. Resume from /queue, then send your instruction. Your message was not queued.'); return false; }
     await this.automation.enqueue({ kind: 'agent', messageContext, project: this.store.data.project, chatKey: this.chatKey(), prompt, displayPrompt, voiceInput, attachedFiles, settings: { ...this.settings }, interactive: true, ...(planMode ? { planMode: true } : {}) });
     this.kick();
-    if (otherChat) await this.say('Another chat is running. This message is queued for this chat and starts when that task finishes. See /queue.');
+    // The task is queued now; a failed notice must not hand the files back (M4).
+    if (otherChat) await this.say('Another chat is running. This message is queued for this chat and starts when that task finishes. See /queue.').catch(() => {});
+    return true;
   }
 
   /** Opens a fresh draft chat seeded with a summary of the selected chat's completed work (used by /fresh and after a safety stop). */
@@ -843,6 +873,7 @@ export class Controller {
     let progress = task.voiceInput ? 'Transcribing voice…' : 'Thinking…';
     let timedOut = false;
     let pendingHelpers = 0;
+    let usedTools = false; let autoRetry = false;
     const expire = () => setTimeout(() => { timedOut = true; abort.abort(); }, Math.max(1, Date.parse(task.deadlineAt!) - Date.now()));
     let timeout = expire();
     active.extendDeadline = () => {
@@ -943,8 +974,12 @@ export class Controller {
           const text = redact(event.text, configSecrets(this.config)).trim();
           const key = event.id + ':' + text;
           if (text && !published.has(key)) {
-            published.add(key); lastPublished = text; await this.chats.append(archiveKey, { role: 'assistant', text });
-            await this.say(text.length > 12000 ? text.slice(0, 12000) + '\n\nFull text is saved in this chat history.' : text, true);
+            published.add(key); await this.chats.append(archiveKey, { role: 'assistant', text });
+            // N-a: a scheduled run only sends its final answer; its commentary stays in the saved chat.
+            if (task.interactive) {
+              lastPublished = text;
+              await this.say(text.length > 12000 ? text.slice(0, 12000) + '\n\nFull text is saved in this chat history.' : text, true);
+            }
           }
         } else if (event.type === 'steered') {
           for (const record of task.steers ?? []) if (active.input.messages.some(m => m.id === record.id && m.answered)) record.status = 'answered';
@@ -955,6 +990,7 @@ export class Controller {
             else await this.ledger?.recordStep(event.session, event.id, event.model, event.usage, event.complete);
           } catch { this.persistenceFailed = true; abort.abort(); throw new AgentError('Usage storage failed. Work stopped to protect your records.'); }
         } else if (event.type === 'speed') this.store.data.lastSpeed = event.state;
+        else if (event.type === 'effect') usedTools = true;
         else if (event.type === 'progress') progress = redact(event.text, configSecrets(this.config));
         else if (event.type === 'helpers') pendingHelpers = event.count;
         else if (event.type === 'held_open') { const { type: _type, ...why } = event; console.warn(JSON.stringify({ event: 'turn_held_open', task: task.id, ...why })); }
@@ -993,7 +1029,13 @@ export class Controller {
         : error instanceof AgentSafetyError ? 'safety_refusal' : error instanceof AgentApiError ? 'api_failure'
         : error instanceof TranscriptionError ? 'transcription_failed' : 'sdk_error';
       if (error instanceof AgentSafetyError) { task.failureKind = 'safety_refusal'; console.warn(JSON.stringify({ event: 'claude_safety_stop', task: task.id, session: archiveKey, model: task.settings?.model ?? this.config.model, category: error.category ?? 'unreported', time: new Date().toISOString() })); }
-      if (error instanceof AgentApiError) { (this.store.data.health ??= {}).apiError = error.kind; console.warn(`Claude task API failure: ${error.kind}.`); await this.automation.setPaused(true); }
+      if (error instanceof AgentApiError) {
+        (this.store.data.health ??= {}).apiError = error.kind; console.warn(`Claude task API failure: ${error.kind}.`);
+        // M2: only key or account problems stop the queue; a busy API does not.
+        if (PAUSE_API_KINDS.includes(error.kind)) await this.automation.setPaused(true);
+        // W47-06: a busy API before any tool ran gets one automatic retry.
+        autoRetry = BUSY_API_KINDS.includes(error.kind) && !usedTools && !task.autoRetry && !abort.signal.aborted && !this.shuttingDown;
+      }
       status = abort.signal.aborted ? 'cancelled' : 'failed';
       await finishIndicator();
       console.warn(JSON.stringify({ event: 'task_ended', task: task.id, reason: task.failureKind, elapsedMs: Date.now() - Date.parse(task.startedAt!), pendingHelpers }));
@@ -1004,7 +1046,9 @@ export class Controller {
       await this.say(notice + (pendingHelpers ? '\nPending SDK helpers stopped with this task; their completion is unconfirmed. No work was replayed.' : ''));
       if (error instanceof AgentApiError) {
         // W47-05/06: the reason is in the notice above; offer the retry right here.
-        await this.panel(`Claude API problem: ${error.kind.replace(/_/g, ' ')}. Retry this task when it is fixed (for a busy or overloaded API, after a minute). The queue is paused; /queue resumes it.`,
+        const reason = `Claude API problem: ${error.kind.replace(/_/g, ' ')}.`;
+        if (autoRetry) await this.panel(`${reason} Nothing was changed, so I will retry this task once automatically in about a minute.`, [[button('Queue', 'queue'), button('Key status', 'keys')], ...BACK]);
+        else await this.panel(`${reason} Retry this task when it is fixed (for a busy or overloaded API, after a minute). ${this.store.data.queuePaused ? 'The queue is paused; /queue resumes it.' : 'The queue keeps running.'}`,
           [[button('Retry task', 'taskretry ' + task.id)], [button('Queue', 'queue'), button('Key status', 'keys')], ...BACK]);
       }
       if (error instanceof AgentSafetyError) {
@@ -1024,7 +1068,7 @@ export class Controller {
       await finishIndicator();
       this.store.data.lastJob = { ...job, status, endReason: task.failureKind, finishedAt: new Date().toISOString() };
       this.store.data.active = null;
-      try { await this.automation.finish(task.id, this.shuttingDown && status === 'cancelled' ? 'interrupted' : status); }
+      try { await this.automation.finish(task.id, this.shuttingDown && status === 'cancelled' ? 'interrupted' : status); if (autoRetry) this.scheduleAutoRetry(task.id); }
       catch { this.persistenceFailed = true; console.error('Job state persistence failed; new jobs disabled.'); }
       await this.dismiss('task-' + task.id);
     }
@@ -1166,8 +1210,16 @@ export class Controller {
     // H-18: captions sent with the files stay part of the task when the instruction comes later.
     const captions = batches.map(b => b.prompt).filter(Boolean).join('\n');
     const prompt = (instruction && captions && !voiceInput && instruction !== captions ? captions + '\n' + instruction : instruction) ?? (captions || 'Inspect these files. For bill photos, extract only clear values, check arithmetic, and ask about unclear fields with relevant crops. If the desired output is unclear, ask the owner.');
+    // M4: claim the batches now (an album timer must not pick them up twice) and give them
+    // back if the instruction did not start, steer or queue a task.
     for (const batch of batches) batch.status = 'queued';
-    await this.launch(prompt + '\n\nAttached project files:\n' + files.map(f => f.path).join('\n'), await this.workspace(batches[0].project), maskTokens(prompt) + `\n[${files.length} attached files]`, voiceInput, voiceInput ? files.filter(f => f.path !== voiceInput).map(f => f.path) : undefined, messageContext);
+    let started = false;
+    try {
+      started = await this.launch(prompt + '\n\nAttached project files:\n' + files.map(f => f.path).join('\n'), await this.workspace(batches[0].project), maskTokens(prompt) + `\n[${files.length} attached files]`, voiceInput, voiceInput ? files.filter(f => f.path !== voiceInput).map(f => f.path) : undefined, messageContext);
+    } finally {
+      if (!started) { for (const batch of batches) batch.status = 'collecting'; await this.store.save().catch(() => {}); }
+    }
+    if (!started) return;
     for (const batch of batches) await this.dismiss('batch-' + batch.id);
     await this.uploadReceipt();
     await this.dismiss('controls');
@@ -1272,7 +1324,10 @@ export class Controller {
         ...recent.filter(t => ['failed', 'interrupted', 'cancelled'].includes(t.status)).map(t => [button('Retry ' + t.id, 'taskretry ' + t.id)]), ...BACK]);
     } else if (command === 'taskcancel' || command === 'taskfirst') { if (command === 'taskcancel') await this.automation.cancelTask(argument); else await this.automation.prioritize(argument); await this.extraCommand('queue', ''); }
     else if (command === 'taskretry') { await this.panel('Retry this task? It may have already changed files or external systems. Review the previous output first; retry starts the task again.', [[button('Retry task', 'taskconfirm ' + argument)], ...BACK]); }
-    else if (command === 'taskconfirm') { await this.automation.retryTask(argument); this.kick(); await this.extraCommand('queue', ''); }
+    else if (command === 'taskconfirm') {
+      // A manual Retry replaces a pending automatic one, so the task runs once.
+      const pending = this.autoRetryTimers.get(argument); if (pending) { clearTimeout(pending); this.autoRetryTimers.delete(argument); }
+      await this.automation.retryTask(argument); this.kick(); await this.extraCommand('queue', ''); }
     else if (command === 'schedules') {
       await this.panel(`Schedules · ${d.schedules!.length}\nIndia time by default. Ask Claude to create/edit reminders or recurring jobs.\n\n${d.schedules!.slice(0, 12).map(s => `${s.enabled ? 'ON' : 'PAUSED'} · ${s.name}\nNext: ${new Date(s.nextRun).toLocaleString('en-GB', { timeZone: s.timezone })} (${s.timezone})\nLast: ${s.lastStatus ?? 'not run'}`).join('\n\n') || 'No schedules yet.'}`, [
         ...d.schedules!.slice(0, 12).map(s => [button((s.enabled ? 'Pause ' : 'Resume ') + privatePreview(s.name, configSecrets(this.config), 22), 'schedule' + (s.enabled ? 'pause ' : 'resume ') + s.id), button('Delete', 'scheduledelete ' + s.id)]), [button('Clock', 'clock')], ...BACK]);

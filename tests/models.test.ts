@@ -87,3 +87,16 @@ test('a family whose newest model changes is announced to the owner once', async
   await bot.announceModelChanges(); assert.equal(sent.length, 2, 'an unchanged family says nothing');
   assert.equal((await StateStore.open(s.file)).data.modelNotices?.fable, 'claude-fable-6');
 });
+
+test('O-c: with OAuth only (no API key) the model list falls back quietly, without a network call or warnings', async (t) => {
+  const { fetchModels, NoModelKeyError, ModelCatalog } = await import('../src/models.js');
+  let fetched = 0;
+  await assert.rejects(fetchModels('', (async () => { fetched++; throw new Error('should not fetch'); }) as never), (e: unknown) => e instanceof NoModelKeyError);
+  assert.equal(fetched, 0);
+  const { StateStore } = await import('../src/state.js'); const { mkdtemp } = await import('node:fs/promises'); const { tmpdir } = await import('node:os'); const path = await import('node:path');
+  const store = await StateStore.open(path.join(await mkdtemp(path.join(tmpdir(), 'tg-oauth-models-')), 'state.json'));
+  const warn = t.mock.method(console, 'warn', () => {});
+  const catalog = new ModelCatalog(store, undefined, () => fetchModels(''));
+  assert.equal(await catalog.refresh(), false); assert.equal(warn.mock.callCount(), 0);
+  assert.ok(catalog.current().get('opus'), 'built-in list still works');
+});

@@ -54,8 +54,12 @@ export function newestByFamily(models: CatalogModel[], families: string[]): Map<
 
 export type FetchLike = (url: string, init: { headers: Record<string, string>; signal: AbortSignal }) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
 
+/** O-c: Claude Code OAuth has no API key for the Models API; the built-in list is used without a call. */
+export class NoModelKeyError extends Error { constructor() { super('No API key for the Models API (OAuth login).'); this.name = 'NoModelKeyError'; } }
+
 /** GET /v1/models with pagination (at most 5 pages). Throws on any HTTP or shape error; never includes the key in errors. */
 export async function fetchModels(apiKey: string, fetchImpl: FetchLike = fetch as unknown as FetchLike, baseUrl = 'https://api.anthropic.com'): Promise<CatalogModel[]> {
+  if (!apiKey) throw new NoModelKeyError();
   const models: CatalogModel[] = []; let after: string | undefined;
   for (let page = 0; page < 5; page++) {
     const url = `${baseUrl}/v1/models?limit=100${after ? '&after_id=' + encodeURIComponent(after) : ''}`;
@@ -90,7 +94,7 @@ export class ModelCatalog {
   async refresh(now = new Date()): Promise<boolean> {
     let models: CatalogModel[];
     try { models = await this.load(); }
-    catch { console.warn('Model list refresh failed; keeping the last known list.'); return false; }
+    catch (error) { if (!(error instanceof NoModelKeyError)) console.warn('Model list refresh failed; keeping the last known list.'); return false; }
     this.store.data.modelCatalog = { fetchedAt: now.toISOString(), models: models.slice(0, 500) };
     await this.store.save(); return true;
   }

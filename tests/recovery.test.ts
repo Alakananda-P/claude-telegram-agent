@@ -88,3 +88,26 @@ test('safety refusals never rotate keys or replay the task automatically', async
   await assert.rejects(runner.run({prompt:'Current task',cwd:'.'},()=>{},new AbortController()),/safety system/);
   assert.equal(calls,1);assert.deepEqual(store.data.disabledKeyIds,[]);
 });
+
+test('M2: a busy API moves to the next key, and the last key gets one retry', async () => {
+  const calls: string[] = []; let backupFailures = 0;
+  const { runner } = await setup(key => ({ async run() {
+    calls.push(key);
+    if (key === 'sk-ant-primary' || backupFailures++ < 1) throw new AgentApiError('overloaded', 'Overloaded');
+    return { text: 'ok', session: 's-' + calls.length, cumulativeCost: 0 };
+  } }));
+  const result = await runner.run({ prompt: 'Hi', cwd: '.' }, () => {}, new AbortController());
+  assert.equal(result.text, 'ok'); assert.deepEqual(calls, ['sk-ant-primary', 'sk-ant-backup', 'sk-ant-backup']);
+});
+test('M2: with one key a busy API reports the real reason, not "all keys failed"', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'tg-recovery-one-'));
+  const store = await StateStore.open(path.join(dir, 'state.json'));
+  const config = loadConfig({ TELEGRAM_BOT_TOKEN: '123456:abcdefghijklmnopqrstuvw', TELEGRAM_OWNER_ID: '123', ANTHROPIC_API_KEY: 'sk-ant-only', DATA_DIR: dir });
+  let calls = 0; let busy = true;
+  const runner = new ResilientRunner(config, store, () => ({ async run() { calls++; if (busy) throw new AgentApiError('server_error', 'Server error'); return { text: 'ok', session: 's', cumulativeCost: 0 }; } }), 1);
+  await assert.rejects(runner.run({ prompt: 'Hi', cwd: '.' }, () => {}, new AbortController()), (e: unknown) => e instanceof AgentApiError && e.kind === 'server_error' && !/All eligible/.test(e.message));
+  assert.equal(calls, 2, 'one retry on the same key');
+  busy = false; calls = 0;
+  assert.equal((await runner.run({ prompt: 'Hi', cwd: '.' }, () => {}, new AbortController())).text, 'ok', 'a busy key in short cooldown is still tried');
+  assert.equal(calls, 1);
+});

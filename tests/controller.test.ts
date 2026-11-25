@@ -939,3 +939,59 @@ test('safety refusal is recorded distinctly without pausing unrelated future req
   assert.match(replies.join('\n'),/safety system stopped/);
   const reopened=await StateStore.open(store.file);assert.equal(reopened.data.tasks![0].failureKind,'safety_refusal');
 });
+
+test('M2 + W47-06: a busy API does not pause the queue and the task is retried once automatically', async () => {
+  let runs = 0;
+  const { bot, panels, store } = await setup({ async run(_r, emit) { runs++; await emit({ type: 'session', id: 'busy-' + runs }); if (runs === 1) throw new AgentApiError('overloaded', 'Claude API is overloaded.'); return { text: 'Done after retry', session: 'busy-' + runs, cumulativeCost: 0 }; } });
+  bot.autoRetryDelayMs = 0;
+  await bot.handle(message('make the sheet')); await bot.idle();
+  for (let i = 0; i < 200 && store.data.tasks![1]?.status !== 'completed'; i++) { await new Promise(r => setTimeout(r, 5)); await bot.idle(); }
+  await bot.idle();
+  assert.equal(store.data.queuePaused ?? false, false);
+  assert.equal(runs, 2); assert.equal(store.data.tasks!.length, 2);
+  assert.equal(store.data.tasks![1].status, 'completed'); assert.equal(store.data.tasks![1].autoRetry, true);
+  assert.match(panels.find(p => /overloaded/.test(p.text))!.text, /automatically/);
+});
+test('M2: a second busy failure is not retried again, and a task that already used tools is never auto-retried', async () => {
+  let runs = 0;
+  const { bot, panels, store } = await setup({ async run(r, emit) { runs++; await emit({ type: 'session', id: 'busy-' + runs }); if (/tools/.test(r.prompt)) await emit({ type: 'effect', tool: 'Bash' }); throw new AgentApiError('overloaded', 'Claude API is overloaded.'); } });
+  bot.autoRetryDelayMs = 0;
+  await bot.handle(message('make the sheet')); await bot.idle();
+  for (let i = 0; i < 50; i++) { await new Promise(r => setTimeout(r, 5)); await bot.idle(); }
+  assert.equal(runs, 2, 'only one automatic retry'); assert.equal(store.data.queuePaused ?? false, false);
+  assert.ok(panels.at(-1)!.buttons.flat().some(b => b.callback_data === 'taskretry ' + store.data.tasks![1].id));
+  await bot.handle(message('run the tools')); await bot.idle();
+  for (let i = 0; i < 50; i++) { await new Promise(r => setTimeout(r, 5)); await bot.idle(); }
+  assert.equal(runs, 3, 'no automatic replay after tools ran');
+});
+test('M2: a manual Retry during the wait replaces the automatic retry, so the task runs once more only', async () => {
+  let runs = 0;
+  const { bot, store } = await setup({ async run(_r, emit) { runs++; await emit({ type: 'session', id: 'busy-' + runs }); if (runs === 1) throw new AgentApiError('overloaded', 'Claude API is overloaded.'); return { text: 'done', session: 'busy-' + runs, cumulativeCost: 0 }; } });
+  bot.autoRetryDelayMs = 40;
+  await bot.handle(message('make the sheet')); await bot.idle();
+  const failed = store.data.tasks![0]; assert.equal(failed.status, 'failed');
+  await bot.handle(message('/taskconfirm ' + failed.id)); await bot.idle();
+  for (let i = 0; i < 40; i++) { await new Promise(r => setTimeout(r, 5)); await bot.idle(); }
+  assert.equal(runs, 2, 'one manual retry, no extra automatic copy'); assert.equal(store.data.tasks!.length, 2);
+});
+test('M2: billing failures still pause the queue', async () => {
+  const { bot, store } = await setup({ async run(_r, emit) { await emit({ type: 'session', id: 'bill' }); throw new AgentApiError('billing_error', 'Billing'); } });
+  bot.autoRetryDelayMs = 0;
+  await bot.handle(message('make the sheet')); await bot.idle();
+  assert.equal(store.data.queuePaused, true); assert.equal(store.data.tasks!.length, 1);
+});
+
+test('N-a: a scheduled run keeps its in-between commentary out of Telegram and sends only the final answer', async () => {
+  const { bot, replies, store } = await setup({ async run(_r, emit) {
+    await emit({ type: 'session', id: 'sched-chat' }); await emit({ type: 'commentary', id: 'c1', text: '2d done, starting 2e' });
+    await emit({ type: 'commentary', id: 'c2', text: 'Mutation check passed' }); return { text: 'Bot fix: 2e done', session: 'sched-chat', cumulativeCost: 0 };
+  } });
+  const automation = (bot as unknown as { automation: { enqueue(t: object): Promise<unknown> } }).automation;
+  await automation.enqueue({ kind: 'agent', project: 'default', chatKey: 'schedule-abc', prompt: 'Scheduled work', interactive: false });
+  await bot.tick(); await bot.idle();
+  assert.equal(store.data.tasks!.at(-1)!.status, 'completed');
+  assert.ok(replies.includes('Bot fix: 2e done'), replies.join(' | '));
+  assert.ok(!replies.some(r => /2d done|Mutation check/.test(r)), replies.join(' | '));
+  const archive = await new ChatArchive(path.join((bot as unknown as { config: { dataDir: string } }).config.dataDir, 'bot/chats'), []).read('sched-chat');
+  assert.ok(archive.some(t => t.text === 'Mutation check passed'), 'commentary stays in the saved chat');
+});

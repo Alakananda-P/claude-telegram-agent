@@ -82,7 +82,8 @@ export class KeyPool {
     if (!record || (!this.credentials.some(c => c.id === id) && record.status !== 'retired')) throw new Error('Unknown configured key.');
     return record;
   }
-  available() {
+  /** Usable credentials, preferred first. includeCooling also returns keys in a short busy-API cooldown (M2). */
+  available(includeCooling = false) {
     if (!this.credentials.length) return [];
     const preferred = this.credentials.some(c => c.id === this.store.data.activeKeyId) ? this.store.data.activeKeyId! : this.credentials[0].id;
     const current = this.record(preferred);
@@ -90,7 +91,7 @@ export class KeyPool {
     return this.credentials.filter(c => !this.store.data.disabledKeyIds!.includes(c.id)
       && !['blocked', 'rejected', 'no_credit'].includes(this.record(c.id).status)
       && !(this.record(c.id).lastError && restricted.includes(this.record(c.id).lastError!))
-      && !(this.record(c.id).status === 'cooldown' && Date.parse(this.record(c.id).nextCheckAt) > this.now()))
+      && !(!includeCooling && this.record(c.id).status === 'cooldown' && Date.parse(this.record(c.id).nextCheckAt) > this.now()))
       .sort((a, b) => Number(b.id === preferred) - Number(a.id === preferred));
   }
   selectedConfig(): Config | undefined {

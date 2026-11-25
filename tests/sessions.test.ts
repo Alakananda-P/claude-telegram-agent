@@ -207,3 +207,19 @@ test('an unreadable file gives the clear permission message instead of a generic
   const other = await toolResult(async () => { throw new Error('boom /private/path'); });
   assert.equal(other.content[0].text, 'Saved data could not be accessed. No raw service details are exposed.');
 });
+
+test('M6: one chat that cannot be purged is skipped and retried later; the others still purge', async () => {
+  const { catalog, store, archive } = await setup();
+  store.data.conversations!.push({ id: 'second-id', project: 'bills', updatedAt: '2026-10-30' });
+  const now = new Date('2026-10-31T12:00:00Z');
+  await catalog.trash('old-id', now); await catalog.trash('second-id', now);
+  const original = archive.purge.bind(archive); let busy = true;
+  archive.purge = async (id, root) => { if (id === 'old-id' && busy) throw Object.assign(new Error('resource busy'), { code: 'EBUSY' }); return original(id, root); };
+  const later = new Date('2026-11-02T12:00:00Z');
+  assert.equal(await catalog.purgeExpired(later), 1);
+  assert.ok(!store.data.conversations!.some(c => c.id === 'second-id'));
+  assert.equal(await catalog.purgeExpired(new Date(+later + 60_000)), 0, 'waits before retrying the busy chat');
+  busy = false;
+  assert.equal(await catalog.purgeExpired(new Date(+later + 11 * 60_000)), 1);
+  assert.ok(!store.data.conversations!.some(c => c.id === 'old-id'));
+});
