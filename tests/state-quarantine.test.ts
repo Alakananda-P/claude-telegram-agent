@@ -100,3 +100,23 @@ test('M6: a failing purge does not pause new tasks; a real state save failure st
   assert.equal((second.bot as unknown as { persistenceFailed: boolean }).persistenceFailed, true);
   await second.bot.stop();
 });
+
+test('M5: file delivery and title failures after the answer keep the task completed with no Retry', async () => {
+  const dataDir = await mkdtemp(path.join(tmpdir(), 'tg-m5-'));
+  const config = loadConfig({ TELEGRAM_BOT_TOKEN: '123456:abcdefghijklmnopqrstuvw', TELEGRAM_OWNER_ID: '123', ANTHROPIC_API_KEY: 'test-only', DATA_DIR: dataDir });
+  const store = await StateStore.open(path.join(dataDir, 'bot', 'state.json'));
+  const replies: string[] = []; const panels: string[] = [];
+  const { mkdir } = await import('node:fs/promises');
+  const runner: Runner = { async run(r, emit) { await emit({ type: 'session', id: 'm5-chat' }); await mkdir(path.join(r.cwd, 'output'), { recursive: true }); await writeFile(path.join(r.cwd, 'output', 'table.csv'), 'a,b'); return { session: 'm5-chat', text: 'Answer sent', cumulativeCost: 0 }; } };
+  const sender = { async send(_c: number, t: string) { replies.push(t); }, async temporary() { return 9; }, async edit() {}, async remove() {}, async typing() {},
+    async panel(_c: number, t: string) { panels.push(t); }, async acknowledge() {}, async sendFile() { throw new Error('Telegram refused the file'); }, async sendPhoto() { throw new Error('refused'); } };
+  const titles = { async generate() { throw new Error('title model down'); } };
+  const bot = new Controller(config, store, sender as never, runner, undefined, titles as never);
+  await bot.handle(message('Make a table')); await bot.idle();
+  const task = store.data.tasks!.at(-1)!;
+  assert.equal(task.status, 'completed'); assert.equal(task.failureKind, undefined);
+  assert.ok(replies.includes('Answer sent'));
+  assert.ok(replies.some(r => /automatic delivery failed/.test(r)), replies.join(' | '));
+  assert.ok(!replies.some(r => /could not finish/.test(r)) && !panels.some(p => /Retry/.test(p)));
+  assert.equal(store.data.lastJob?.status, 'completed');
+});
