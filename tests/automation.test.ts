@@ -68,3 +68,11 @@ test('corrupt persisted queue records are quarantined instead of executing malfo
   await writeFile(store.file, JSON.stringify({ ...store.data, schedules: [{ id: 'bad' }] }));
   await assert.rejects(StateStore.open(store.file), /invalid automation/);
 });
+test('a task whose save failed is not left in memory to run later', async () => {
+  const { store, engine } = await setup();
+  const save = store.save.bind(store); let fail = true;
+  store.save = async () => { if (fail) { fail = false; throw new Error('disk full'); } return save(); };
+  await assert.rejects(engine.enqueue({ kind: 'agent', project: 'default', chatKey: 'draft-a', prompt: 'unsaved' }));
+  assert.equal(store.data.tasks!.length, 0);
+  assert.equal(await engine.claim(), undefined);
+});

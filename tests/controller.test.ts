@@ -964,6 +964,16 @@ test('M2: a second busy failure is not retried again, and a task that already us
   for (let i = 0; i < 50; i++) { await new Promise(r => setTimeout(r, 5)); await bot.idle(); }
   assert.equal(runs, 3, 'no automatic replay after tools ran');
 });
+test('M2: a manual Retry during the wait replaces the automatic retry, so the task runs once more only', async () => {
+  let runs = 0;
+  const { bot, store } = await setup({ async run(_r, emit) { runs++; await emit({ type: 'session', id: 'busy-' + runs }); if (runs === 1) throw new AgentApiError('overloaded', 'Claude API is overloaded.'); return { text: 'done', session: 'busy-' + runs, cumulativeCost: 0 }; } });
+  bot.autoRetryDelayMs = 40;
+  await bot.handle(message('make the sheet')); await bot.idle();
+  const failed = store.data.tasks![0]; assert.equal(failed.status, 'failed');
+  await bot.handle(message('/taskconfirm ' + failed.id)); await bot.idle();
+  for (let i = 0; i < 40; i++) { await new Promise(r => setTimeout(r, 5)); await bot.idle(); }
+  assert.equal(runs, 2, 'one manual retry, no extra automatic copy'); assert.equal(store.data.tasks!.length, 2);
+});
 test('M2: billing failures still pause the queue', async () => {
   const { bot, store } = await setup({ async run(_r, emit) { await emit({ type: 'session', id: 'bill' }); throw new AgentApiError('billing_error', 'Billing'); } });
   bot.autoRetryDelayMs = 0;

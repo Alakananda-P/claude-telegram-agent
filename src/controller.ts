@@ -130,7 +130,7 @@ export class Controller {
   /** W47-06: queue the one automatic retry if a key is still usable (Claude Code OAuth always counts as usable). */
   private scheduleAutoRetry(id: string): void {
     const timer = setTimeout(() => {
-      this.autoRetryTimers.delete(timer);
+      this.autoRetryTimers.delete(id);
       if (this.shuttingDown || this.persistenceFailed) return;
       void (async () => {
         let ready = false; try { ready = this.keys.available(true).length > 0; } catch { ready = false; }
@@ -138,7 +138,7 @@ export class Controller {
         const retried = await this.automation.retryTask(id); retried.autoRetry = true; await this.store.save(); this.kick();
       })().catch(() => console.warn('Automatic retry could not be queued; the Retry button in /queue still works.'));
     }, this.autoRetryDelayMs);
-    timer.unref?.(); this.autoRetryTimers.add(timer);
+    timer.unref?.(); this.autoRetryTimers.set(id, timer);
   }
   private afterAnswer(work: () => Promise<void>): void {
     const job: Promise<void> = work().catch(error => {
@@ -154,7 +154,8 @@ export class Controller {
   albumDelayMs = 2500;
   /** W47-06: wait before the one automatic retry of a task that failed on a busy API. */
   autoRetryDelayMs = 60_000;
-  private autoRetryTimers = new Set<NodeJS.Timeout>();
+  /** Pending automatic retries by failed task id; a manual Retry cancels the automatic one. */
+  private autoRetryTimers = new Map<string, NodeJS.Timeout>();
   private albumTimers = new Map<string, NodeJS.Timeout>();
   private pendingUpdate?: { token: string; live: Deploy; target: string; expires: number };
   private pendingRollback?: { token: string; expires: number };
@@ -379,7 +380,7 @@ export class Controller {
     this.shuttingDown = true;
     clearInterval(this.timer);
     for (const timer of this.albumTimers.values()) clearTimeout(timer);
-    for (const timer of this.autoRetryTimers) clearTimeout(timer);
+    for (const timer of this.autoRetryTimers.values()) clearTimeout(timer);
     this.running?.abort.abort();
     await this.idle();
     await this.background.stop();
@@ -640,7 +641,8 @@ export class Controller {
       const release = active.input.reserve()!;
       const record: SteerRecord = { messageContext, id: randomUUID(), text: prompt, displayText: displayPrompt, voiceInput, attachedFiles, status: 'preparing' };
       (active.task.steers ??= []).push(record); active.extendDeadline?.();
-      try { await this.store.save(); } catch (error) { release(); throw error; }
+      // A steer that was not saved must not stay in memory and run anyway.
+      try { await this.store.save(); } catch (error) { active.task.steers = active.task.steers.filter(r => r !== record); release(); throw error; }
       this.prepareSteer(active, record, release);
       return true;
     }
@@ -1322,7 +1324,10 @@ export class Controller {
         ...recent.filter(t => ['failed', 'interrupted', 'cancelled'].includes(t.status)).map(t => [button('Retry ' + t.id, 'taskretry ' + t.id)]), ...BACK]);
     } else if (command === 'taskcancel' || command === 'taskfirst') { if (command === 'taskcancel') await this.automation.cancelTask(argument); else await this.automation.prioritize(argument); await this.extraCommand('queue', ''); }
     else if (command === 'taskretry') { await this.panel('Retry this task? It may have already changed files or external systems. Review the previous output first; retry starts the task again.', [[button('Retry task', 'taskconfirm ' + argument)], ...BACK]); }
-    else if (command === 'taskconfirm') { await this.automation.retryTask(argument); this.kick(); await this.extraCommand('queue', ''); }
+    else if (command === 'taskconfirm') {
+      // A manual Retry replaces a pending automatic one, so the task runs once.
+      const pending = this.autoRetryTimers.get(argument); if (pending) { clearTimeout(pending); this.autoRetryTimers.delete(argument); }
+      await this.automation.retryTask(argument); this.kick(); await this.extraCommand('queue', ''); }
     else if (command === 'schedules') {
       await this.panel(`Schedules · ${d.schedules!.length}\nIndia time by default. Ask Claude to create/edit reminders or recurring jobs.\n\n${d.schedules!.slice(0, 12).map(s => `${s.enabled ? 'ON' : 'PAUSED'} · ${s.name}\nNext: ${new Date(s.nextRun).toLocaleString('en-GB', { timeZone: s.timezone })} (${s.timezone})\nLast: ${s.lastStatus ?? 'not run'}`).join('\n\n') || 'No schedules yet.'}`, [
         ...d.schedules!.slice(0, 12).map(s => [button((s.enabled ? 'Pause ' : 'Resume ') + privatePreview(s.name, configSecrets(this.config), 22), 'schedule' + (s.enabled ? 'pause ' : 'resume ') + s.id), button('Delete', 'scheduledelete ' + s.id)]), [button('Clock', 'clock')], ...BACK]);
