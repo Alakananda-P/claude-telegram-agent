@@ -25,7 +25,7 @@ import { SteeringInput } from './steering.js';
 import { artifactSnapshot, changedArtifactReport, privateDocument } from './artifacts.js';
 import { Backups } from './backup.js';
 import { KeyPool } from './key-pool.js';
-import { PROVIDER_MODELS, providerModel } from './providers.js';
+import { configuredProviderModels, providerModel } from './providers.js';
 import { Transcriber, TranscriptionError, type TranscriptionService } from './transcription.js';
 import { completedWorkSummary } from './continuation.js';
 import { BackgroundJobs } from './background.js';
@@ -215,7 +215,7 @@ export class Controller {
 
   /** Tells the owner once when the newest model of the chosen family changes, e.g. Fable 5.1 -> Fable 5.2. */
   async announceModelChanges(): Promise<void> {
-    const s = this.settings; const family = settingsFamily(s);
+    const s = this.settings; const family = settingsFamily(s); if (!family) return;
     const newest = this.models.current().get(family)?.id; if (!newest) return;
     const seen = this.store.data.modelNotices ??= {};
     const previous = Object.hasOwn(seen, family) ? seen[family] : familyOf(s.model) === family ? s.model : undefined;
@@ -231,7 +231,8 @@ export class Controller {
     const external = providerModel(s.model);
     if (external) return { ...s, fast: !!(s.fast && external.fast) };
     const { family: _family, ...rest } = s;
-    const model = this.models.current().get(settingsFamily(s)); const id = model?.id ?? s.model;
+    const family = settingsFamily(s);
+    const model = family ? this.models.current().get(family) : undefined; const id = model?.id ?? s.model;
     const efforts = this.effortsFor(model);
     const effort = efforts.includes(s.effort) ? s.effort : [...efforts].reverse().find(e => EFFORTS.indexOf(e) < EFFORTS.indexOf(s.effort)) ?? efforts[0];
     return effectiveSettings({ ...rest, model: id, effort }, m => !!this.prices.fastPrice(m));
@@ -420,13 +421,15 @@ export class Controller {
     const s = this.settings;
     if (command === 'model') {
       const current = this.models.current(); const family = settingsFamily(s);
-      const choices = this.config.modelFamilies.filter(f => current.has(f)).map(f => button((f === family ? '✓ ' : '') + modelLabel(current.get(f)!.id), 'model ' + f));
-      choices.push(...PROVIDER_MODELS.map(m => button((s.model === m.id ? '✓ ' : '') + m.label, 'model ' + m.id)));
+      const choices = this.config.modelFamilies.filter(f => current.has(f)).map(f => button((family && f === family ? '✓ ' : '') + modelLabel(current.get(f)!.id), 'model ' + f));
+      choices.push(...configuredProviderModels(this.config.providers).map(m => button((s.model === m.id ? '✓ ' : '') + m.label, 'model ' + m.id)));
       const rows: Buttons = []; for (let i = 0; i < choices.length; i += 2) rows.push(choices.slice(i, i + 2));
       return this.panel(`Model\n\nCurrent: ${settingsLabel(this.resolved(s))}\nChoose the model for your next task. Each choice runs the newest model of that family.`, [...rows, ...BACK]);
     }
     if (command === 'efforts' || command === 'effort') {
-      const levels = this.effortsFor(this.models.current().get(settingsFamily(s))); const effort = this.resolved(s).effort;
+      const family = settingsFamily(s);
+      if (!family) return this.panel(`Reasoning effort\n\nCurrent model: ${modelLabel(s.model)}\nReasoning effort levels apply to Claude models.`, BACK);
+      const levels = this.effortsFor(this.models.current().get(family)); const effort = this.resolved(s).effort;
       const choices = levels.map(v => button((effort === v ? '✓ ' : '') + v, 'efforts ' + v));
       return this.panel(`Reasoning effort\n\nCurrent: ${effort}\nHigher effort can take longer and use more tokens.`, [choices.slice(0, 3), ...(choices.length > 3 ? [choices.slice(3)] : []), ...BACK]);
     }
@@ -549,7 +552,9 @@ export class Controller {
           next.fast = argument.toLowerCase() === 'on';
         } else {
           if (!EFFORTS.includes(argument.toLowerCase() as Effort)) return this.panel('Choose low, medium, high, xhigh or max.');
-          const levels = this.effortsFor(this.models.current().get(settingsFamily(next)));
+          const family = settingsFamily(next);
+          if (!family) return this.panel('Reasoning effort applies to Claude models.');
+          const levels = this.effortsFor(this.models.current().get(family));
           if (!levels.includes(argument.toLowerCase() as Effort)) return this.panel('This model supports: ' + levels.join(', ') + '.');
           next.effort = argument.toLowerCase() as Effort;
         }
@@ -1036,7 +1041,9 @@ export class Controller {
         : error instanceof TranscriptionError ? 'transcription_failed' : 'sdk_error';
       if (error instanceof AgentSafetyError) { task.failureKind = 'safety_refusal'; console.warn(JSON.stringify({ event: 'claude_safety_stop', task: task.id, session: archiveKey, model: task.settings?.model ?? this.config.model, category: error.category ?? 'unreported', time: new Date().toISOString() })); }
       if (error instanceof AgentApiError) {
-        (this.store.data.health ??= {}).apiError = error.kind; console.warn(`Claude task API failure: ${error.kind}.`);
+        const failedModel = task.settings?.model ?? this.settings.model;
+        const providerLabel = providerModel(failedModel) ? modelLabel(failedModel) : 'Claude API';
+        (this.store.data.health ??= {}).apiError = error.kind; console.warn(`${providerLabel} task failure: ${error.kind}.`);
         // M2: only key or account problems stop the queue; a busy API does not.
         if (PAUSE_API_KINDS.includes(error.kind)) await this.automation.setPaused(true);
         // W47-06: a busy API before any tool ran gets one automatic retry.
@@ -1052,7 +1059,9 @@ export class Controller {
       await this.say(notice + (pendingHelpers ? '\nPending SDK helpers stopped with this task; their completion is unconfirmed. No work was replayed.' : ''));
       if (error instanceof AgentApiError) {
         // W47-05/06: the reason is in the notice above; offer the retry right here.
-        const reason = `Claude API problem: ${error.kind.replace(/_/g, ' ')}.`;
+        const failedModel = task.settings?.model ?? this.settings.model;
+        const providerLabel = providerModel(failedModel) ? modelLabel(failedModel) : 'Claude API';
+        const reason = `${providerLabel} problem: ${error.kind.replace(/_/g, ' ')}.`;
         if (autoRetry) await this.panel(`${reason} Nothing was changed, so I will retry this task once automatically in about a minute.`, [[button('Queue', 'queue'), button('Key status', 'keys')], ...BACK]);
         else await this.panel(`${reason} Retry this task when it is fixed (for a busy or overloaded API, after a minute). ${this.store.data.queuePaused ? 'The queue is paused; /queue resumes it.' : 'The queue keeps running.'}`,
           [[button('Retry task', 'taskretry ' + task.id)], [button('Queue', 'queue'), button('Key status', 'keys')], ...BACK]);

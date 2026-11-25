@@ -18,7 +18,7 @@ import { Automation } from './automation.js';
 import { KeyPool, messageProbe } from './key-pool.js';
 import { ModelCatalog, fetchModels } from './models.js';
 import { PriceBook, fetchPricingPage } from './pricing.js';
-import { ProviderRunner, RoutedRunner } from './providers.js';
+import { ProviderHealthTracker, ProviderRunner, RoutedRunner } from './providers.js';
 import { UpdateClient, updateConfig } from './updater.js';
 
 async function main(): Promise<void> {
@@ -60,7 +60,16 @@ async function main(): Promise<void> {
   refreshModels();
   const modelTimer = setInterval(refreshModels, 60 * 60_000); modelTimer.unref();
   const claudeRunner = new ResilientRunner(config, store, undefined, undefined, keys);
-  const controller = new Controller(config, store, telegram, new RoutedRunner(claudeRunner, new ProviderRunner(config.providers)), ledger, new HaikuTitles(config, ledger, undefined, () => keys.selectedConfig()), keys);
+  const providerHealth = new ProviderHealthTracker(store);
+  const providerRunner = new ProviderRunner(config.providers, config);
+  const routedRunner = new RoutedRunner(claudeRunner, providerRunner, providerHealth, async () => {
+    const selected = keys.selectedConfig();
+    if (!selected) return false;
+    if (!selected.apiKey) return true;
+    const probe = await messageProbe(ledger)(selected.apiKey, AbortSignal.timeout(15_000));
+    return probe.ok;
+  });
+  const controller = new Controller(config, store, telegram, routedRunner, ledger, new HaikuTitles(config, ledger, undefined, () => keys.selectedConfig()), keys);
   controller.models = models;
   const updates = updateConfig(process.env); if (updates) controller.updates = new UpdateClient(updates);
   announce = () => controller.announceModelChanges().catch(() => {});

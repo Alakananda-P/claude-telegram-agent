@@ -47,8 +47,15 @@ export interface Conversation {
   title?: string; titleSource?: 'fallback' | 'auto' | 'model' | 'manual'; titleAttempted?: boolean;
   trashedAt?: string; purgeAt?: string;
 }
+export interface ProviderHealthRecord {
+  status: 'healthy' | 'cooldown';
+  cooldownUntil?: string;
+  lastError?: string;
+  lastCheckedAt?: string;
+}
 export interface TelegramOutage { startedAt: string; endedAt: string; durationMs: number; failures: number; reason: string }
 export interface State {
+  providerHealth?: Record<string, ProviderHealthRecord>;
   projects?: ProjectRecord[];
   backgroundJobs?: BackgroundJob[];
   pendingMessageCleanup?: { chat: number; id: number; retryAt?: number; attempts?: number }[];
