@@ -228,7 +228,7 @@ export class Controller {
     if (!this.config.upgradeGithubToken || !this.config.upgradeRenderToken || !this.config.upgradeRenderServiceId) throw new ProjectError('Bot upgrade publishing is not configured by the owner.');
     const repo = path.resolve(root, directory), prefix = root.endsWith(path.sep) ? root : root + path.sep;
     if (!repo.startsWith(prefix)) throw new ProjectError('Upgrade repository must be inside the current project.');
-    const git = async (args: string[], env?: NodeJS.ProcessEnv) => (await run('git', ['-c', 'core.hooksPath=/dev/null', ...args], { cwd: repo, env, timeout: 120_000, maxBuffer: 200_000 })).stdout.trim();
+    const git = async (args: string[], env?: NodeJS.ProcessEnv) => (await run('git', ['-c', 'core.hooksPath=/dev/null', ...args], { cwd: repo, env, timeout: 120_000, maxBuffer: 200_000 })).stdout.trimEnd();
     try {
       const remote = await git(['config', '--get', 'remote.origin.url']);
       if (!/github\.com[/:]Alakananda-P\/claude-telegram-agent(?:\.git)?$/i.test(remote)) throw new Error('remote');
