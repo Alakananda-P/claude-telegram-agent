@@ -82,3 +82,21 @@ test('M1: a corrupt chat archive makes /history answer with an error instead of 
   await bot.callback({ id: 'cb', from: { id: 123 }, message: { ...message(''), message_id: 7 }, data: 'history chat-x 0' });
   assert.ok(replies.filter(r => /still running/i.test(r)).length >= 2, replies.join(' | '));
 });
+
+test('M6: a failing purge does not pause new tasks; a real state save failure still does', async () => {
+  const { bot, store, replies, release } = await running(); release();
+  const internals = bot as unknown as { sessions: { purgeExpired(): Promise<number> }; persistenceFailed: boolean };
+  internals.sessions.purgeExpired = async () => { throw Object.assign(new Error('resource busy'), { code: 'EBUSY' }); };
+  bot.start(); await new Promise(r => setTimeout(r, 30));
+  assert.equal(internals.persistenceFailed, false);
+  await bot.handle(message('New task after a purge error')); await bot.idle();
+  assert.ok(!replies.some(r => /State storage failed/.test(r)), replies.join(' | '));
+  assert.equal(store.data.tasks!.at(-1)!.status, 'completed');
+  await bot.stop();
+  const { StateSaveError } = await import('../src/state.js');
+  const second = await running(); second.release();
+  (second.bot as unknown as { sessions: { purgeExpired(): Promise<number> } }).sessions.purgeExpired = async () => { throw new StateSaveError(new Error('ENOSPC')); };
+  second.bot.start(); await new Promise(r => setTimeout(r, 30));
+  assert.equal((second.bot as unknown as { persistenceFailed: boolean }).persistenceFailed, true);
+  await second.bot.stop();
+});

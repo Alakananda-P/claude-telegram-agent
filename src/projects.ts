@@ -1,11 +1,11 @@
 import { mkdir, readdir, lstat, realpath, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import type { StateStore } from './state.js';
+import { StateSaveError, type StateStore } from './state.js';
 import { projectName, redact, secretPath } from './safety.js';
 import { ProjectError, assertProjectWork, type ProjectRecord } from './project-state.js';
 import { ChatArchive } from './chats.js';
-import { SessionCatalog } from './sessions.js';
+import { SessionCatalog, PURGE_RETRY_MS } from './sessions.js';
 
 export { ProjectError } from './project-state.js';
 export interface ProjectQuery { status?: ProjectRecord['status'] | 'all'; query?: string; offset?: number; limit?: number }
@@ -15,6 +15,7 @@ const missing = (error: unknown) => (error as NodeJS.ErrnoException).code === 'E
 /** IDs and directories never change when the owner edits a project's name. */
 export class ProjectCatalog {
   private initialized?: Promise<void>;
+  private purgeRetryAt = new Map<string, number>();
   private base: string;
   private sessions: SessionCatalog;
   constructor(private dataDir: string, readonly store: StateStore, readonly secrets: string[] = []) {
@@ -234,8 +235,18 @@ export class ProjectCatalog {
   }
   async purgeExpired(now = new Date()) {
     await this.initialize();
-    const ids = this.store.data.projects!.filter(p => p.status === 'purging' || (p.status === 'trashed' && !!p.purgeAt && Date.parse(p.purgeAt) <= +now)).map(p => p.id);
-    for (const id of ids) await this.purge(id); return ids.length;
+    const ids = this.store.data.projects!.filter(p => (p.status === 'purging' || (p.status === 'trashed' && !!p.purgeAt && Date.parse(p.purgeAt) <= +now)) && !((this.purgeRetryAt.get(p.id) ?? 0) > +now)).map(p => p.id);
+    let purged = 0;
+    for (const id of ids) {
+      // M6: a file error in one project must not stop the other purges or the queue; retry it later.
+      try { await this.purge(id); purged++; this.purgeRetryAt.delete(id); }
+      catch (error) {
+        if (error instanceof StateSaveError) throw error;
+        this.purgeRetryAt.set(id, +now + PURGE_RETRY_MS);
+        console.warn(`Expired project ${id} could not be purged (${(error as NodeJS.ErrnoException).code ?? (error as Error).name}); retrying in 10 min.`);
+      }
+    }
+    return purged;
   }
   async select(id: string, beforeCommit?: () => void) {
     await this.workspace(id); return this.lock(async () => { assertProjectWork(this.store.data, id); beforeCommit?.(); this.store.data.project = id; await this.store.save(); return this.view(this.find(id)); });

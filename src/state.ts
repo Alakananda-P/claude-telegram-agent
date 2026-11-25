@@ -98,6 +98,11 @@ function quarantineInvalidTasks(data: State): { kind: 'task' | 'steer'; taskId?:
   return removed;
 }
 
+/** M6: writing state.json failed. Only this kind of error pauses new tasks. */
+export class StateSaveError extends Error {
+  constructor(cause: unknown) { super('Bot state could not be saved.', { cause }); this.name = 'StateSaveError'; }
+}
+
 export class StateStore {
   private saving: Promise<void> = Promise.resolve();
   /** Tasks that were running when the previous process died (W47-08); not persisted. */
@@ -184,7 +189,7 @@ export class StateStore {
       const tmp = this.file + '.tmp';
       await writeFile(tmp, snapshot, { mode: 0o600 });
       await rename(tmp, this.file);
-    });
+    }).catch(error => { throw new StateSaveError(error); });
     this.saving = task.catch(() => {});
     return task;
   }

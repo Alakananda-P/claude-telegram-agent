@@ -1,17 +1,20 @@
 import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
-import { StateStore, type Conversation } from './state.js';
+import { StateStore, StateSaveError, type Conversation } from './state.js';
 import { ChatArchive, type ChatTurn } from './chats.js';
 import { redact, safeJson, PathAccessError } from './safety.js';
 import { randomUUID } from 'node:crypto';
 import { ProjectError, projectVisible } from './project-state.js';
 
+/** M6: wait this long before retrying a purge that failed on a file error. */
+export const PURGE_RETRY_MS = 10 * 60_000;
 const titleText = (text: string): string => text.replace(/[\p{Cc}\p{Cf}]/gu, ' ').replace(/\s+/g, ' ').trim().slice(0, 64);
 export const sessionTitle = (record: Conversation): string => record.title || `${record.project} conversation`;
 export class SessionAccessError extends Error {}
 
 export class SessionCatalog {
   onDeleteRequest?: (id: string, title: string) => Promise<void>;
+  private purgeRetryAt = new Map<string, number>();
   constructor(private store: StateStore, private chats: ChatArchive, private secrets: string[], private transcriptRoot?: string) {}
   private find(id: string): Conversation {
     const record = this.store.data.conversations?.find(s => s.id === id);
@@ -156,9 +159,18 @@ export class SessionCatalog {
     return related;
   }
   async purgeExpired(now = new Date()): Promise<number> {
-    const expired = this.trashList(true).filter(s => s.purgeAt && Date.parse(s.purgeAt) <= +now);
-    for (const s of expired) await this.purge(s.id);
-    return expired.length;
+    const expired = this.trashList(true).filter(s => s.purgeAt && Date.parse(s.purgeAt) <= +now && !((this.purgeRetryAt.get(s.id) ?? 0) > +now));
+    let purged = 0;
+    for (const s of expired) {
+      // M6: one locked or unreadable file must not stop the other purges or the queue; retry it later.
+      try { await this.purge(s.id); purged++; this.purgeRetryAt.delete(s.id); }
+      catch (error) {
+        if (error instanceof StateSaveError) throw error;
+        this.purgeRetryAt.set(s.id, +now + PURGE_RETRY_MS);
+        console.warn(`Expired chat ${s.id.slice(0, 8)} could not be purged (${(error as NodeJS.ErrnoException).code ?? (error as Error).name}); retrying in 10 min.`);
+      }
+    }
+    return purged;
   }
   async rename(id: string, title: string, source: 'model' | 'manual' = 'model') {
     const record = this.find(this.resolve(id));

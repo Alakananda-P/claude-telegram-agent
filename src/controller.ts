@@ -5,7 +5,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { configSecrets, type Config } from './config.js';
 import { AgentError, AgentApiError, AgentSafetyError, type Runner, type PlanDecision } from './agent.js';
-import { StateStore } from './state.js';
+import { StateStore, StateSaveError } from './state.js';
 import { authorized, projectName, redact, privatePreview, safeFile, secretPath, detectTokens, maskTokens, PathAccessError, type Message, type Callback } from './safety.js';
 import { EFFORTS, effectiveSettings, settingsLabel, modelLabel, familyOf, familySettings, settingsFamily, type AgentSettings, type Effort } from './settings.js';
 import { ModelCatalog, type CatalogModel } from './models.js';
@@ -337,7 +337,10 @@ export class Controller {
 
   async tick(now = new Date()): Promise<void> {
     if (this.ticking || this.shuttingDown) return;
-    void this.background.tick(+now).catch(() => { this.persistenceFailed = true; console.error('Background notification storage failed; new tasks paused.'); });
+    void this.background.tick(+now).catch(error => {
+      if (error instanceof StateSaveError) { this.persistenceFailed = true; console.error('Background notification storage failed; new tasks paused.'); }
+      else console.warn(`Background job check failed (${error instanceof Error ? error.name : 'unknown'}); retrying on the next tick.`);
+    });
     if (!this.cleaningUi && this.messenger.cleanup) {
       this.cleaningUi = this.messenger.cleanup(this.config.owner, +now).catch(() => { console.warn('Temporary UI cleanup deferred; conversation data is unchanged.'); }).finally(() => { this.cleaningUi = undefined; });
     }
@@ -347,7 +350,11 @@ export class Controller {
   }
   start(): void {
     if (this.timer) return;
-    const tick = () => void this.tick().catch(() => { this.persistenceFailed = true; console.error('Automation storage failed; queue stopped.'); });
+    // M6: only a failed state save pauses new tasks; any other tick error is logged and retried in 5 s.
+    const tick = () => void this.tick().catch(error => {
+      if (error instanceof StateSaveError) { this.persistenceFailed = true; console.error('Automation storage failed; queue stopped.'); }
+      else console.warn(`Automation tick failed (${error instanceof Error ? error.name : 'unknown'}); retrying on the next tick.`);
+    });
     this.timer = setInterval(tick, 5000); this.timer.unref(); tick();
   }
 
