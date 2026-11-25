@@ -16,6 +16,8 @@ export interface Task {
   status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted';
   createdAt: string; startedAt?: string; finishedAt?: string; scheduleId?: string; occurrence?: string;
   interactive?: boolean; settings?: AgentSettings; displayPrompt?: string;
+  /** W47-06: this task is the one automatic retry of a task that failed on a busy API. */
+  autoRetry?: boolean;
   voiceInput?: string; attachedFiles?: string[];
   steers?: SteerRecord[];
   deadlineAt?: string; handoffFrom?: string;

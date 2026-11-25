@@ -5,6 +5,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { configSecrets, type Config } from './config.js';
 import { AgentError, AgentApiError, AgentSafetyError, type Runner, type PlanDecision } from './agent.js';
+import { BUSY_API_KINDS, PAUSE_API_KINDS } from './recovery.js';
 import { StateStore, StateSaveError } from './state.js';
 import { authorized, projectName, redact, privatePreview, safeFile, secretPath, detectTokens, maskTokens, PathAccessError, type Message, type Callback } from './safety.js';
 import { EFFORTS, effectiveSettings, settingsLabel, modelLabel, familyOf, familySettings, settingsFamily, type AgentSettings, type Effort } from './settings.js';
@@ -126,6 +127,19 @@ export class Controller {
   private projectPurgeRequests = new Map<string, { id: string; expires: number }>();
   /** File delivery and titles that run after an answer was sent (W47-02). */
   private postAnswer = new Set<Promise<void>>();
+  /** W47-06: queue the one automatic retry if a key is still usable (Claude Code OAuth always counts as usable). */
+  private scheduleAutoRetry(id: string): void {
+    const timer = setTimeout(() => {
+      this.autoRetryTimers.delete(timer);
+      if (this.shuttingDown || this.persistenceFailed) return;
+      void (async () => {
+        let ready = false; try { ready = this.keys.available(true).length > 0; } catch { ready = false; }
+        if (!ready) { await this.say('The automatic retry was skipped because no Claude key is ready. Retry from /queue when it is fixed.'); return; }
+        const retried = await this.automation.retryTask(id); retried.autoRetry = true; await this.store.save(); this.kick();
+      })().catch(() => console.warn('Automatic retry could not be queued; the Retry button in /queue still works.'));
+    }, this.autoRetryDelayMs);
+    timer.unref?.(); this.autoRetryTimers.add(timer);
+  }
   private afterAnswer(work: () => Promise<void>): void {
     const job: Promise<void> = work().catch(error => {
       if (error instanceof TitleAccountingError) this.persistenceFailed = true;
@@ -138,6 +152,9 @@ export class Controller {
   updatePollMs = 15_000;
   /** Wait after the last album item before starting a captioned album (H-18). */
   albumDelayMs = 2500;
+  /** W47-06: wait before the one automatic retry of a task that failed on a busy API. */
+  autoRetryDelayMs = 60_000;
+  private autoRetryTimers = new Set<NodeJS.Timeout>();
   private albumTimers = new Map<string, NodeJS.Timeout>();
   private pendingUpdate?: { token: string; live: Deploy; target: string; expires: number };
   private pendingRollback?: { token: string; expires: number };
@@ -362,6 +379,7 @@ export class Controller {
     this.shuttingDown = true;
     clearInterval(this.timer);
     for (const timer of this.albumTimers.values()) clearTimeout(timer);
+    for (const timer of this.autoRetryTimers) clearTimeout(timer);
     this.running?.abort.abort();
     await this.idle();
     await this.background.stop();
@@ -853,6 +871,7 @@ export class Controller {
     let progress = task.voiceInput ? 'Transcribing voice…' : 'Thinking…';
     let timedOut = false;
     let pendingHelpers = 0;
+    let usedTools = false; let autoRetry = false;
     const expire = () => setTimeout(() => { timedOut = true; abort.abort(); }, Math.max(1, Date.parse(task.deadlineAt!) - Date.now()));
     let timeout = expire();
     active.extendDeadline = () => {
@@ -965,6 +984,7 @@ export class Controller {
             else await this.ledger?.recordStep(event.session, event.id, event.model, event.usage, event.complete);
           } catch { this.persistenceFailed = true; abort.abort(); throw new AgentError('Usage storage failed. Work stopped to protect your records.'); }
         } else if (event.type === 'speed') this.store.data.lastSpeed = event.state;
+        else if (event.type === 'effect') usedTools = true;
         else if (event.type === 'progress') progress = redact(event.text, configSecrets(this.config));
         else if (event.type === 'helpers') pendingHelpers = event.count;
         else if (event.type === 'held_open') { const { type: _type, ...why } = event; console.warn(JSON.stringify({ event: 'turn_held_open', task: task.id, ...why })); }
@@ -1003,7 +1023,13 @@ export class Controller {
         : error instanceof AgentSafetyError ? 'safety_refusal' : error instanceof AgentApiError ? 'api_failure'
         : error instanceof TranscriptionError ? 'transcription_failed' : 'sdk_error';
       if (error instanceof AgentSafetyError) { task.failureKind = 'safety_refusal'; console.warn(JSON.stringify({ event: 'claude_safety_stop', task: task.id, session: archiveKey, model: task.settings?.model ?? this.config.model, category: error.category ?? 'unreported', time: new Date().toISOString() })); }
-      if (error instanceof AgentApiError) { (this.store.data.health ??= {}).apiError = error.kind; console.warn(`Claude task API failure: ${error.kind}.`); await this.automation.setPaused(true); }
+      if (error instanceof AgentApiError) {
+        (this.store.data.health ??= {}).apiError = error.kind; console.warn(`Claude task API failure: ${error.kind}.`);
+        // M2: only key or account problems stop the queue; a busy API does not.
+        if (PAUSE_API_KINDS.includes(error.kind)) await this.automation.setPaused(true);
+        // W47-06: a busy API before any tool ran gets one automatic retry.
+        autoRetry = BUSY_API_KINDS.includes(error.kind) && !usedTools && !task.autoRetry && !abort.signal.aborted && !this.shuttingDown;
+      }
       status = abort.signal.aborted ? 'cancelled' : 'failed';
       await finishIndicator();
       console.warn(JSON.stringify({ event: 'task_ended', task: task.id, reason: task.failureKind, elapsedMs: Date.now() - Date.parse(task.startedAt!), pendingHelpers }));
@@ -1014,7 +1040,9 @@ export class Controller {
       await this.say(notice + (pendingHelpers ? '\nPending SDK helpers stopped with this task; their completion is unconfirmed. No work was replayed.' : ''));
       if (error instanceof AgentApiError) {
         // W47-05/06: the reason is in the notice above; offer the retry right here.
-        await this.panel(`Claude API problem: ${error.kind.replace(/_/g, ' ')}. Retry this task when it is fixed (for a busy or overloaded API, after a minute). The queue is paused; /queue resumes it.`,
+        const reason = `Claude API problem: ${error.kind.replace(/_/g, ' ')}.`;
+        if (autoRetry) await this.panel(`${reason} Nothing was changed, so I will retry this task once automatically in about a minute.`, [[button('Queue', 'queue'), button('Key status', 'keys')], ...BACK]);
+        else await this.panel(`${reason} Retry this task when it is fixed (for a busy or overloaded API, after a minute). ${this.store.data.queuePaused ? 'The queue is paused; /queue resumes it.' : 'The queue keeps running.'}`,
           [[button('Retry task', 'taskretry ' + task.id)], [button('Queue', 'queue'), button('Key status', 'keys')], ...BACK]);
       }
       if (error instanceof AgentSafetyError) {
@@ -1034,7 +1062,7 @@ export class Controller {
       await finishIndicator();
       this.store.data.lastJob = { ...job, status, endReason: task.failureKind, finishedAt: new Date().toISOString() };
       this.store.data.active = null;
-      try { await this.automation.finish(task.id, this.shuttingDown && status === 'cancelled' ? 'interrupted' : status); }
+      try { await this.automation.finish(task.id, this.shuttingDown && status === 'cancelled' ? 'interrupted' : status); if (autoRetry) this.scheduleAutoRetry(task.id); }
       catch { this.persistenceFailed = true; console.error('Job state persistence failed; new jobs disabled.'); }
       await this.dismiss('task-' + task.id);
     }

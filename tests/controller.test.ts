@@ -939,3 +939,34 @@ test('safety refusal is recorded distinctly without pausing unrelated future req
   assert.match(replies.join('\n'),/safety system stopped/);
   const reopened=await StateStore.open(store.file);assert.equal(reopened.data.tasks![0].failureKind,'safety_refusal');
 });
+
+test('M2 + W47-06: a busy API does not pause the queue and the task is retried once automatically', async () => {
+  let runs = 0;
+  const { bot, panels, store } = await setup({ async run(_r, emit) { runs++; await emit({ type: 'session', id: 'busy-' + runs }); if (runs === 1) throw new AgentApiError('overloaded', 'Claude API is overloaded.'); return { text: 'Done after retry', session: 'busy-' + runs, cumulativeCost: 0 }; } });
+  bot.autoRetryDelayMs = 0;
+  await bot.handle(message('make the sheet')); await bot.idle();
+  for (let i = 0; i < 100 && store.data.tasks!.length < 2; i++) { await new Promise(r => setTimeout(r, 5)); await bot.idle(); }
+  await bot.idle();
+  assert.equal(store.data.queuePaused ?? false, false);
+  assert.equal(runs, 2); assert.equal(store.data.tasks!.length, 2);
+  assert.equal(store.data.tasks![1].status, 'completed'); assert.equal(store.data.tasks![1].autoRetry, true);
+  assert.match(panels.find(p => /overloaded/.test(p.text))!.text, /automatically/);
+});
+test('M2: a second busy failure is not retried again, and a task that already used tools is never auto-retried', async () => {
+  let runs = 0;
+  const { bot, panels, store } = await setup({ async run(r, emit) { runs++; await emit({ type: 'session', id: 'busy-' + runs }); if (/tools/.test(r.prompt)) await emit({ type: 'effect', tool: 'Bash' }); throw new AgentApiError('overloaded', 'Claude API is overloaded.'); } });
+  bot.autoRetryDelayMs = 0;
+  await bot.handle(message('make the sheet')); await bot.idle();
+  for (let i = 0; i < 50; i++) { await new Promise(r => setTimeout(r, 5)); await bot.idle(); }
+  assert.equal(runs, 2, 'only one automatic retry'); assert.equal(store.data.queuePaused ?? false, false);
+  assert.ok(panels.at(-1)!.buttons.flat().some(b => b.callback_data === 'taskretry ' + store.data.tasks![1].id));
+  await bot.handle(message('run the tools')); await bot.idle();
+  for (let i = 0; i < 50; i++) { await new Promise(r => setTimeout(r, 5)); await bot.idle(); }
+  assert.equal(runs, 3, 'no automatic replay after tools ran');
+});
+test('M2: billing failures still pause the queue', async () => {
+  const { bot, store } = await setup({ async run(_r, emit) { await emit({ type: 'session', id: 'bill' }); throw new AgentApiError('billing_error', 'Billing'); } });
+  bot.autoRetryDelayMs = 0;
+  await bot.handle(message('make the sheet')); await bot.idle();
+  assert.equal(store.data.queuePaused, true); assert.equal(store.data.tasks!.length, 1);
+});

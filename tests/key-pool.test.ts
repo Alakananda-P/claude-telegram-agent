@@ -74,13 +74,14 @@ test('healthy checks are six-hourly, serialized and do not run during a user tas
   store.data.active = null; await pool.checkDue(); assert.equal(probes, 10);
 });
 
-test('all five failed keys stop after one attempt each, with no retry loop or model changes', async () => {
+test('all five busy keys get one attempt each plus one retry on the last, with no retry loop or model changes', async () => {
   const { pool, config, store } = await setup(); let calls = 0;
-  const runner = new ResilientRunner(config, store, c => ({ async run() { calls++; assert.equal(c.model, config.model); throw new AgentApiError('server_error', 'Unavailable'); } }), 60_000, pool);
-  await assert.rejects(runner.run({ prompt: 'Hi', cwd: '.' }, () => {}, new AbortController()), /All eligible/);
-  assert.equal(calls, 5); assert.ok(pool.list().every(r => r.status === 'cooldown'));
-  await assert.rejects(runner.run({ prompt: 'Hi', cwd: '.' }, () => {}, new AbortController()), /No eligible/);
-  assert.equal(calls, 5);
+  const runner = new ResilientRunner(config, store, c => ({ async run() { calls++; assert.equal(c.model, config.model); throw new AgentApiError('server_error', 'Unavailable'); } }), 1, pool);
+  await assert.rejects(runner.run({ prompt: 'Hi', cwd: '.' }, () => {}, new AbortController()), (e: unknown) => e instanceof AgentApiError && e.kind === 'server_error' && /busy/.test(e.message));
+  assert.equal(calls, 6); assert.ok(pool.list().every(r => r.status === 'cooldown'));
+  // M2: while every key cools down, only one key is tried (with its one retry), never all five again.
+  await assert.rejects(runner.run({ prompt: 'Hi', cwd: '.' }, () => {}, new AbortController()), /busy/);
+  assert.equal(calls, 8);
 });
 
 test('owner refresh never blindly marks failed keys healthy and cannot hammer the API', async () => {
