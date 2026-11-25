@@ -2,7 +2,8 @@ import { readdir, lstat } from 'node:fs/promises';
 import path from 'node:path';
 import { secretPath } from './safety.js';
 
-const deliverable = /\.(xlsx?|csv|pdf|png|jpe?g|webp|docx|pptx|zip|txt|md|json|html)$/i;
+// N-b: videos and audio are deliverables too (a rendered video in output/ was not auto-sent).
+const deliverable = /\.(xlsx?|csv|pdf|png|jpe?g|webp|gif|docx|pptx|zip|txt|md|json|html|mp4|mov|m4v|webm|mkv|mp3|m4a|wav|ogg|opus)$/i;
 // Filename screening for automatic delivery only, not a content classifier.
 export const privateDocument = (name: string) => name.split('/').some(part => /(?:^|[._ -])(?:aadhaar|aadhar|adhaar|passport|pan(?:[_ -]?card)?|voter[_ -]?id|driving[_ -]?licen[cs]e|identity|id[_ -]?proof|api[_ -]?keys?|access[_ -]?tokens?|passwords?|secrets?)(?:[._ -]|$)/i.test(part));
 export async function artifactSnapshot(root: string): Promise<Record<string, string>> {

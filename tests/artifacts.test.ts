@@ -49,3 +49,12 @@ test('changed output files that are not sent automatically are counted, without 
   const again = await changedArtifactReport(root, await artifactSnapshot(root));
   assert.deepEqual(again, { files: [], skippedPrivate: 0, tooLarge: [] }, 'unchanged files are not reported again');
 });
+
+test('N-b: videos and audio written to a new output/ folder during the task are sent automatically', async () => {
+  const { mkdtemp, mkdir, writeFile } = await import('node:fs/promises'); const { tmpdir } = await import('node:os'); const path = await import('node:path');
+  const { artifactSnapshot, changedArtifactReport } = await import('../src/artifacts.js');
+  const root = await mkdtemp(path.join(tmpdir(), 'tg-nb-'));
+  const before = await artifactSnapshot(root);
+  await mkdir(path.join(root, 'output')); for (const name of ['dinner.mp4', 'clip.mov', 'voice.mp3', 'song.m4a', 'loop.gif', 'reel.webm']) await writeFile(path.join(root, 'output', name), 'x');
+  assert.deepEqual((await changedArtifactReport(root, before)).files.sort(), ['output/clip.mov', 'output/dinner.mp4', 'output/loop.gif', 'output/reel.webm', 'output/song.m4a', 'output/voice.mp3']);
+});

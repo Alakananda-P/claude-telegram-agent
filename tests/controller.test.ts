@@ -945,7 +945,7 @@ test('M2 + W47-06: a busy API does not pause the queue and the task is retried o
   const { bot, panels, store } = await setup({ async run(_r, emit) { runs++; await emit({ type: 'session', id: 'busy-' + runs }); if (runs === 1) throw new AgentApiError('overloaded', 'Claude API is overloaded.'); return { text: 'Done after retry', session: 'busy-' + runs, cumulativeCost: 0 }; } });
   bot.autoRetryDelayMs = 0;
   await bot.handle(message('make the sheet')); await bot.idle();
-  for (let i = 0; i < 100 && store.data.tasks!.length < 2; i++) { await new Promise(r => setTimeout(r, 5)); await bot.idle(); }
+  for (let i = 0; i < 200 && store.data.tasks![1]?.status !== 'completed'; i++) { await new Promise(r => setTimeout(r, 5)); await bot.idle(); }
   await bot.idle();
   assert.equal(store.data.queuePaused ?? false, false);
   assert.equal(runs, 2); assert.equal(store.data.tasks!.length, 2);
