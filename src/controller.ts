@@ -25,6 +25,7 @@ import { SteeringInput } from './steering.js';
 import { artifactSnapshot, changedArtifactReport, privateDocument } from './artifacts.js';
 import { Backups } from './backup.js';
 import { KeyPool } from './key-pool.js';
+import { PROVIDER_MODELS, providerModel } from './providers.js';
 import { Transcriber, TranscriptionError, type TranscriptionService } from './transcription.js';
 import { completedWorkSummary } from './continuation.js';
 import { BackgroundJobs } from './background.js';
@@ -227,6 +228,8 @@ export class Controller {
   /** The settings a task runs with: the newest model of the chosen family, fast only where the
    * fast price table lists it, and the nearest supported effort level. Never persisted. */
   private resolved(s: AgentSettings): AgentSettings {
+    const external = providerModel(s.model);
+    if (external) return { ...s, fast: !!(s.fast && external.fast) };
     const { family: _family, ...rest } = s;
     const model = this.models.current().get(settingsFamily(s)); const id = model?.id ?? s.model;
     const efforts = this.effortsFor(model);
@@ -418,6 +421,7 @@ export class Controller {
     if (command === 'model') {
       const current = this.models.current(); const family = settingsFamily(s);
       const choices = this.config.modelFamilies.filter(f => current.has(f)).map(f => button((f === family ? '✓ ' : '') + modelLabel(current.get(f)!.id), 'model ' + f));
+      choices.push(...PROVIDER_MODELS.map(m => button((s.model === m.id ? '✓ ' : '') + m.label, 'model ' + m.id)));
       const rows: Buttons = []; for (let i = 0; i < choices.length; i += 2) rows.push(choices.slice(i, i + 2));
       return this.panel(`Model\n\nCurrent: ${settingsLabel(this.resolved(s))}\nChoose the model for your next task. Each choice runs the newest model of that family.`, [...rows, ...BACK]);
     }
@@ -534,6 +538,8 @@ export class Controller {
       if (['model', 'efforts', 'effort', 'fast'].includes(command ?? '')) {
         let next = { ...this.settings };
         if (command === 'model') {
+          const external = providerModel(argument);
+          if (external) { next = { ...next, model: external.id, family: undefined, fast: !!external.fast }; this.store.data.settings = next; await this.store.save(); await this.controls('model'); await this.dismiss('controls', 3000); return; }
           const choice = argument.toLowerCase(); const family = /^[a-z]{1,32}$/.test(choice) ? choice : familyOf(choice);
           if (!family || !this.config.modelFamilies.includes(family)) return this.panel('Choose ' + this.config.modelFamilies.join(', ') + '.');
           const { family: _old, ...rest } = next; next = { ...rest, ...familySettings(family) };

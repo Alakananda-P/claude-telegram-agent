@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { MODELS, EFFORTS, familyOf, familySettings, type Effort } from './settings.js';
+import type { ProviderConfig } from './providers.js';
 
 export interface Config {
   token: string; owner: number; apiKey: string; dataDir: string;
@@ -16,9 +17,10 @@ export interface Config {
   updateKeys?: string[];
   backupKeys?: string[]; backupEncryptionKey?: string;
   keyLabels?: string[]; elevenLabsKey?: string;
+  providers: ProviderConfig;
 }
 
-export function configSecrets(c: Config): string[] { return [c.token, c.apiKey, ...(c.oauthToken ? [c.oauthToken] : []), ...(c.upgradeGithubToken ? [c.upgradeGithubToken] : []), ...(c.upgradeRenderToken ? [c.upgradeRenderToken] : []), ...(c.backupKeys ?? []), ...(c.backupEncryptionKey ? [c.backupEncryptionKey] : []), ...(c.elevenLabsKey ? [c.elevenLabsKey] : []), ...(c.updateKeys ?? [])].filter(Boolean); }
+export function configSecrets(c: Config): string[] { return [c.token, c.apiKey, ...(c.oauthToken ? [c.oauthToken] : []), ...(c.upgradeGithubToken ? [c.upgradeGithubToken] : []), ...(c.upgradeRenderToken ? [c.upgradeRenderToken] : []), ...(Object.values(c.providers.keys).flat()), ...(c.backupKeys ?? []), ...(c.backupEncryptionKey ? [c.backupEncryptionKey] : []), ...(c.elevenLabsKey ? [c.elevenLabsKey] : []), ...(c.updateKeys ?? [])].filter(Boolean); }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const required = (key: string) => {
@@ -64,7 +66,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     catch { throw new Error('Set ANTHROPIC_KEY_LABELS to unique non-secret labels for each unique configured key.'); }
   }
   if (backupEncryptionKey && !/^[a-f0-9]{64}$/i.test(backupEncryptionKey)) throw new Error('Set BACKUP_ENCRYPTION_KEY to 32 random bytes encoded as hex.');
-  return { token, owner, apiKey, oauthToken: oauthToken || undefined, upgradeGithubToken: env.BOT_UPGRADE_GITHUB_TOKEN?.trim() || undefined, upgradeRenderToken: env.BOT_UPGRADE_RENDER_API_KEY?.trim() || undefined, upgradeRenderServiceId: env.BOT_UPGRADE_RENDER_SERVICE_ID?.trim() || undefined, model, backupKeys, backupEncryptionKey, keyLabels, elevenLabsKey: env.ELEVENLABS_API_KEY?.trim() || undefined,
+  const split = (name: string) => (env[name] ?? '').split(',').map(x => x.trim()).filter(Boolean);
+  const providers: ProviderConfig = { keys: { gemini: split('GEMINI_API_KEYS'), xai: split('XAI_API_KEYS'), minimax: split('MINIMAX_API_KEYS'), openrouter: split('OPENROUTER_API_KEYS') } };
+  return { token, owner, apiKey, oauthToken: oauthToken || undefined, upgradeGithubToken: env.BOT_UPGRADE_GITHUB_TOKEN?.trim() || undefined, upgradeRenderToken: env.BOT_UPGRADE_RENDER_API_KEY?.trim() || undefined, upgradeRenderServiceId: env.BOT_UPGRADE_RENDER_SERVICE_ID?.trim() || undefined, model, backupKeys, backupEncryptionKey, keyLabels, elevenLabsKey: env.ELEVENLABS_API_KEY?.trim() || undefined, providers,
     effort, fast: (env.CLAUDE_FAST_MODE ?? 'true') === 'true', permissionMode: 'auto', maxTurns, modelFamilies, ...(modelFamily ? { modelFamily } : {}), updateKeys: [env.RENDER_API_KEY, env.GITHUB_TOKEN].map(v => v?.trim()).filter((v): v is string => !!v),
     timeoutMs: positive('JOB_TIMEOUT_MINUTES', 20) * 60_000,
     dataDir: path.resolve(env.DATA_DIR ?? './data') };
