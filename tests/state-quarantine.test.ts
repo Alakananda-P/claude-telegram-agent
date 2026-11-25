@@ -120,3 +120,17 @@ test('M5: file delivery and title failures after the answer keep the task comple
   assert.ok(!replies.some(r => /could not finish/.test(r)) && !panels.some(p => /Retry/.test(p)));
   assert.equal(store.data.lastJob?.status, 'completed');
 });
+
+test('M4: files stay pending when the instruction could not start a task', async () => {
+  const { bot, store, replies, release } = await running(); release();
+  const photo: Message = { ...message(''), photo: [{ file_id: 'bill-large', width: 1200, height: 900 }] } as Message;
+  await bot.handle(photo);
+  assert.equal(store.data.batches!.at(-1)!.status, 'collecting');
+  await bot.handle(message('x'.repeat(29990)));
+  assert.ok(replies.some(r => /too long/i.test(r)), replies.join(' | '));
+  assert.equal(store.data.tasks!.length, 0);
+  assert.equal(store.data.batches!.at(-1)!.status, 'collecting', 'the photo is still waiting for an instruction');
+  await bot.handle(message('Read this bill')); await bot.idle();
+  assert.equal(store.data.tasks!.length, 1); assert.match(store.data.tasks![0].prompt, /Read this bill[\s\S]*uploads\//);
+  assert.equal(store.data.batches!.at(-1)!.status, 'queued');
+});

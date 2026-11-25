@@ -603,9 +603,10 @@ export class Controller {
     }
   }
 
-  private async launch(prompt: string, cwd: string, displayPrompt = prompt, voiceInput?: string, attachedFiles?: string[], messageContext?: TelegramMessageContext, planMode = false): Promise<void> {
+  /** Starts, steers or queues the instruction. Returns false when nothing was started (M4). */
+  private async launch(prompt: string, cwd: string, displayPrompt = prompt, voiceInput?: string, attachedFiles?: string[], messageContext?: TelegramMessageContext, planMode = false): Promise<boolean> {
     // H3: check the size before anything is saved; an oversized record would stop the next start.
-    if (!prompt.trim() || prompt.length > 30000 || displayPrompt.length > 30000) return this.say('This instruction is too long (limit 30,000 characters, including the list of attached files). Send a shorter message or fewer files. Nothing was queued.');
+    if (!prompt.trim() || prompt.length > 30000 || displayPrompt.length > 30000) { await this.say('This instruction is too long (limit 30,000 characters, including the list of attached files). Send a shorter message or fewer files. Nothing was queued.'); return false; }
     await this.dismiss('controls');
     // claim() persists before execute() opens its inbox. Wait only for that small
     // startup window so rapid consecutive messages join the very first task.
@@ -616,19 +617,21 @@ export class Controller {
       if (active.planWait && !voiceInput && !attachedFiles?.length) {
         // A text reply while a plan waits for approval is feedback on that plan.
         await this.chats.append(this.resolveChat(active.task.chatKey), { role: 'user', text: displayPrompt });
-        active.planWait.resolve({ approved: false, feedback: prompt }); return;
+        active.planWait.resolve({ approved: false, feedback: prompt }); return true;
       }
       const release = active.input.reserve()!;
       const record: SteerRecord = { messageContext, id: randomUUID(), text: prompt, displayText: displayPrompt, voiceInput, attachedFiles, status: 'preparing' };
       (active.task.steers ??= []).push(record); active.extendDeadline?.();
       try { await this.store.save(); } catch (error) { release(); throw error; }
       this.prepareSteer(active, record, release);
-      return;
+      return true;
     }
-    if (this.store.data.queuePaused) return this.say('Processing is paused. Resume from /queue, then send your instruction. Your message was not queued.');
+    if (this.store.data.queuePaused) { await this.say('Processing is paused. Resume from /queue, then send your instruction. Your message was not queued.'); return false; }
     await this.automation.enqueue({ kind: 'agent', messageContext, project: this.store.data.project, chatKey: this.chatKey(), prompt, displayPrompt, voiceInput, attachedFiles, settings: { ...this.settings }, interactive: true, ...(planMode ? { planMode: true } : {}) });
     this.kick();
-    if (otherChat) await this.say('Another chat is running. This message is queued for this chat and starts when that task finishes. See /queue.');
+    // The task is queued now; a failed notice must not hand the files back (M4).
+    if (otherChat) await this.say('Another chat is running. This message is queued for this chat and starts when that task finishes. See /queue.').catch(() => {});
+    return true;
   }
 
   /** Opens a fresh draft chat seeded with a summary of the selected chat's completed work (used by /fresh and after a safety stop). */
@@ -1173,8 +1176,16 @@ export class Controller {
     // H-18: captions sent with the files stay part of the task when the instruction comes later.
     const captions = batches.map(b => b.prompt).filter(Boolean).join('\n');
     const prompt = (instruction && captions && !voiceInput && instruction !== captions ? captions + '\n' + instruction : instruction) ?? (captions || 'Inspect these files. For bill photos, extract only clear values, check arithmetic, and ask about unclear fields with relevant crops. If the desired output is unclear, ask the owner.');
+    // M4: claim the batches now (an album timer must not pick them up twice) and give them
+    // back if the instruction did not start, steer or queue a task.
     for (const batch of batches) batch.status = 'queued';
-    await this.launch(prompt + '\n\nAttached project files:\n' + files.map(f => f.path).join('\n'), await this.workspace(batches[0].project), maskTokens(prompt) + `\n[${files.length} attached files]`, voiceInput, voiceInput ? files.filter(f => f.path !== voiceInput).map(f => f.path) : undefined, messageContext);
+    let started = false;
+    try {
+      started = await this.launch(prompt + '\n\nAttached project files:\n' + files.map(f => f.path).join('\n'), await this.workspace(batches[0].project), maskTokens(prompt) + `\n[${files.length} attached files]`, voiceInput, voiceInput ? files.filter(f => f.path !== voiceInput).map(f => f.path) : undefined, messageContext);
+    } finally {
+      if (!started) { for (const batch of batches) batch.status = 'collecting'; await this.store.save().catch(() => {}); }
+    }
+    if (!started) return;
     for (const batch of batches) await this.dismiss('batch-' + batch.id);
     await this.uploadReceipt();
     await this.dismiss('controls');
