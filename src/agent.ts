@@ -63,7 +63,9 @@ export function agentEnvironment(config: Config): Record<string, string | undefi
   }
   const home = path.join(config.dataDir, 'home');
   return { ...inherited, HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: path.join(config.dataDir, 'claude'),
-    ANTHROPIC_API_KEY: config.apiKey, npm_config_prefix: path.join(home, '.npm-global'),
+    ...(config.apiKey ? { ANTHROPIC_API_KEY: config.apiKey } : {}),
+    ...(config.oauthToken ? { CLAUDE_CODE_OAUTH_TOKEN: config.oauthToken } : {}),
+    npm_config_prefix: path.join(home, '.npm-global'),
     VIRTUAL_ENV: path.join(config.dataDir, 'venv'), CLAUDE_AGENT_SDK_CLIENT_APP: 'private-telegram-agent/1.0.0',
     CLAUDE_CODE_RESUME_INTERRUPTED_TURN: '0' };
 }

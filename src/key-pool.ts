@@ -17,6 +17,7 @@ export const keyRecordSchema = z.object({
 });
 export type KeyRecord = z.infer<typeof keyRecordSchema>;
 export type KeyProbe = (key: string, signal: AbortSignal) => Promise<{ ok: boolean; kind?: KeyReason }>;
+type Credential = { id: string; key: string; label: string; kind: 'api' | 'oauth' };
 const restricted = ['rate_limit', 'account_on_hold', 'verification_required', 'oauth_org_not_allowed'];
 const transient = ['overloaded', 'server_error', 'network_error'];
 const stamp = (ms: number) => new Date(ms).toISOString();
@@ -36,13 +37,14 @@ class ProbeAccountingError extends Error {}
 /** No raw credentials or provider error descriptions enter durable state. */
 export class KeyPool {
   readonly primaryId: string;
-  private credentials: { id: string; key: string; label: string }[];
+  private credentials: Credential[];
   private checking?: Promise<void>;
   private probeAbort?: AbortController;
   private stopped = false;
   private timer?: ReturnType<typeof setInterval>;
   constructor(private config: Config, private store: StateStore, private probe: KeyProbe = messageProbe(), private now = Date.now) {
-    this.credentials = [...new Set([config.apiKey, ...(config.backupKeys ?? [])])].map((key, i) => ({ key, id: createHash('sha256').update(key).digest('hex').slice(0, 16), label: config.keyLabels?.[i] ?? `Key ${i + 1}` }));
+    const sources = config.oauthToken ? [{ key: config.oauthToken, kind: 'oauth' as const }] : [config.apiKey, ...(config.backupKeys ?? [])].map(key => ({ key, kind: 'api' as const }));
+    this.credentials = [...new Map(sources.map(source => [source.key, source])).values()].map((source, i) => ({ ...source, id: createHash('sha256').update(source.key).digest('hex').slice(0, 16), label: config.keyLabels?.[i] ?? (source.kind === 'oauth' ? 'Claude OAuth' : `Key ${i + 1}`) }));
     this.primaryId = this.credentials[0].id;
     store.data.keyRecords ??= Object.create(null); store.data.disabledKeyIds ??= [];
     for (const c of this.credentials) {
@@ -73,9 +75,10 @@ export class KeyPool {
       .sort((a, b) => Number(b.id === preferred) - Number(a.id === preferred));
   }
   selectedConfig(): Config | undefined {
-    try { const credential = this.available()[0]; return credential ? { ...this.config, apiKey: credential.key } : undefined; }
+    try { const credential = this.available()[0]; return credential ? this.configFor(credential) : undefined; }
     catch { return undefined; }
   }
+  configFor(credential: Credential): Config { return { ...this.config, apiKey: credential.kind === 'api' ? credential.key : '', oauthToken: credential.kind === 'oauth' ? credential.key : undefined }; }
   async begin(id: string) {
     this.probeAbort?.abort();
     const r = this.record(id); if (r.status === 'retired') throw new Error('This key has been retired.');
@@ -131,6 +134,10 @@ export class KeyPool {
     for (const c of [...this.credentials]) {
       if (this.stopped || this.store.data.active) return;
       const r = this.record(c.id); if (r.status === 'retired' || Date.parse(r.nextCheckAt) > this.now()) continue;
+      // Claude Code OAuth cannot be validated through the public Messages API.
+      // Its validity is therefore verified by the next real SDK task, rather
+      // than sending the token to an incompatible endpoint.
+      if (c.kind === 'oauth') { r.lastCheckAt = stamp(this.now()); r.nextCheckAt = stamp(this.now() + 6 * 60 * 60_000); await this.store.save(); continue; }
       const lastAttempt = r.lastAttemptAt;
       let timedOut = false;
       const abort = this.probeAbort = new AbortController(); const timer = setTimeout(() => { timedOut = true; abort.abort(); }, 15_000);
