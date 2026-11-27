@@ -1,6 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { Games, GameError, checkQuestion, cleanWord, empties, winner, botMove, hangmanView, parseGameCallback, type GamesData, type QuizQuestion } from '../src/games.js';
+import path from 'node:path';
+import { tmpdir } from 'node:os';
+import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { pathToFileURL } from 'node:url';
+import { Games, GameError, checkQuestion, cleanWord, empties, winner, botMove, hangmanView, parseGameCallback, type Cell, type GamesData, type QuizQuestion } from '../src/games.js';
 import { gameCallPayload, TelegramCallError } from '../src/telegram.js';
 
 const OWNER = 4242;
@@ -73,9 +79,9 @@ test('board helpers detect wins, draws and open cells', () => {
 });
 
 test('bot plays a win, blocks a threat and keeps hard level sharp', () => {
-  const win = ['O', 'O', '', '', 'X', '', '', 'X', ''];
+  const win: Cell[] = ['O', 'O', '', '', 'X', '', '', 'X', ''];
   assert.equal(botMove(win, 'easy', () => 0), 2);
-  const block = ['X', 'X', '', '', 'O', '', '', 'O', ''];
+  const block: Cell[] = ['X', 'X', '', '', 'O', '', '', 'O', ''];
   assert.equal(botMove(block, 'medium', () => 0), 2);
   assert.equal(botMove(['X', '', 'O', '', '', '', '', '', ''], 'medium', () => 0), 4);
   // Hard forks with a corner instead of taking the centre.
@@ -236,6 +242,63 @@ test('a restarted bot closes an open quiz instead of pretending it still runs', 
   games.restore();
   await new Promise(r => setTimeout(r, 20));
   assert.ok(h.calls.some(c => c.method === 'stopPoll'));
+  assert.equal(s.data.games?.active, undefined);
+  assert.equal(games.results().results[0]!.outcome, 'stopped');
+});
+
+test('answering a quiz keeps the worker alive until the next question is sent', async () => {
+  // Regression: the pause after an answer used an unref'd timer, so Node exited silently mid-quiz.
+  const dir = await mkdtemp(path.join(tmpdir(), 'quiz-alive-'));
+  try {
+    const file = path.join(dir, 'answer.mjs');
+    await writeFile(file, `import { Games } from ${JSON.stringify(pathToFileURL(path.resolve('src/games.ts')).href)};
+let id = 100, polls = 0;
+const host = { async call(method) { if (method === 'sendPoll') { polls++; return { message_id: ++id, poll: { id: 'p' + id } }; } return { message_id: ++id }; }, async panel() {}, async say() {} };
+const store = { data: {}, async save() {} };
+const games = new Games(host, 1, store);
+await games.play({ kind: 'rapid', questions: [{ question: 'A?', options: ['x', 'y'], answer: 0 }, { question: 'B?', options: ['x', 'y'], answer: 1 }], timer_seconds: 30 });
+await games.onPollAnswer({ poll_id: store.data.games.active.pollId, option_ids: [0], user: { id: 1 } });
+console.log('POLLS=' + polls);
+games.dispose();
+`);
+    const { stdout } = await promisify(execFile)(process.execPath, ['--import', 'tsx', file], { timeout: 30_000 });
+    assert.match(stdout, /POLLS=2/);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+function failingSecondPoll() {
+  const made = make();
+  const call = made.h.call.bind(made.h);
+  made.h.call = async (method: string, params: any) => {
+    if (method === 'sendPoll' && made.h.polls().length >= 1) { made.h.calls.push({ method, params }); throw new TelegramCallError('Telegram refused the poll.'); }
+    return call(method, params);
+  };
+  return made;
+}
+
+test('a quiz whose next poll fails is closed with its score instead of hanging', async () => {
+  const { games, h, s } = failingSecondPoll();
+  await games.play({ kind: 'quiz', questions: [Q, { question: '2+2?', options: ['3', '4'], answer: 1 }], timer_seconds: 10 });
+  await assert.rejects(games.onPollAnswer({ poll_id: 'poll-1', option_ids: [1], voter: { id: OWNER } }));
+  assert.equal(s.data.games?.active, undefined);
+  const result = games.results().results[0]!;
+  assert.equal(result.outcome, 'stopped');
+  assert.equal(result.score, 1);
+  assert.ok(h.calls.some(c => c.method === 'editMessageText' && /quiz band/.test(c.params.text)), 'the owner sees that the quiz stopped');
+});
+
+test('a failing timer step never becomes an unhandled rejection', async () => {
+  const { games, s, timers } = failingSecondPoll();
+  const unhandled: unknown[] = [];
+  const listener = (error: unknown) => { unhandled.push(error); };
+  process.on('unhandledRejection', listener);
+  const warn = console.warn; console.warn = () => { };
+  try {
+    await games.play({ kind: 'quiz', questions: [Q, { question: '2+2?', options: ['3', '4'], answer: 1 }], timer_seconds: 10 });
+    timers.at(-1)!.fn();
+    await new Promise(r => setTimeout(r, 30));
+  } finally { process.off('unhandledRejection', listener); console.warn = warn; }
+  assert.deepEqual(unhandled, []);
   assert.equal(s.data.games?.active, undefined);
   assert.equal(games.results().results[0]!.outcome, 'stopped');
 });

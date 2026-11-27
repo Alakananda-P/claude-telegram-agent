@@ -221,6 +221,7 @@ function againKey(kind: GameKind, level?: Level): string {
 function endKeys(kind: GameKind, level?: Level): Buttons {
   return [[button('🔄 Phir', againKey(kind, level)), button('🎮 Games', 'g:menu')]];
 }
+const errorName = (error: unknown) => error instanceof Error ? error.name : 'unknown';
 const defaultSchedule = (ms: number, fn: () => void) => { const t = setTimeout(fn, ms); t.unref?.(); return { cancel: () => clearTimeout(t) }; };
 
 type Toast = (text?: string) => Promise<void>;
@@ -232,7 +233,8 @@ export class Games {
   constructor(private host: GameHost, private owner: number, private store: GameStore, private options: GameOptions = {}) {}
 
   private now(): number { return this.options.now?.() ?? Date.now(); }
-  private sleep(ms: number): Promise<void> { return this.options.sleep?.(ms) ?? new Promise(r => { const t = setTimeout(r, ms); t.unref?.(); }); }
+  // Awaited inside update handling while no Telegram request is open: an unref'd timer here let Node exit silently.
+  private sleep(ms: number): Promise<void> { return this.options.sleep?.(ms) ?? new Promise(r => setTimeout(r, ms)); }
   private newId(): string { return this.options.newId?.() ?? randomBytes(2).toString('hex'); }
   private pick<T>(items: readonly T[]): T { return this.options.pick?.(items) ?? items[Math.floor(Math.random() * items.length)]!; }
   private rng(): () => number { return this.options.rng ?? Math.random; }
@@ -262,7 +264,7 @@ export class Games {
       const text = 'Quiz restart pe band ho gaya.\n\n/games se phir shuru karo.';
       if (statusId) await this.edit(statusId, text).catch(() => this.host.say(text));
       else await this.host.say(text);
-    });
+    }).catch(error => console.warn(`Quiz restart cleanup failed (${errorName(error)}).`));
   }
   results(limit = 10): { results: GameResult[] } {
     const n = Number.isInteger(limit) ? Math.min(30, Math.max(1, limit)) : 10;
@@ -377,7 +379,9 @@ export class Games {
     this.cancelTimer();
     const wait = Math.max(0, (game.deadline ?? this.now()) - this.now()) + 800;
     const id = game.id, index = game.index ?? 0;
-    this.timer = (this.options.schedule ?? defaultSchedule)(wait, () => { void this.enqueue(() => this.expire(id, index)); });
+    this.timer = (this.options.schedule ?? defaultSchedule)(wait, () => {
+      void this.enqueue(() => this.expire(id, index)).catch(error => console.warn(`Quiz timer step failed (${errorName(error)}).`));
+    });
   }
   private async expire(id: string, index: number): Promise<void> {
     const game = this.data().active;
@@ -394,7 +398,15 @@ export class Games {
     if (game.index >= (game.questions?.length ?? 0)) return this.finishQuiz(game);
     game.locked = false;
     await this.save();
-    await this.sendPoll(game);
+    try { await this.sendPoll(game); }
+    catch (error) {
+      // A quiz that cannot send its next poll is closed, never left half-open.
+      if (this.data().active?.id === game.id) await this.record({ at: new Date().toISOString(), kind: game.kind, title: game.title || kindLabel(game.kind), outcome: 'stopped', score: game.score, total: game.questions?.length }).catch(() => {});
+      const text = `Agla sawal nahi ja paya, quiz band.\nScore ${game.score ?? 0}/${game.questions?.length ?? 0}\n\n/games se phir shuru karo.`;
+      if (game.statusId) await this.edit(game.statusId, text, endKeys(game.kind)).catch(() => this.host.say(text).catch(() => {}));
+      else await this.host.say(text).catch(() => {});
+      throw error;
+    }
     await this.editStatus(game);
   }
   private async editStatus(game: ActiveGame): Promise<void> {

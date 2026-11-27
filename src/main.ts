@@ -88,6 +88,8 @@ async function main(): Promise<void> {
   };
   process.once('SIGTERM', stop);
   process.once('SIGINT', stop);
+  let keepAlive: ReturnType<typeof setInterval> | undefined;
+  process.on('exit', code => { if (!stopping) console.error(`Worker exited without a shutdown request (code ${code}).`); });
   try {
     await controller.prepareSessions(shutdown.signal);
     const checkId = process.env.VERIFY_AGENT_CHECK_ID ?? 'initial-upgrade';
@@ -184,15 +186,27 @@ async function main(): Promise<void> {
     console.log('Private Telegram worker started.');
     controller.start();
     keys.start();
+    // Every background timer is unref'd, so an update handler awaiting one of them could let Node
+    // exit silently with polling unfinished. This handle keeps the worker alive until shutdown.
+    keepAlive = setInterval(() => {}, 2 ** 30);
     await poll(telegram, store, message => controller.handle(message), shutdown.signal, callback => controller.callback(callback), async (_failures, outage) => {
       await telegram.send(config.owner, `Telegram connection recovered after ${Math.ceil(outage.durationMs / 1000)}s. Queued work and stored files are preserved. Check /health for the latest status.`);
     }, {}, answer => controller.pollAnswer(answer));
   } finally {
+    clearInterval(keepAlive);
     stop();
     await controller.stop();
     await keys.stop();
   }
 }
+
+// Never let Node dump an error object (it may carry request secrets); log only its name and code frames.
+function crashLine(kind: string, error: unknown): string {
+  const frames = error instanceof Error ? (error.stack ?? '').split('\n').filter(line => /^\s+at /.test(line)).slice(0, 3).map(line => line.trim().replace(/\(.*[\\/]((?:src|dist)[\\/][^)]+)\)/, '($1)')).join(' | ') : '';
+  return `${kind}: ${error instanceof Error ? error.name : typeof error}${frames ? ' ' + frames : ''}`;
+}
+process.on('unhandledRejection', error => console.error(crashLine('Unhandled async error; the worker keeps running', error)));
+process.on('uncaughtException', error => { console.error(crashLine('Uncaught error; the worker restarts', error)); process.exit(1); });
 
 main().catch(error => {
   // Never dump SDK, fetch, or Telegram error objects containing request secrets.
