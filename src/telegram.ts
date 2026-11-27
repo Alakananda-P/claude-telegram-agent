@@ -152,7 +152,8 @@ export class Telegram {
   }
 
   /** D1: a quick receipt reaction on an owner message the bot handles. */
-  async react(chat: number, id: number, emoji = '👀'): Promise<void> { await this.call('setMessageReaction', { chat_id: chat, message_id: id, reaction: [{ type: 'emoji', emoji }] }); }
+  /** emoji null clears the bot's reaction on that message. */
+  async react(chat: number, id: number, emoji: string | null = '👀'): Promise<void> { await this.call('setMessageReaction', { chat_id: chat, message_id: id, reaction: emoji ? [{ type: 'emoji', emoji }] : [] }); }
 
   async typing(chat: number, action: 'typing' | 'upload_document' | 'upload_photo' = 'typing'): Promise<void> { await this.call('sendChatAction', { chat_id: chat, action }); }
 

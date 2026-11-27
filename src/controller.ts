@@ -54,7 +54,7 @@ export interface Messenger {
   edit(chat: number, id: number, text: string): Promise<void>;
   remove(chat: number, id: number): Promise<void>;
   typing(chat: number, action?: 'typing' | 'upload_document' | 'upload_photo'): Promise<void>;
-  react?(chat: number, id: number, emoji?: string): Promise<void>;
+  react?(chat: number, id: number, emoji?: string | null): Promise<void>;
   panel?(chat: number, text: string, buttons: Buttons, editId?: number, scope?: string): Promise<void>;
   notice?(chat: number, text: string, scope?: string, ttlMs?: number): Promise<void>;
   dismiss?(chat: number, scope?: string, graceMs?: number): Promise<void>;
@@ -132,6 +132,8 @@ export function extendedDeadline(startedAt: string, current: string, timeoutMs: 
 export class Controller {
   private conversation?: { messageContext?: TelegramMessageContext; task: Task; input: SteeringInput; abort: AbortController; cwd: string; ready: Promise<void>; serial: Promise<void>; projectChange?: ProjectChange; changeCancelledByOwner?: boolean; extendDeadline?: () => void; sessionId?: string; model?: string; quick?: Set<AbortController>; resumeTyping?: () => void; planWait?: { token: string; resolve: (decision: PlanDecision) => void } };
   private running?: { abort: AbortController; done: Promise<void>; task: Task };
+  /** Owner messages marked 👀 because they arrived while the bot was busy; cleared once an answer goes out. */
+  private eyes = new Set<number>();
   private projectTransition?: Promise<void>;
   private shuttingDown = false;
   private persistenceFailed = false;
@@ -454,7 +456,13 @@ export class Controller {
       else await this.messenger.send(this.config.owner, safe);
     }
     catch { console.warn('Owner message delivery failed; job state was preserved.'); return; }
+    if (persistent) this.clearEyes();
     await this.resendUnsent();
+  }
+  /** An answer went out: the 👀 receipts it covers are removed (fire-and-forget). */
+  private clearEyes(): void {
+    const ids = [...this.eyes]; this.eyes.clear();
+    for (const id of ids) void Promise.resolve().then(() => this.messenger.react?.(this.config.owner, id, null)).catch(() => {});
   }
   /** Waits between final-answer send attempts when Telegram gives no retry_after (A2). */
   answerRetryMs = [2000, 5000];
@@ -462,7 +470,7 @@ export class Controller {
   private async sayFinal(text: string): Promise<boolean> {
     const safe = redact(text, configSecrets(this.config));
     for (let attempt = 0; ; attempt++) {
-      try { await this.messenger.send(this.config.owner, safe); break; }
+      try { await this.messenger.send(this.config.owner, safe); this.clearEyes(); break; }
       catch (error) {
         const code = error instanceof TelegramError ? error.code : 'unknown';
         if (attempt >= this.answerRetryMs.length || this.shuttingDown) {
@@ -567,8 +575,12 @@ export class Controller {
     // Switching chats or projects is allowed while a task runs; like new work, it cancels the task's pending project change.
     const switching = ['new', 'fresh'].includes(command ?? '') || (['session', 'project'].includes(command ?? '') && !!argument);
     const ownerWork = (!command && !!text) || incomingMedia || command === 'run' || command === 'stop' || switching;
-    // D1: a fire-and-forget 👀 receipt on owner work (never on slash commands or buttons); it can never block or fail handling.
-    if (!command && (text || incomingMedia) && message.message_id !== undefined && !this.persistenceFailed) void Promise.resolve().then(() => this.messenger.react?.(this.config.owner, message.message_id!, '👀')).catch(() => {});
+    // D1: a fire-and-forget 👀 receipt, only while a task is running (the owner's message waits for a step), never on slash commands
+    // or buttons; it is removed as soon as an answer goes out and can never block or fail handling.
+    if (!command && (text || incomingMedia) && message.message_id !== undefined && !this.persistenceFailed && this.running) {
+      const id = message.message_id; this.eyes.add(id);
+      void Promise.resolve().then(() => this.messenger.react?.(this.config.owner, id, '👀')).catch(() => {});
+    }
     if (ownerWork && this.conversation?.projectChange) {
       delete this.conversation.projectChange; this.conversation.changeCancelledByOwner = true;
     }
@@ -973,7 +985,7 @@ export class Controller {
           } catch { await this.automation.finish(task.id, 'failed'); await this.say('Scheduled delivery failed. Open /queue to retry it.'); }
         }
       })();
-      try { await running.done; } finally { this.running = undefined; }
+      try { await running.done; } finally { this.running = undefined; this.clearEyes(); }
     }
   }
 

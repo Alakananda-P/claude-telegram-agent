@@ -1093,14 +1093,20 @@ test('A3/A5: a failed task still sends its changed files, and a multi-part answe
   assert.equal(replies.filter(r => /Part one/.test(r)).length, 1); assert.ok(!replies.some(r => /Use \/files/.test(r)));
 });
 
-test('D1: owner work gets a fire-and-forget eyes reaction; slash commands do not, and a failing reaction never blocks', async () => {
-  const { bot, sender, calls } = await setup(); const reactions: [number, string | undefined][] = [];
-  Object.assign(sender, { async react(_chat: number, id: number, emoji?: string) { reactions.push([id, emoji]); if (id === 3) throw new Error('reaction refused'); } });
-  await bot.handle({ ...message('First'), message_id: 1 }); await bot.idle();
-  await bot.handle({ ...message('/status'), message_id: 2 }); await new Promise(r => setTimeout(r, 5));
-  assert.deepEqual(reactions, [[1, '👀']]);
-  await bot.handle({ ...message('Second'), message_id: 3 }); await bot.idle();
-  assert.deepEqual(reactions.map(r => r[0]), [1, 3]); assert.equal(calls.length, 2, 'a refused reaction does not stop the task');
+test('D1: 👀 only while a task runs (never on commands, never when idle), cleared once the answer is out; a failing reaction never blocks', async () => {
+  let release!: () => void; let began!: () => void;
+  const ready = new Promise<void>(resolve => { began = resolve; }); const wait = new Promise<void>(resolve => { release = resolve; }); const calls: AgentRequest[] = [];
+  const { bot, sender } = await setup({ async run(r, emit) { calls.push(r); if (calls.length === 1) { began(); await wait; } await emit({ type: 'session', id: 'same-chat' }); return { session: 'same-chat', text: 'Done', cumulativeCost: 0 }; } });
+  const reactions: [number, string | null | undefined][] = [];
+  Object.assign(sender, { async react(_chat: number, id: number, emoji?: string | null) { reactions.push([id, emoji]); if (id === 4) throw new Error('reaction refused'); } });
+  await bot.handle({ ...message('First'), message_id: 1 }); await ready;
+  assert.deepEqual(reactions, [], 'no receipt when the bot was idle');
+  await bot.handle({ ...message('Busy steer'), message_id: 2 }); await bot.handle({ ...message('/status'), message_id: 3 }); await bot.handle({ ...message('Another'), message_id: 4 });
+  await new Promise(r => setTimeout(r, 5));
+  assert.deepEqual(reactions.filter(r => r[1] === '👀').map(r => r[0]), [2, 4], 'busy messages get 👀, commands never');
+  release(); await bot.idle();
+  assert.deepEqual(reactions.filter(r => r[1] === null).map(r => r[0]).sort(), [2, 4], 'receipts are cleared after the answer');
+  assert.ok(calls.length >= 1, 'a refused reaction does not stop the task');
 });
 
 test('D2: a reply carries who sent the target, its redacted text or the selected quote, and saves replied-to media', async () => {
