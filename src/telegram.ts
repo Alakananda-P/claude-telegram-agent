@@ -1,5 +1,5 @@
 import { setTimeout as delay } from 'node:timers/promises';
-import { chunks, redact, type Message } from './safety.js';
+import { chunks, maskTokens, redact, type Message } from './safety.js';
 import type { Buttons } from './ui.js';
 import type { StateStore } from './state.js';
 import { Agent, fetch, FormData } from 'undici';
@@ -14,7 +14,41 @@ export function createTelegramDispatcher(lookup?: LookupFunction): Agent {
 const telegramDispatcher = createTelegramDispatcher();
 
 export class TelegramError extends Error {
+  description?: string;
   constructor(public code: number, public retryAfter = 0, public unchanged = false, public networkCode?: string, public messageMissing = false, public deletionDenied = false, public formatRejected = false) { super(`Telegram request failed (status ${code}).`); }
+}
+
+/** telegram_call: owner-chat-only Bot API methods. Admin, webhook/update, payment, business and profile methods are never reachable (profile edits go through set_bot_profile approval). */
+export const TELEGRAM_CALL_METHODS = ['sendMessage', 'editMessageText', 'editMessageCaption', 'editMessageReplyMarkup', 'setMessageReaction', 'pinChatMessage', 'unpinChatMessage', 'unpinAllChatMessages', 'forwardMessage', 'copyMessage', 'forwardMessages', 'copyMessages', 'sendPhoto', 'sendDocument', 'sendVideo', 'sendAudio', 'sendVoice', 'sendAnimation', 'sendVideoNote', 'sendMediaGroup', 'sendSticker', 'sendPoll', 'stopPoll', 'sendDice', 'sendLocation', 'sendVenue', 'sendContact', 'sendChatAction', 'setMyCommands', 'getMyCommands', 'deleteMyCommands', 'setChatMenuButton', 'getChatMenuButton', 'getMe', 'getChat', 'getUserProfilePhotos', 'getFile'];
+const NO_CHAT_METHODS = new Set(['getMe', 'getFile', 'getUserProfilePhotos', 'setMyCommands', 'getMyCommands', 'deleteMyCommands']);
+export class TelegramCallError extends Error {}
+function cleanStrings(value: unknown, secrets: string[]): unknown {
+  if (typeof value === 'string') return maskTokens(redact(value, secrets));
+  if (Array.isArray(value)) return value.map(v => cleanStrings(v, secrets));
+  return value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).map(([k, v]) => [k, cleanStrings(v, secrets)])) : value;
+}
+/** Callback, login, web-app, payment and request buttons could impersonate bot controls or owner actions: only URL/copy inline buttons and plain-text keyboards pass. */
+function checkMarkup(markup: unknown): void {
+  if (!markup || typeof markup !== 'object') return;
+  const m = markup as { inline_keyboard?: unknown; keyboard?: unknown };
+  const rows = (k: unknown) => Array.isArray(k) && k.every(Array.isArray) ? (k as unknown[][]).flat() : null;
+  const inline = m.inline_keyboard === undefined ? [] : rows(m.inline_keyboard), keys = m.keyboard === undefined ? [] : rows(m.keyboard);
+  if (!inline || !keys || inline.some(b => !b || typeof b !== 'object' || Object.keys(b).some(k => !['text', 'url', 'copy_text', 'style', 'icon_custom_emoji_id'].includes(k)) || !('url' in b || 'copy_text' in b))
+    || keys.some(b => typeof b !== 'string' && (!b || typeof b !== 'object' || Object.keys(b).some(k => !['text', 'style', 'icon_custom_emoji_id'].includes(k)))))
+    throw new TelegramCallError('reply_markup may contain only URL/copy-text inline buttons or plain-text keyboard buttons; callback, login, web-app, payment and request buttons are reserved for the bot.');
+}
+/** Owner-only payload: chat ids forced to the owner, visible strings redacted, other-chat routing (inline/business ids) refused. */
+export function telegramCallPayload(method: string, params: Record<string, unknown>, owner: number, botId: number, secrets: string[] = []): Record<string, unknown> {
+  if (!TELEGRAM_CALL_METHODS.includes(method)) throw new TelegramCallError(`Telegram method "${method}" is not allowed. Allowed: ${TELEGRAM_CALL_METHODS.join(', ')}. Webhook/update, admin (ban/restrict/promote), payment/stars/gift/business and setMy* profile methods are never available; use set_bot_profile for profile changes.`);
+  const p = cleanStrings(params, secrets) as Record<string, unknown>;
+  if ('inline_message_id' in p || 'business_connection_id' in p) throw new TelegramCallError('inline_message_id and business_connection_id are not allowed: telegram_call works only in the owner chat.');
+  checkMarkup(p.reply_markup);
+  if (!NO_CHAT_METHODS.has(method)) p.chat_id = owner;
+  if ('from_chat_id' in p || /^(forward|copy)Message/.test(method)) p.from_chat_id = owner;
+  if (p.reply_parameters && typeof p.reply_parameters === 'object') p.reply_parameters = { ...p.reply_parameters as object, chat_id: owner };
+  if (/MyCommands$/.test(method)) p.scope = { type: 'chat', chat_id: owner };
+  if (method === 'getUserProfilePhotos') { p.user_id ??= owner; if (p.user_id !== owner && p.user_id !== botId) throw new TelegramCallError('getUserProfilePhotos is limited to the owner and this bot.'); }
+  return p;
 }
 
 export interface MessageListOptions { limit?: number; beforeMessageId?: number; messageId?: number; includeUi?: boolean }
@@ -79,7 +113,7 @@ export class Telegram {
         await delay(retryAfter * 1000, undefined, { signal });
         continue;
       }
-      throw new TelegramError(code, retryAfter, code === 400 && /message is not modified/i.test(body.description ?? ''), undefined, code === 400 && /message to delete not found/i.test(body.description ?? ''), code === 400 && /message (?:can't|cannot|can not) be deleted|message is too old/i.test(body.description ?? ''), code === 400 && /can't parse entities|cannot parse entities|unsupported start tag|can't find end tag/i.test(body.description ?? ''));
+      throw Object.assign(new TelegramError(code, retryAfter, code === 400 && /message is not modified/i.test(body.description ?? ''), undefined, code === 400 && /message to delete not found/i.test(body.description ?? ''), code === 400 && /message (?:can't|cannot|can not) be deleted|message is too old/i.test(body.description ?? ''), code === 400 && /can't parse entities|cannot parse entities|unsupported start tag|can't find end tag/i.test(body.description ?? '')), { description: body.description?.slice(0, 300) });
     }
     throw new TelegramError(429);
   }
@@ -395,6 +429,20 @@ export class Telegram {
     if (change.removePhoto) { await this.removeMyProfilePhoto(); done.push('photo removed'); }
     if (change.photo) { await this.setMyProfilePhoto(change.photo.name, change.photo.bytes); done.push('photo'); }
     return done;
+  }
+
+  /** telegram_call: an allowlisted Bot API call in the owner chat; files upload as multipart (attach://name or a top-level field). */
+  async ownerCall(owner: number, method: string, params: Record<string, unknown> = {}, files: { name: string; filename: string; bytes: Uint8Array }[] = []): Promise<unknown> {
+    const secrets = [this.token, ...this.secrets], p = telegramCallPayload(method, params, owner, Number(this.token.split(':')[0]), secrets);
+    if (!files.length) return this.call(method, p);
+    const form = new FormData(), direct = new Map<string, string>();
+    for (const [key, value] of Object.entries(p)) if (typeof value === 'string' && value.startsWith('attach://') && files.some(f => f.name === value.slice(9))) { direct.set(value.slice(9), key); delete p[key]; }
+    for (const [key, value] of Object.entries(p)) form.set(key, typeof value === 'object' && value !== null ? JSON.stringify(value) : String(value));
+    for (const f of files) {
+      for (const secret of secrets.filter(Boolean)) if (Buffer.from(f.bytes).includes(Buffer.from(secret))) throw new TelegramCallError('A file contains a configured secret; upload refused.');
+      form.set(direct.get(f.name) ?? f.name, new Blob([new Uint8Array(f.bytes)]), f.filename);
+    }
+    return this.call(method, form);
   }
 
   async download(fileId: string): Promise<Buffer> {

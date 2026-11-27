@@ -8,7 +8,7 @@ import { configSecrets, type Config } from './config.js';
 import { AgentError, AgentApiError, AgentSafetyError, type Runner, type PlanDecision } from './agent.js';
 import { BUSY_API_KINDS, PAUSE_API_KINDS } from './recovery.js';
 import { StateStore, StateSaveError } from './state.js';
-import { authorized, projectName, redact, privatePreview, safeFile, sendableFile, secretPath, detectTokens, maskTokens, PathAccessError, type Message, type Callback } from './safety.js';
+import { authorized, projectName, redact, privatePreview, safeFile, safeJson, sendableFile, secretPath, detectTokens, maskTokens, PathAccessError, type Message, type Callback } from './safety.js';
 import { EFFORTS, effectiveSettings, settingsLabel, modelLabel, familyOf, familySettings, settingsFamily, type AgentSettings, type Effort } from './settings.js';
 import { ModelCatalog, type CatalogModel } from './models.js';
 import { PriceBook } from './pricing.js';
@@ -64,6 +64,7 @@ export interface Messenger {
   queueClear?(chat: number): Promise<void>;
   botProfile?(): Promise<BotProfile>;
   applyProfile?(change: ProfileChange): Promise<string[]>;
+  ownerCall?(owner: number, method: string, params?: Record<string, unknown>, files?: { name: string; filename: string; bytes: Uint8Array }[]): Promise<unknown>;
 }
 
 const HELP = `Your Claude assistant
@@ -1163,7 +1164,7 @@ export class Controller {
         }, telegram: this.messenger.listBotMessages && this.messenger.deleteBotMessages ? {
           list: async a => this.messenger.listBotMessages!(this.config.owner, { limit: a.limit, messageId: a.message_id, beforeMessageId: a.include_current_task ? undefined : active.messageContext?.beforeMessageId, includeUi: a.include_ui }),
           delete: ids => this.messenger.deleteBotMessages!(this.config.owner, ids, abort.signal)
-        } : undefined, automation: this.automation, transcribe: async (file, language) => { progress = 'Transcribing audio…'; try { return await this.transcriber.transcribe(cwd, file, language, abort.signal); } finally { progress = 'Thinking…'; } }, deliver: async (file, preview) => { await sendOnce(file, preview); }, backup: () => this.exportBackup() } }, async event => {
+        } : undefined, telegramApi: this.messenger.ownerCall ? { call: input => this.telegramCall(cwd, input), clearReactions: ids => this.clearReactions(ids, abort.signal) } : undefined, automation: this.automation, transcribe: async (file, language) => { progress = 'Transcribing audio…'; try { return await this.transcriber.transcribe(cwd, file, language, abort.signal); } finally { progress = 'Thinking…'; } }, deliver: async (file, preview) => { await sendOnce(file, preview); }, backup: () => this.exportBackup() } }, async event => {
         if (event.type === 'effect' || event.type === 'progress' || event.type === 'step') { touch(); helperStatus?.touch(); }
         if (event.type === 'session') {
           active.sessionId = event.id; await bind(event.id);
@@ -1461,6 +1462,26 @@ export class Controller {
     for (const batch of batches) await this.dismiss('batch-' + batch.id);
     await this.uploadReceipt();
     await this.dismiss('controls');
+  }
+  /** telegram_call: files pass the deliver_file gate; getFile also saves into uploads/. Result JSON is redacted and bounded. */
+  async telegramCall(root: string, input: { method: string; params?: Record<string, unknown>; files?: Record<string, string> }): Promise<unknown> {
+    if (!this.messenger.ownerCall) throw new Error('Telegram API calls are unavailable.');
+    const files = Object.entries(input.files ?? {});
+    if (files.length > 10) throw new PathAccessError('Attach at most 10 files per call.');
+    const uploads = [];
+    for (const [name, relative] of files) { const { file, bytes } = await sendableFile(root, relative, configSecrets(this.config)); uploads.push({ name, filename: path.basename(file), bytes }); }
+    let result = await this.messenger.ownerCall(this.config.owner, input.method, input.params ?? {}, uploads);
+    const filePath = (result as { file_path?: string } | null)?.file_path;
+    if (input.method === 'getFile' && typeof filePath === 'string' && typeof input.params?.file_id === 'string') result = { ...result as object, saved: (await this.storeUpload(root, input.params.file_id, path.basename(filePath))).relative };
+    const json = safeJson(result ?? null, configSecrets(this.config));
+    return json.length > 6000 ? { result: json.slice(0, 6000), truncated: true } : { result: JSON.parse(json) };
+  }
+  /** clear_reactions: an empty reaction list per owner-chat message; per-id failures are counted, never fatal. */
+  async clearReactions(ids: number[], signal?: AbortSignal): Promise<{ cleared: number; failed: number }> {
+    if (!this.messenger.react) throw new Error('Reactions are unavailable.');
+    let cleared = 0, failed = 0;
+    for (const id of ids.slice(0, 300)) { signal?.throwIfAborted(); try { await this.messenger.react!(this.config.owner, id, null); cleared++; } catch { failed++; } }
+    return { cleared, failed };
   }
   private async deliver(root: string, relative: string, preview?: string): Promise<void> {
     const { file, bytes } = await sendableFile(root, relative, configSecrets(this.config));
