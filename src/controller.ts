@@ -191,6 +191,17 @@ export class Controller {
   /** D4: one live status message per running background job (outlives its task). */
   private jobStatus = new Map<string, LiveStatus>();
   statusIntervalMs = 50_000;
+  /** Telegram shows no online status for bots, so the header says "typing…" while background work runs. */
+  backgroundTypingMs = 4000;
+  private helperGroups = 0;
+  private bgTyping?: ReturnType<typeof setInterval>;
+  private syncBackgroundTyping(): void {
+    const active = () => this.jobStatus.size > 0 || this.helperGroups > 0;
+    if (active() && !this.bgTyping) {
+      const tick = () => { if (active() && !this.shuttingDown) void this.messenger.typing(this.config.owner).catch(() => {}); };
+      this.bgTyping = setInterval(tick, this.backgroundTypingMs); this.bgTyping.unref?.(); tick();
+    } else if (!active() && this.bgTyping) { clearInterval(this.bgTyping); this.bgTyping = undefined; }
+  }
 
   constructor(private config: Config, private store: StateStore, private messenger: Messenger, private runner: Runner, private ledger?: UsageLedger, private titles?: TitleGenerator, private keys = new KeyPool(config, store), private transcriber: TranscriptionService = new Transcriber(config, store), private live?: QuickResponder) {
     this.memory = new SharedMemory(config.dataDir, configSecrets(config));
@@ -205,7 +216,7 @@ export class Controller {
       const source = this.resolveChat(job.chatKey);
       const record = store.data.conversations?.find(c => c.id === source && !c.trashedAt);
       const output = await this.background.readTail(job.id, 900);
-      const live = this.jobStatus.get(job.id); this.jobStatus.delete(job.id);
+      const live = this.jobStatus.get(job.id); this.jobStatus.delete(job.id); this.syncBackgroundTyping();
       await live?.finish(job.status === 'completed', job.status.replaceAll('_', ' '));
       const text = redact(`${job.status === 'completed' ? '✅' : 'ℹ️'} ${job.name}: ${job.status.replaceAll('_', ' ')}.\n${record ? 'Chat: ' + sessionTitle(record) : 'Project: ' + job.project}${output.text ? '\n\n' + output.text : ''}\n\nFull output is in /background.`, configSecrets(config));
       if (record && !store.data.purgedSessions?.includes(source)) await this.chats.append(source, { role: 'assistant', text, eventId: 'background-' + job.id });
@@ -1159,7 +1170,7 @@ export class Controller {
         settings: selected, memoryEnabled: this.store.data.memoryEnabled !== false, sessions: this.sessions.scoped(task.chatKey, project), projects: projectTools, steering: active.input,
         planApproval: task.interactive ? (plan, signal) => this.askPlan(active, plan, signal) : undefined, planMode: task.planMode,
         workspace: { root: cwd, project, upgrades: { publish: (directory, summary) => this.publishBotUpgrade(cwd, directory, summary) }, profile: this.messenger.botProfile ? { get: () => this.messenger.botProfile!(), request: change => this.requestProfileChange(cwd, change) } : undefined, background: {
-          start: async input => { const job = await this.background.start({ ...input, root: cwd, project, chatKey: this.resolveChat(task.chatKey) }); if (!this.jobStatus.has(job.id)) this.jobStatus.set(job.id, new LiveStatus(this.messenger, this.config.owner, `Background job “${job.name}”`, this.statusIntervalMs, Date.now, () => this.background.activity(job.id))); return job; },
+          start: async input => { const job = await this.background.start({ ...input, root: cwd, project, chatKey: this.resolveChat(task.chatKey) }); if (!this.jobStatus.has(job.id)) this.jobStatus.set(job.id, new LiveStatus(this.messenger, this.config.owner, `Background job “${job.name}”`, this.statusIntervalMs, Date.now, () => this.background.activity(job.id))); this.syncBackgroundTyping(); return job; },
           list: (offset, limit) => this.background.list(offset, limit), read: (id, offset, limit) => this.background.read(id, offset, limit), cancel: id => this.background.cancel(id)
         }, telegram: this.messenger.listBotMessages && this.messenger.deleteBotMessages ? {
           list: async a => this.messenger.listBotMessages!(this.config.owner, { limit: a.limit, messageId: a.message_id, beforeMessageId: a.include_current_task ? undefined : active.messageContext?.beforeMessageId, includeUi: a.include_ui }),
@@ -1194,8 +1205,8 @@ export class Controller {
         else if (event.type === 'notice') { if (task.interactive) await this.say(redact(event.text, configSecrets(this.config)), true); }
         else if (event.type === 'helpers') {
           pendingHelpers = event.count;
-          if (event.count > 0) { helperStatus ??= new LiveStatus(this.messenger, this.config.owner, '', this.statusIntervalMs); helperStatus.description = `${event.count} helper${event.count === 1 ? '' : 's'}`; helperStatus.touch(); }
-          else if (helperStatus) { const done = helperStatus; helperStatus = undefined; done.description = 'Helpers'; void done.finish(true); }
+          if (event.count > 0) { if (!helperStatus) { helperStatus = new LiveStatus(this.messenger, this.config.owner, '', this.statusIntervalMs); this.helperGroups++; this.syncBackgroundTyping(); } helperStatus.description = `${event.count} helper${event.count === 1 ? '' : 's'}`; helperStatus.touch(); }
+          else if (helperStatus) { const done = helperStatus; helperStatus = undefined; done.description = 'Helpers'; void done.finish(true); this.helperGroups = Math.max(0, this.helperGroups - 1); this.syncBackgroundTyping(); }
         }
         else if (event.type === 'held_open') { const { type: _type, ...why } = event; console.warn(JSON.stringify({ event: 'turn_held_open', task: task.id, ...why })); }
         else if (event.type === 'idle_closed') console.warn(JSON.stringify({ event: 'turn_idle_closed', task: task.id, helpers: event.helpers }));
@@ -1267,7 +1278,7 @@ export class Controller {
       ready(); active.input.close(); for (const quick of active.quick ?? []) quick.abort(); await active.serial;
       clearTimeout(timeout); clearTimeout(warning); clearInterval(heartbeat);
       await finishIndicator();
-      if (helperStatus) { helperStatus.description = 'Helpers'; void helperStatus.finish(status === 'completed', status === 'completed' ? '' : 'stopped with the task'); helperStatus = undefined; }
+      if (helperStatus) { helperStatus.description = 'Helpers'; void helperStatus.finish(status === 'completed', status === 'completed' ? '' : 'stopped with the task'); helperStatus = undefined; this.helperGroups = Math.max(0, this.helperGroups - 1); this.syncBackgroundTyping(); }
       // W47-02/W47-07: changed files follow in the background for every outcome (also timeout and failure), so the queue moves on now.
       if (!this.shuttingDown && !this.persistenceFailed) this.afterAnswer(() => ship(true));
       this.store.data.lastJob = { ...job, status, endReason: task.failureKind, finishedAt: new Date().toISOString() };

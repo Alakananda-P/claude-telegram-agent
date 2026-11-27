@@ -1166,3 +1166,15 @@ test('E3: the Claude runner never resumes a provider-* session id', () => {
   assert.equal(resumeSession('provider-2', 'claude-opus-4-1', latest), undefined);
   assert.equal(resumeSession(undefined, 'claude-opus-4-1', latest), undefined);
 });
+
+test('header shows typing while background work runs and stops when it ends (bots have no online status)', async () => {
+  const { bot, sender } = await setup(); const typing: string[] = [];
+  (sender as { typing: (chat: number, action?: string) => Promise<void> }).typing = async (_chat, action) => { typing.push(action ?? 'typing'); };
+  const b = bot as unknown as { backgroundTypingMs: number; jobStatus: Map<string, unknown>; syncBackgroundTyping(): void };
+  b.backgroundTypingMs = 10; b.jobStatus.set('job-1', {}); b.syncBackgroundTyping();
+  await new Promise(r => setTimeout(r, 45));
+  assert.ok(typing.length >= 3, 'typing repeats while a background job runs');
+  b.jobStatus.delete('job-1'); b.syncBackgroundTyping(); const seen = typing.length;
+  await new Promise(r => setTimeout(r, 40));
+  assert.equal(typing.length, seen, 'typing stops when no background work is left');
+});
