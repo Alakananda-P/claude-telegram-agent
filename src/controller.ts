@@ -36,6 +36,8 @@ import { ProjectCatalog, ProjectError } from './projects.js';
 import { projectAcceptsWork } from './project-state.js';
 import type { ProjectToolContext } from './project-tools.js';
 import { ProjectUI, type ProjectTab } from './project-ui.js';
+import { Games, type PlayInput } from './games.js';
+import type { PollAnswer } from './polling.js';
 
 interface ProjectChange { action: 'switch' | 'archive' | 'trash'; project: string; continueTask?: string }
 interface ProfileRequest { id: string; change: ProfileChange; summary: string; expires: number }
@@ -65,6 +67,7 @@ export interface Messenger {
   botProfile?(): Promise<BotProfile>;
   applyProfile?(change: ProfileChange): Promise<string[]>;
   ownerCall?(owner: number, method: string, params?: Record<string, unknown>, files?: { name: string; filename: string; bytes: Uint8Array }[]): Promise<unknown>;
+  gameCall?(owner: number, method: string, params?: Record<string, unknown>): Promise<unknown>;
 }
 
 const HELP = `Your Claude assistant
@@ -97,6 +100,7 @@ Voice notes run immediately as spoken instructions. Audio files, photos, videos,
 /queue — saved tasks, schedules, pause/resume and explicit retry
 New text and voice messages steer your active conversation; no separate task is queued.
 Claude can use tools without slash commands, including removing its obsolete messages. Ask naturally or reply to an old bot message to identify it. Telegram deletion normally works within 48 hours and keeps saved chats, memory and files.
+/games — MCQ quiz, rapid fire, tic tac toe and hangman
 /schedules — reminders and recurring tasks; ask Claude to create or edit them
 /background — independent scripts, status, output and cancellation
 /clock — current India time; specify other timezones in your task
@@ -188,6 +192,7 @@ export class Controller {
   private pendingRollback?: { token: string; expires: number };
   private upgradeRequests = new Map<string, UpgradeRequest>();
   private profileRequests = new Map<string, ProfileRequest>();
+  private games?: Games;
   /** D4: one live status message per running background job (outlives its task). */
   private jobStatus = new Map<string, LiveStatus>();
   statusIntervalMs = 50_000;
@@ -352,6 +357,22 @@ export class Controller {
     await this.say(`Upgrade deployment started for ${request.commit.slice(0, 12)}. Existing chats, memory and files are preserved by the persistent disk.`);
   }
 
+  private gameHost(): Games {
+    if (!this.messenger.gameCall) throw new ProjectError('Games are unavailable.');
+    return this.games ??= new Games({
+      call: (method, params) => this.messenger.gameCall!(this.config.owner, method, params),
+      panel: (text, buttons) => this.panel(text, buttons),
+      say: text => this.say(text),
+    }, this.config.owner, this.store);
+  }
+  async pollAnswer(answer: PollAnswer): Promise<void> {
+    if (!this.messenger.gameCall) return;
+    try { await this.gameHost().onPollAnswer(answer); }
+    catch (error) {
+      if (error instanceof TelegramError && [401, 403, 409].includes(error.code)) throw error;
+      console.warn(`Quiz answer could not be handled (${error instanceof Error ? error.name : 'unknown'}).`);
+    }
+  }
   async menu(): Promise<void> {
     const project = await this.projects.get(this.store.data.project);
     await this.panel(`Claude · Your workspace\n\n${settingsLabel(this.resolved(this.settings))}\nProject: ${project.name}\nMemory: ${this.store.data.memoryEnabled !== false ? 'ON · shared across chats' : 'OFF'}\n${this.running ? 'Working on your task…' : 'Ready for your next task.'}\n\nSend a message or choose a control below.`, HOME);
@@ -359,10 +380,21 @@ export class Controller {
 
   async callback(callback: Callback): Promise<void> {
     if (!callback.message || !authorized({ ...callback.message, from: callback.from }, this.config.owner)) return;
-    await this.messenger.acknowledge?.(callback.id).catch(() => {});
     const data = callback.data ?? '';
+    if (data.startsWith('g:')) {
+      this.panelId = callback.message.message_id;
+      try { await this.gameHost().onCallback(callback); }
+      catch (error) {
+        await this.messenger.acknowledge?.(callback.id).catch(() => {});
+        if (error instanceof TelegramError && [401, 403, 409].includes(error.code)) throw error;
+        console.warn(`Game button could not be handled (${error instanceof Error ? error.name : 'unknown'}); the bot keeps running.`);
+        await this.say('That game action failed, but the bot is still running. Try /games again.').catch(() => {});
+      } finally { this.panelId = undefined; }
+      return;
+    }
+    await this.messenger.acknowledge?.(callback.id).catch(() => {});
     const projectCallback = /^(pnew|ppage (?:active|archived|trashed) \d+|(?:pinfo|pedit|parchive|parchok|ptrash|ptrashok|prestore|ppurge) [a-zA-Z0-9][a-zA-Z0-9_-]{0,47}|pfiles [a-zA-Z0-9][a-zA-Z0-9_-]{0,47} \d+|ppurgeok [a-f0-9]{8})$/.test(data);
-    if (!/^(menu|help|status|stop|rename|new chat|fresh|model(?: [a-zA-Z0-9._:/-]{1,96})?|efforts(?: (?:low|medium|high|xhigh|max))?|fast(?: (?:on|off))?|token count|cost|memory(?: (?:on|off|confirm-clear|clear))?|session(?: [a-zA-Z0-9_-]+)?|sessionpage \d+|history [a-zA-Z0-9_-]+ \d+|projects|project [a-zA-Z0-9_-]+|files|batch|process(?: [a-zA-Z0-9_-]+)?|discard [a-zA-Z0-9_-]+|queue(?: (?:pause|resume))?|task(?:cancel|first|retry|confirm) [a-zA-Z0-9_-]+|schedules|schedule(?:pause|resume|delete) [a-zA-Z0-9_-]+|trash|(?:delete|trashmove|restore|purge|purgeconfirm) [a-zA-Z0-9_-]+|backup(?: (?:export|files|daily|off))?|restorebackup confirm|health(?: retry)?|keys(?: retired)?|keyhistory [a-f0-9]{16} \d+|keyremove [a-f0-9]{16}|background(?: \d+)?|backgroundlog [a-f0-9]{16} \d+|backgroundcancel [a-f0-9]{16}|plan(?:ok|no) [a-f0-9]{8}|update(?:ok|no) [a-f0-9]{8}|deupdate(?:ok|no) [a-f0-9]{8}|upgrade(?:confirm|cancel) [a-f0-9]{8}|profile(?:ok|no) [a-f0-9]{8}|clock)$/.test(data) && !projectCallback) return;
+    if (!/^(menu|help|status|stop|rename|new chat|fresh|model(?: [a-zA-Z0-9._:/-]{1,96})?|efforts(?: (?:low|medium|high|xhigh|max))?|fast(?: (?:on|off))?|token count|cost|memory(?: (?:on|off|confirm-clear|clear))?|session(?: [a-zA-Z0-9_-]+)?|sessionpage \d+|history [a-zA-Z0-9_-]+ \d+|projects|project [a-zA-Z0-9_-]+|files|batch|process(?: [a-zA-Z0-9_-]+)?|discard [a-zA-Z0-9_-]+|queue(?: (?:pause|resume))?|task(?:cancel|first|retry|confirm) [a-zA-Z0-9_-]+|schedules|schedule(?:pause|resume|delete) [a-zA-Z0-9_-]+|trash|(?:delete|trashmove|restore|purge|purgeconfirm) [a-zA-Z0-9_-]+|backup(?: (?:export|files|daily|off))?|restorebackup confirm|health(?: retry)?|keys(?: retired)?|keyhistory [a-f0-9]{16} \d+|keyremove [a-f0-9]{16}|background(?: \d+)?|backgroundlog [a-f0-9]{16} \d+|backgroundcancel [a-f0-9]{16}|plan(?:ok|no) [a-f0-9]{8}|update(?:ok|no) [a-f0-9]{8}|deupdate(?:ok|no) [a-f0-9]{8}|upgrade(?:confirm|cancel) [a-f0-9]{8}|profile(?:ok|no) [a-f0-9]{8}|clock|games)$/.test(data) && !projectCallback) return;
     this.panelId = callback.message.message_id;
     try {
       if (data === 'memory confirm-clear') {
@@ -443,6 +475,7 @@ export class Controller {
   }
   start(): void {
     if (this.timer) return;
+    if (this.messenger.gameCall) this.gameHost().restore();
     // M6: only a failed state save pauses new tasks; any other tick error is logged and retried in 5 s.
     const tick = () => void this.tick().catch(error => {
       if (error instanceof StateSaveError) { this.persistenceFailed = true; console.error('Automation storage failed; queue stopped.'); }
@@ -453,6 +486,7 @@ export class Controller {
 
   async stop(): Promise<void> {
     this.shuttingDown = true;
+    this.games?.dispose();
     clearInterval(this.timer);
     for (const timer of this.albumTimers.values()) clearTimeout(timer);
     for (const timer of this.autoRetryTimers.values()) clearTimeout(timer);
@@ -615,6 +649,7 @@ export class Controller {
       return this.say(command === 'planok' ? 'Plan approved. Claude starts the work in auto mode.' : 'Claude keeps planning. Reply with what to change.');
     }
     if (command === 'help') return this.panel(HELP);
+    if (command === 'games') { try { await this.gameHost().menu(); } catch (error) { await this.say(error instanceof ProjectError ? error.message : 'Games could not open. Try again.'); } return; }
     try { if (await this.extraCommand(command, argument, messageContext)) return; }
     catch (error) { return this.say(error instanceof ProjectError ? error.message : 'Could not complete that action. Check the selected item, storage and command. Existing data is kept.'); }
     if (command === 'rename' && !argument) return this.panel('Send /rename followed by the new title, or ask Claude to rename this chat.');
@@ -1175,7 +1210,7 @@ export class Controller {
         }, telegram: this.messenger.listBotMessages && this.messenger.deleteBotMessages ? {
           list: async a => this.messenger.listBotMessages!(this.config.owner, { limit: a.limit, messageId: a.message_id, beforeMessageId: a.include_current_task ? undefined : active.messageContext?.beforeMessageId, includeUi: a.include_ui }),
           delete: ids => this.messenger.deleteBotMessages!(this.config.owner, ids, abort.signal)
-        } : undefined, telegramApi: this.messenger.ownerCall ? { call: input => this.telegramCall(cwd, input), clearReactions: ids => this.clearReactions(ids, abort.signal) } : undefined, automation: this.automation, transcribe: async (file, language) => { progress = 'Transcribing audio…'; try { return await this.transcriber.transcribe(cwd, file, language, abort.signal); } finally { progress = 'Thinking…'; } }, deliver: async (file, preview) => { await sendOnce(file, preview); }, backup: () => this.exportBackup() } }, async event => {
+        } : undefined, telegramApi: this.messenger.ownerCall ? { call: input => this.telegramCall(cwd, input), clearReactions: ids => this.clearReactions(ids, abort.signal) } : undefined, games: this.messenger.gameCall ? { play: (input: PlayInput) => this.gameHost().play(input), results: (limit?: number) => this.gameHost().results(limit ?? 10) } : undefined, automation: this.automation, transcribe: async (file, language) => { progress = 'Transcribing audio…'; try { return await this.transcriber.transcribe(cwd, file, language, abort.signal); } finally { progress = 'Thinking…'; } }, deliver: async (file, preview) => { await sendOnce(file, preview); }, backup: () => this.exportBackup() } }, async event => {
         if (event.type === 'effect' || event.type === 'progress' || event.type === 'step') { touch(); helperStatus?.touch(); }
         if (event.type === 'session') {
           active.sessionId = event.id; await bind(event.id);

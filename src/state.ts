@@ -9,6 +9,7 @@ import { projectRecordSchema, type ProjectRecord } from './project-state.js';
 import type { ModelCatalogState } from './models.js';
 import type { PricingState } from './pricing.js';
 import type { UpdateRecord } from './updater.js';
+import type { GamesData } from './games.js';
 
 const identifier = z.string().regex(/^[a-zA-Z0-9_-]{1,100}$/);
 const projectId = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,47}$/);
@@ -90,6 +91,8 @@ export interface State {
   bindings?: Record<string, string>; drafts?: Record<string, string>; purgedSessions?: string[];
   resumeDisabled?: string[]; sessionCredentials?: Record<string, string>; disabledKeyIds?: string[]; activeKeyId?: string;
   freshContexts?: Record<string, string>;
+  /** Active Telegram game and recent results (new optional field). */
+  games?: GamesData;
   health?: { telegramAt?: string; claudeAt?: string; apiError?: string; lastAlert?: string; lastBackupAt?: string; activeCredential?: number; disabledCredentials?: number[]; telegramOutage?: Omit<TelegramOutage, 'endedAt' | 'durationMs'>; telegramOutages?: TelegramOutage[] };
 }
 

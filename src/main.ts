@@ -159,6 +159,7 @@ async function main(): Promise<void> {
       { command: 'schedules', description: 'Reminders and recurring tasks' },
       { command: 'background', description: 'Background scripts, output and stop controls' },
       { command: 'clock', description: 'Current India time' },
+      { command: 'games', description: 'Quiz, rapid fire, tic tac toe, hangman' },
       { command: 'trash', description: 'Restore deleted chats within 48 hours' },
       { command: 'backup', description: 'Encrypted export and restore' },
       { command: 'health', description: 'API, Telegram, disk and queue health' },
@@ -185,7 +186,7 @@ async function main(): Promise<void> {
     keys.start();
     await poll(telegram, store, message => controller.handle(message), shutdown.signal, callback => controller.callback(callback), async (_failures, outage) => {
       await telegram.send(config.owner, `Telegram connection recovered after ${Math.ceil(outage.durationMs / 1000)}s. Queued work and stored files are preserved. Check /health for the latest status.`);
-    });
+    }, {}, answer => controller.pollAnswer(answer));
   } finally {
     stop();
     await controller.stop();

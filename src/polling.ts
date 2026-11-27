@@ -4,6 +4,7 @@ import type { Message, Callback } from './safety.js';
 import type { StateStore, TelegramOutage } from './state.js';
 
 interface PollClient { call<T>(method: string, payload: Record<string, unknown>, signal?: AbortSignal): Promise<T> }
+export interface PollAnswer { poll_id: string; option_ids?: number[]; user?: { id: number }; voter?: { id: number } }
 interface PollOptions { now?: () => number; wait?: (ms: number, signal: AbortSignal) => Promise<void> }
 
 function safeReason(error: unknown): string {
@@ -12,7 +13,7 @@ function safeReason(error: unknown): string {
   return error.networkCode && /^(?:E[A-Z_]+|UND_ERR_[A-Z_]+)$/.test(error.networkCode) && error.networkCode.length <= 64 ? error.networkCode : 'network_error';
 }
 
-export async function poll(client: PollClient, store: StateStore, handle: (message: Message) => Promise<void>, signal: AbortSignal, handleCallback?: (callback: Callback) => Promise<void>, onRecovery?: (failures: number, outage: TelegramOutage) => Promise<void>, options: PollOptions = {}): Promise<void> {
+export async function poll(client: PollClient, store: StateStore, handle: (message: Message) => Promise<void>, signal: AbortSignal, handleCallback?: (callback: Callback) => Promise<void>, onRecovery?: (failures: number, outage: TelegramOutage) => Promise<void>, options: PollOptions = {}, handlePollAnswer?: (answer: PollAnswer) => Promise<void>): Promise<void> {
   const now = options.now ?? Date.now;
   const wait = options.wait ?? ((ms, signal) => delay(ms, undefined, { signal }).catch(() => {}));
   let failures = store.data.health?.telegramOutage?.failures ?? 0;
@@ -23,9 +24,9 @@ export async function poll(client: PollClient, store: StateStore, handle: (messa
     catch (error) { if (!saveWarned) console.error(`Polling state could not be saved (${error instanceof Error ? error.name : 'unknown'}); polling continues in memory.`); saveWarned = true; }
   };
   while (!signal.aborted) {
-    let updates: { update_id: number; message?: Message; callback_query?: Callback }[];
+    let updates: { update_id: number; message?: Message; callback_query?: Callback; poll_answer?: PollAnswer }[];
     try {
-      updates = await client.call('getUpdates', { offset: store.data.offset, timeout: 25, limit: 20, allowed_updates: ['message', 'callback_query'] }, signal);
+      updates = await client.call('getUpdates', { offset: store.data.offset, timeout: 25, limit: 20, allowed_updates: ['message', 'callback_query', 'poll_answer'] }, signal);
     } catch (error) {
       if (signal.aborted) return;
       failures++;
@@ -67,6 +68,7 @@ export async function poll(client: PollClient, store: StateStore, handle: (messa
       try {
         if (update.message) await handle(update.message);
         if (update.callback_query && handleCallback) await handleCallback(update.callback_query);
+        if (update.poll_answer && handlePollAnswer) await handlePollAnswer(update.poll_answer);
       } catch (error) {
         if (error instanceof TelegramError && [401, 403, 409].includes(error.code)) throw error;
         if (signal.aborted) return;

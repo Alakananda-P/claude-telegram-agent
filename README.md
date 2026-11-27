@@ -291,6 +291,7 @@ private repo) and `GITHUB_REPOSITORY` (owner/name; `GITHUB_REPOSITORY_URL` also 
 | `/trash` | Restore chats within 48 hours or delete permanently |
 | `/backup` | Encrypted export, optional daily 03:00 IST export and restore guide |
 | `/health` | Last Telegram/Claude success, API state, queue, schedules and disk |
+| `/games` | MCQ quiz, rapid fire, tic tac toe and hangman |
 
 Upload photos or documents up to 20 MB. A standalone caption starts a task about the saved file;
 without a caption the upload waits for instructions or `/process`. Albums and manual batches always
@@ -482,6 +483,10 @@ audit, Docker build, and a dummy-key no-network container startup check.
 Claude can choose its available tools without slash commands, including `list_telegram_messages` and `delete_telegram_messages`. It can remove its obsolete/redundant progress messages when useful and follow requests such as “remove your last two replies”. Useful answers and delivered files stay by default. The catalogue contains verified outgoing bot messages, with redacted previews, and survives restarts. “Last replies” excludes current-task replies and temporary UI by default; the model can explicitly include them for cleanup.
 
 To identify a message sent before tracking was installed (or outside the bounded 2,000-record catalogue), reply to that bot message in Telegram. Only this bot's messages in the owner's private chat can be targeted. Deletion normally requires messages younger than 48 hours; failures and already-missing messages are reported separately. Removing a Telegram bubble does not erase saved sessions, shared memory or project files. No standalone message-deletion command is required.
+
+### Games (`/games`, `play_game`, `game_results`)
+
+`/games` opens quiz, rapid fire, tic tac toe and hangman in the owner chat. Quiz and rapid fire use Telegram quiz polls: the bot sends each question, enforces a 5-600 second timer, scores the answer, advances and posts the result. Tic tac toe and hangman use bot-owned inline buttons (`g:` callback data only). Claude starts a custom quiz with `play_game` (questions, 0-based correct index, timer) and can read recent scores with `game_results`. The bot keeps the board and the score after that call returns. One game runs at a time. Results stay in bot state; hangman words and quiz answers are not returned by `game_results`.
 
 ### Telegram features in the owner chat (`telegram_call`, `clear_reactions`)
 

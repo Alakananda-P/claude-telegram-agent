@@ -51,6 +51,35 @@ export function telegramCallPayload(method: string, params: Record<string, unkno
   return p;
 }
 
+/** Game boards need callback buttons, which telegram_call must not send. Only g: buttons, only in the owner chat. */
+export const GAME_CALL_METHODS = ['sendMessage', 'editMessageText', 'editMessageReplyMarkup', 'answerCallbackQuery', 'sendPoll', 'stopPoll'];
+export function gameCallPayload(method: string, params: Record<string, unknown>, owner: number, secrets: string[]): Record<string, unknown> {
+  if (!GAME_CALL_METHODS.includes(method)) throw new TelegramCallError(`Game method "${method}" is not allowed.`);
+  if ('inline_message_id' in params || 'business_connection_id' in params) throw new TelegramCallError('inline_message_id and business_connection_id are not allowed.');
+  const p = cleanStrings(params, secrets) as Record<string, unknown>;
+  if (method === 'answerCallbackQuery') delete p.chat_id; else p.chat_id = owner;
+  if (p.reply_markup !== undefined) checkGameMarkup(p.reply_markup);
+  if (method === 'sendPoll') {
+    if (p.type !== 'quiz') throw new TelegramCallError('Games may send only quiz polls.');
+    p.is_anonymous = false;
+    delete p.close_date;
+    if (typeof p.open_period !== 'number' || !Number.isInteger(p.open_period) || p.open_period < 5 || p.open_period > 600) throw new TelegramCallError('Quiz timer must be 5-600 seconds.');
+  }
+  return p;
+}
+function checkGameMarkup(markup: unknown): void {
+  if (!markup || typeof markup !== 'object' || Array.isArray(markup)) throw new TelegramCallError('Invalid game keyboard.');
+  const rows = (markup as { inline_keyboard?: unknown }).inline_keyboard;
+  if (rows === undefined) return;
+  if (!Array.isArray(rows) || !rows.every(Array.isArray)) throw new TelegramCallError('Invalid game keyboard.');
+  for (const item of (rows as unknown[][]).flat()) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) throw new TelegramCallError('Invalid game button.');
+    if (Object.keys(item).some(k => k !== 'text' && k !== 'callback_data')) throw new TelegramCallError('Game buttons may only set text and callback_data.');
+    const data = (item as { callback_data?: unknown }).callback_data;
+    if (typeof data !== 'string' || !/^g:[A-Za-z0-9:]{1,40}$/.test(data)) throw new TelegramCallError('Game button data must start with g:.');
+  }
+}
+
 export interface MessageListOptions { limit?: number; beforeMessageId?: number; messageId?: number; includeUi?: boolean }
 export interface MessageDeletion { deleted: number[]; alreadyMissing: number[]; failed: { id: number; reason: string }[] }
 
@@ -429,6 +458,11 @@ export class Telegram {
     if (change.removePhoto) { await this.removeMyProfilePhoto(); done.push('photo removed'); }
     if (change.photo) { await this.setMyProfilePhoto(change.photo.name, change.photo.bytes); done.push('photo'); }
     return done;
+  }
+
+  /** Game messages, quiz polls and g: keyboards. Never a general Bot API escape hatch. */
+  async gameCall(owner: number, method: string, params: Record<string, unknown> = {}): Promise<unknown> {
+    return this.call(method, gameCallPayload(method, params, owner, [this.token, ...this.secrets]));
   }
 
   /** telegram_call: an allowlisted Bot API call in the owner chat; files upload as multipart (attach://name or a top-level field). */
