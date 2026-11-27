@@ -28,6 +28,8 @@ export interface Schedule {
   id: string; name: string; kind: Task['kind']; prompt: string; project: string; timezone: string;
   at?: string; cron?: string; intervalMinutes?: number; nextRun: string; enabled: boolean;
   lastRun?: string; lastStatus?: Task['status'];
+  /** B5: occurrences skipped because the previous run was still queued or running. */
+  skippedRuns?: number; lastSkipped?: string;
 }
 export interface ScheduleInput { name: string; kind: Task['kind']; prompt: string; project: string; timezone?: string; at?: string; cron?: string; intervalMinutes?: number }
 export interface Upload { id: string; project: string; chatKey: string; path: string; name: string; photo: boolean; mediaType?: 'video' | 'animation' | 'audio' | 'voice'; receivedAt: string; batchId: string }
@@ -45,6 +47,8 @@ function next(s: Pick<Schedule, 'cron' | 'intervalMinutes' | 'at' | 'timezone'>,
   return new Date(s.at).toISOString();
 }
 export class Automation {
+  /** B5: told once per skipped overlapping occurrence (short owner notice). */
+  onSkip?: (schedule: Schedule, occurrence: string) => Promise<void> | void;
   constructor(readonly store: StateStore) { store.data.tasks ??= []; store.data.schedules ??= []; }
   taskView(query: { offset?: number; limit?: number; project?: string; status?: Task['status']; include_summary?: boolean } = {}, secrets: string[] = []) {
     const offset = query.offset ?? 0, limit = query.limit ?? 20;
@@ -59,7 +63,7 @@ export class Automation {
     return { total: records.length, offset, nextOffset: offset + limit < records.length ? offset + limit : null,
       schedules: records.slice(offset, offset + limit).map(s => ({ id: s.id, name: redact(s.name, secrets), project: s.project, kind: s.kind,
         prompt: redact(s.prompt, secrets).slice(0, 500), promptTruncated: redact(s.prompt, secrets).length > 500,
-        enabled: s.enabled, timezone: s.timezone, at: s.at, cron: s.cron, intervalMinutes: s.intervalMinutes, nextRun: s.nextRun, lastRun: s.lastRun, lastStatus: s.lastStatus })) };
+        enabled: s.enabled, timezone: s.timezone, at: s.at, cron: s.cron, intervalMinutes: s.intervalMinutes, nextRun: s.nextRun, lastRun: s.lastRun, lastStatus: s.lastStatus, skippedRuns: s.skippedRuns })) };
   }
   private insert(input: Omit<Task, 'id' | 'status' | 'createdAt'>): Task {
     projectName(input.project);
@@ -109,7 +113,8 @@ export class Automation {
     if (i < 0) throw new Error('Queued task not found.');
     list.unshift(...list.splice(i, 1)); await this.store.save();
   }
-  async setPaused(paused: boolean): Promise<void> { this.store.data.queuePaused = paused; await this.store.save(); }
+  /** B1: remembers why the queue paused so a later key recovery can resume an API pause, never an owner pause. */
+  async setPaused(paused: boolean, reason = 'owner'): Promise<void> { const d = this.store.data; d.queuePaused = paused; if (paused) d.queuePauseReason = reason; else delete d.queuePauseReason; await this.store.save(); }
   private makeSchedule(input: ScheduleInput, now: Date): Schedule {
     projectName(input.project);
     if (!input.name.trim() || input.name.length > 80 || !input.prompt.trim() || input.prompt.length > 10000) throw new Error('Use a short name and a nonempty task.');
@@ -128,6 +133,8 @@ export class Automation {
     const list = this.store.data.schedules!; const s = list.find(s => s.id === id);
     if (!s) throw new Error('Schedule not found.');
     if (action === 'resume') assertProjectWork(this.store.data, s.project);
+    // B5: a one-time schedule that already ran keeps its past nextRun; resuming it must not run it again.
+    if (action === 'resume' && !s.cron && !s.intervalMinutes && s.lastRun) throw new Error('This one-time schedule already ran. Create a new schedule instead.');
     if (action === 'delete') this.store.data.schedules = list.filter(x => x.id !== id);
     else { s.enabled = action === 'resume'; if (s.enabled && (s.cron || s.intervalMinutes)) s.nextRun = next(s, now); }
     for (const task of this.store.data.tasks!.filter(t => t.scheduleId === id && t.status === 'queued')) {
@@ -144,18 +151,19 @@ export class Automation {
     await this.store.save(); return fresh;
   }
   async tick(now = new Date()): Promise<number> {
-    let added = 0; let changed = false;
+    let added = 0; let changed = false; const skipped: [Schedule, string][] = [];
     for (const s of this.store.data.schedules!) {
       if (!s.enabled || !projectAcceptsWork(this.store.data, s.project) || Date.parse(s.nextRun) > +now) continue;
       const occurrence = s.nextRun;
       if (!this.store.data.tasks!.some(t => t.scheduleId === s.id && ['queued', 'running'].includes(t.status))) {
         this.insert({ kind: s.kind, project: s.project, chatKey: 'schedule-' + s.id, prompt: s.prompt, scheduleId: s.id, occurrence, interactive: false }); added++;
-      }
+      } else { s.skippedRuns = (s.skippedRuns ?? 0) + 1; s.lastSkipped = occurrence; skipped.push([s, occurrence]); }
       s.lastRun = occurrence;
       if (s.cron || s.intervalMinutes) s.nextRun = next(s, now); else s.enabled = false;
       changed = true;
     }
     if (changed) await this.store.save();
+    for (const [s, occurrence] of skipped) await Promise.resolve(this.onSkip?.(s, occurrence)).catch(() => console.warn('Schedule skip notice failed; the skip is recorded.'));
     return added;
   }
 }

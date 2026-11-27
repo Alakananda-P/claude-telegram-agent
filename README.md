@@ -22,6 +22,9 @@ API-key setup.
   queued jobs. Pending attachments accompany the next instruction. The SDK reads
   updates at its next tool boundary; a message arriving after a turn ends continues
   in the same session. Long tool calls can delay pickup. Other projects stay isolated.
+- Live replies (`LIVE_STEER=true`, default): a text message sent while a task runs also gets a
+  quick answer within seconds from a tool-less fork of the chat; the running task still applies it.
+  Set `LIVE_STEER=false` to turn this off.
 - Claude's ordinary assistant progress messages appear during substantial work and
   stay in the chat archive. Hidden thinking and subagent text are not forwarded.
   The temporary activity indicator refreshes with elapsed time while a tool runs,
@@ -297,8 +300,10 @@ Downloads are limited to 49 MB. Hidden credential paths and symlinks are rejecte
 by the transfer layer; known configured credentials are refused in outgoing files.
 Generic secret detection is not guaranteed—review artifacts before sharing them.
 
-`/stop` also pauses the queue. Scheduled work joins the same serial queue, so a paused queue
-delays reminders and scheduled jobs until resumed. Telegram retries use bounded backoff.
+`/stop` ends only the running task; queued work continues (`/queue pause` pauses it). A key,
+credit or account API error pauses the queue; new messages are queued meanwhile and the queue
+resumes by itself once a key check or task succeeds. Scheduled work joins the same serial queue,
+so a paused queue delays reminders and scheduled jobs until resumed. Telegram retries use bounded backoff.
 Recovery notifications appear once for outages lasting at least a minute; notification
 failure does not discard updates already fetched. Health retains bounded outage history
 with start, end, duration and safe error categories. A stopped worker cannot send its own
@@ -322,7 +327,7 @@ though the main agent uses your selected Fable, Opus or Sonnet model.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `MAX_TURNS` | `50` | Maximum model turns per task |
-| `JOB_TIMEOUT_MINUTES` | `20` | Abort a task after this duration |
+| `JOB_TIMEOUT_MINUTES` | `20` | Idle minutes before a task stops (max 240); activity extends it up to 90 minutes total |
 
 **There is no bot-enforced spending cap**, per the owner's request. The SDK receives
 no `maxBudgetUsd` option, and no daily budget or reservation limits job admission.

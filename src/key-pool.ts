@@ -16,9 +16,11 @@ export const keyRecordSchema = z.object({
   history: z.array(z.object({ at: z.string().datetime(), event: z.enum(['added', 'selected', 'working', 'failed', 'recovered', 'retired']), reason: reason.optional(), source: z.enum(['task', 'check', 'setup']) })),
 });
 export type KeyRecord = z.infer<typeof keyRecordSchema>;
-export type KeyProbe = (key: string, signal: AbortSignal) => Promise<{ ok: boolean; kind?: KeyReason }>;
+export type KeyProbe = (key: string, signal: AbortSignal) => Promise<{ ok: boolean; kind?: KeyReason; retryAfterMs?: number }>;
 type Credential = { id: string; key: string; label: string; kind: 'api' | 'oauth' };
-const restricted = ['rate_limit', 'account_on_hold', 'verification_required', 'oauth_org_not_allowed'];
+const restricted = ['account_on_hold', 'verification_required', 'oauth_org_not_allowed'];
+/** B2: a 429 cools only that key: the provider's retry-after, else 60 s, capped at 5 min. */
+export const rateLimitCooldownMs = (retryAfterMs?: number) => Math.min(5 * 60_000, Math.max(1000, retryAfterMs !== undefined && Number.isFinite(retryAfterMs) ? retryAfterMs : 60_000));
 const transient = ['overloaded', 'server_error', 'network_error'];
 const stamp = (ms: number) => new Date(ms).toISOString();
 const AUTH_RETIRE_MS = 48 * 60 * 60_000;
@@ -42,6 +44,8 @@ export class KeyPool {
   private probeAbort?: AbortController;
   private stopped = false;
   private timer?: ReturnType<typeof setInterval>;
+  /** B1: called after any key works again (task or check), so an API-paused queue can resume. */
+  onHealthy?: (source: 'task' | 'check') => void | Promise<void>;
   constructor(private config: Config, private store: StateStore, private probe: KeyProbe = messageProbe(), private now = Date.now) {
     const sources = config.oauthToken ? [{ key: config.oauthToken, kind: 'oauth' as const }] : [config.apiKey, ...(config.backupKeys ?? [])].map(key => ({ key, kind: 'api' as const }));
     this.credentials = [...new Map(sources.map(source => [source.key, source])).values()].map((source, i) => ({ ...source, id: createHash('sha256').update(source.key).digest('hex').slice(0, 16), label: config.keyLabels?.[i] ?? (source.kind === 'oauth' ? 'Claude OAuth' : `Key ${i + 1}`) }));
@@ -114,13 +118,14 @@ export class KeyPool {
     if (source === 'task') r.successes++;
     this.store.data.disabledKeyIds = this.store.data.disabledKeyIds!.filter(x => x !== id);
     r.nextCheckAt = stamp(this.now() + 6 * 60 * 60_000); await this.store.save();
+    try { await this.onHealthy?.(source); } catch { console.warn('Queue auto-resume after key recovery failed.'); }
   }
-  async failure(id: string, kind: string, source: 'task' | 'check' = 'task') {
+  async failure(id: string, kind: string, source: 'task' | 'check' = 'task', retryAfterMs?: number) {
     const r = this.record(id), safe = reason.safeParse(kind).success ? kind as KeyReason : 'unknown';
     if (r.status === 'retired') return;
     r.failures++; r.lastError = safe; r.lastFailureAt = stamp(this.now());
-    r.status = safe === 'billing_error' ? 'no_credit' : safe === 'authentication_failed' ? 'rejected' : restricted.includes(safe) ? 'blocked' : transient.includes(safe) ? 'cooldown' : 'error';
-    r.nextCheckAt = stamp(this.now() + (transient.includes(safe) ? 2 : 30) * 60_000);
+    r.status = safe === 'billing_error' ? 'no_credit' : safe === 'authentication_failed' ? 'rejected' : restricted.includes(safe) ? 'blocked' : transient.includes(safe) || safe === 'rate_limit' ? 'cooldown' : 'error';
+    r.nextCheckAt = stamp(this.now() + (safe === 'rate_limit' ? rateLimitCooldownMs(retryAfterMs) : (transient.includes(safe) ? 2 : 30) * 60_000));
     r.history.push({ at: r.lastFailureAt, event: 'failed', reason: safe, source });
     if (safe === 'authentication_failed') {
       r.authFailureSince ??= r.lastFailureAt;
@@ -144,7 +149,8 @@ export class KeyPool {
     // The old /health retry command now verifies recovery instead of blindly enabling keys.
     for (const { id } of this.credentials) {
       const r = this.record(id);
-      if (r.lastError === 'rate_limit' || (r.lastCheckAt && this.now() - Date.parse(r.lastCheckAt) < 60_000)) continue;
+      // B2: rate-limited keys are rechecked too; only a check in the last minute is skipped.
+      if (r.lastCheckAt && this.now() - Date.parse(r.lastCheckAt) < 60_000) continue;
       r.nextCheckAt = stamp(this.now());
     }
     await this.store.save();
@@ -167,7 +173,7 @@ export class KeyPool {
       finally { clearTimeout(timer); if (this.probeAbort === abort) this.probeAbort = undefined; }
       if (this.stopped || this.record(c.id).status === 'retired' || (abort.signal.aborted && !timedOut) || r.lastAttemptAt !== lastAttempt) continue;
       r.checks++; r.lastCheckAt = stamp(this.now());
-      if (result.ok) await this.success(c.id, 'check'); else await this.failure(c.id, result.kind ?? 'unknown', 'check');
+      if (result.ok) await this.success(c.id, 'check'); else await this.failure(c.id, result.kind ?? 'unknown', 'check', result.retryAfterMs);
       console.log(`API key check: ${r.label}; status=${r.status}; checks=${r.checks}; activeKeys=${this.credentials.length}; retiredKeys=${this.archived().length}.`);
     }
   }
@@ -177,7 +183,7 @@ export class KeyPool {
     const retired = [...this.archived(), ...this.unconfigured()], rows = id === 'retired' ? retired : this.list();
     const r = [...rows, ...retired].find(x => x.id === id);
     const time = (v?: string) => v ? new Date(v).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }) + ' IST' : 'not yet';
-    if (!r) return { text: `${id === 'retired' ? 'Retired keys' : 'API key status'} · ${rows.length} keys\n\n` + rows.map(x => `${x.selected ? '▶ ' : ''}${x.label}: ${x.status}${x.lastError ? ' (' + x.lastError + ')' : ''}\nTask successes: ${x.successes} · Failures: ${x.failures}\nLast success: ${time(x.lastSuccessAt)}`).join('\n\n') + '\n\nAuto checks: healthy keys every 6h; credit/auth/limit failures every 30m; network/server failures every 2m. Checks wait while a task runs. After 48h of consecutive authentication failures, a fresh failed check permanently removes the key from routing and checks. History is kept. Status is historical, not a credit balance.', buttons: [...rows.map(x => [button(x.label + ' · history', `keyhistory ${x.id} 0`), ...(id === 'retired' ? [button('Remove ' + x.label, `keyremove ${x.id}`)] : [])]), ...(id !== 'retired' && retired.length ? [[button(`Retired keys (${retired.length})`, 'keys retired')]] : []), [button(id === 'retired' ? 'Active keys' : 'Refresh', 'keys')], ...BACK] };
+    if (!r) return { text: `${id === 'retired' ? 'Retired keys' : 'API key status'} · ${rows.length} keys\n\n` + rows.map(x => `${x.selected ? '▶ ' : ''}${x.label}: ${x.status}${x.lastError ? ' (' + x.lastError + ')' : ''}\nTask successes: ${x.successes} · Failures: ${x.failures}\nLast success: ${time(x.lastSuccessAt)}`).join('\n\n') + '\n\nAuto checks: healthy keys every 6h; credit/auth/account failures every 30m; network/server failures every 2m; a rate-limited key rests for its retry-after (max 5m) while other keys work. Checks wait while a task runs. After 48h of consecutive authentication failures, a fresh failed check permanently removes the key from routing and checks. History is kept. Status is historical, not a credit balance.', buttons: [...rows.map(x => [button(x.label + ' · history', `keyhistory ${x.id} 0`), ...(id === 'retired' ? [button('Remove ' + x.label, `keyremove ${x.id}`)] : [])]), ...(id !== 'retired' && retired.length ? [[button(`Retired keys (${retired.length})`, 'keys retired')]] : []), [button(id === 'retired' ? 'Active keys' : 'Refresh', 'keys')], ...BACK] };
     const pages = Math.max(1, Math.ceil(r.history.length / 8)), p = Math.max(0, Math.min(pages - 1, page));
     const history = [...r.history].reverse().slice(p * 8, (p + 1) * 8);
     return { text: `${r.label} · ${r.status}${r.selected ? ' · selected' : ''}\nAttempts: ${r.attempts} · Completed: ${r.successes} · Failures: ${r.failures} · Checks: ${r.checks}\nLast success: ${time(r.lastSuccessAt)}\nLast failure: ${time(r.lastFailureAt)}\nLast check: ${time(r.lastCheckAt)}\n${r.retiredAt ? 'Retired: ' + time(r.retiredAt) : 'Next check: ' + time(r.nextCheckAt)}${r.authFailureSince ? '\nAuthentication failures since: ' + time(r.authFailureSince) : ''}\n\nHistory ${p + 1}/${pages}\n` + history.map(h => `${time(h.at)}\n${h.event}${h.reason ? ': ' + h.reason : ''} · ${h.source}`).join('\n\n'), buttons: [...(p > 0 ? [[button('Newer', `keyhistory ${id} ${p - 1}`)]] : []), ...(p + 1 < pages ? [[button('Older', `keyhistory ${id} ${p + 1}`)]] : []), [button('All keys', 'keys')], ...BACK] };
@@ -201,6 +207,7 @@ export function messageProbe(ledger?: UsageLedger, fetcher: typeof fetch = fetch
       : response.status === 429 ? 'rate_limit' : response.status === 529 ? 'overloaded'
       : response.status >= 500 ? 'server_error' : response.status === 403 ? 'oauth_org_not_allowed'
       : response.status === 404 ? 'model_not_found' : type === 'invalid_request_error' ? 'invalid_request' : 'unknown';
-    return { ok: false, kind };
+    const retryAfter = Number(response.headers?.get?.('retry-after'));
+    return { ok: false, kind, ...(kind === 'rate_limit' && retryAfter > 0 ? { retryAfterMs: retryAfter * 1000 } : {}) };
   };
 }

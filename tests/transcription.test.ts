@@ -69,7 +69,34 @@ test('concurrent identical tool calls use one provider request; changed audio is
 
 test('missing key and cancelled work do not send audio to a provider', async () => {
   let calls = 0; const { service, root, config, store } = await setup((async () => { calls++; return new Response('{}'); }) as typeof fetch);
-  await assert.rejects(new Transcriber({ ...config, elevenLabsKey: undefined }, store).transcribe(root, 'uploads/voice.ogg'), /not configured/);
+  await assert.rejects(new Transcriber({ ...config, elevenLabsKey: undefined, elevenLabsKeys: [] }, store).transcribe(root, 'uploads/voice.ogg'), /not configured/);
   await assert.rejects(service.transcribe(root, 'uploads/voice.ogg', undefined, AbortSignal.abort()));
   assert.equal(calls, 0);
+});
+
+test('W48-01: ELEVENLABS_API_KEYS fail over on 401/403/429/quota, report detail.status and stay redacted', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'stt-keys-'));
+  const config = loadConfig({ TELEGRAM_BOT_TOKEN: '123456:abcdefghijklmnopqrstuvw', TELEGRAM_OWNER_ID: '123', ANTHROPIC_API_KEY: 'test-only', ELEVENLABS_API_KEY: 'eleven-one', ELEVENLABS_API_KEYS: 'eleven-two, eleven-one ,eleven-three', DATA_DIR: dir });
+  assert.deepEqual(config.elevenLabsKeys, ['eleven-one', 'eleven-two', 'eleven-three']);
+  assert.ok(['eleven-one', 'eleven-two', 'eleven-three'].every(k => configSecrets(config).includes(k)));
+  const used: string[] = [];
+  const statuses: [number, string][] = [[401, 'invalid_api_key'], [429, 'too_many_concurrent_requests']];
+  const fetcher = (async (_url: unknown, init: RequestInit) => {
+    used.push((init.headers as Record<string, string>)['xi-api-key']);
+    const next = statuses.shift();
+    return next ? new Response(JSON.stringify({ detail: { status: next[1], message: 'eleven-one prose' } }), { status: next[0] }) : new Response(JSON.stringify(transcript));
+  }) as typeof fetch;
+  const root = path.join(dir, 'workspaces', 'default'); await mkdir(path.join(root, 'uploads'), { recursive: true }); await writeFile(path.join(root, 'uploads', 'voice.ogg'), 'audio one');
+  const store = await StateStore.open(path.join(dir, 'bot', 'state.json'));
+  const service = new Transcriber(config, store, fetcher, async () => ({ durationSeconds: 3, hasAudio: true }));
+  assert.equal((await service.transcribe(root, 'uploads/voice.ogg')).text, transcript.text);
+  assert.deepEqual(used, ['eleven-one', 'eleven-two', 'eleven-three']);
+  assert.equal(service.lastError?.kind, 'rate_limited:too_many_concurrent_requests');
+  used.length = 0; statuses.push([403, 'missing_permissions'], [402, 'quota_exceeded'], [401, 'invalid_api_key']);
+  await writeFile(path.join(root, 'uploads', 'voice.ogg'), 'audio two');
+  await assert.rejects(service.transcribe(root, 'uploads/voice.ogg'), e => e instanceof Error && /access was rejected \(3 keys tried\) \[HTTP 401, invalid_api_key\]/.test(e.message) && !/eleven-|prose/.test(e.message));
+  assert.equal(used.length, 3);
+  used.length = 0; statuses.push([500, 'server_error']);
+  await writeFile(path.join(root, 'uploads', 'voice.ogg'), 'audio three');
+  await assert.rejects(service.transcribe(root, 'uploads/voice.ogg'), /HTTP 500, server_error/); assert.equal(used.length, 1);
 });

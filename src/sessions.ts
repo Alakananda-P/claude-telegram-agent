@@ -108,6 +108,10 @@ export class SessionCatalog {
     }
     await this.store.save();
   }
+  /** E3: newest Claude (non provider-*) version of this chat, so the Claude runner never resumes a provider session id. */
+  claudeVersion(id: string): string | undefined {
+    try { return [...this.group(id)].filter(v => !v.id.startsWith('provider-') && !v.trashedAt).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0]?.id; } catch { return undefined; }
+  }
   private group(id: string) { this.find(id); return this.groups().find(g => g.record.id === this.resolve(id))!.versions; }
   trashList(includeHiddenProjects = false) { return this.groups().filter(g => g.trashed && (includeHiddenProjects || projectVisible(this.store.data, g.record.project))).map(g => ({ id: g.record.id, title: this.title(g.record),
     trashedAt: g.versions.find(s => s.trashedAt)?.trashedAt, purgeAt: g.versions.find(s => s.purgeAt)?.purgeAt })); }
@@ -204,7 +208,8 @@ export class SessionCatalog {
     this.assertProjectAvailable(record);
     if (this.group(id).some(s => s.trashedAt)) throw new SessionAccessError('This session is in Trash. Restore it before reading.');
     if (![startTurn, offset].every(n => Number.isSafeInteger(n) && n >= 0)) throw new SessionAccessError('Invalid chat page cursor.');
-    const source = await this.chats.read(id);
+    // E3: an old version id reads the latest version, which holds the whole bound history.
+    const source = await this.chats.read(this.resolve(id));
     if (startTurn > source.length || (offset && (!source[startTurn] || offset > source[startTurn].text.length))) throw new SessionAccessError('Invalid chat page cursor.');
     const turns: { index: number; role: string; text: string; attachmentName?: string }[] = [];
     let budget = 10000;

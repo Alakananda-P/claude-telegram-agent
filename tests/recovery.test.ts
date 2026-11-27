@@ -62,11 +62,18 @@ test('pre-effect key recovery retains steering input for the fresh attempt', asy
   } }));
   await runner.run({ prompt: 'Process bill', cwd: '.', steering }, () => {}, new AbortController()); assert.deepEqual(received, [update.id, update.id]);
 });
-test('rate limits retry the same key once and never rotate keys', async () => {
+test('B2: a rate limit rests only that key; the next key takes over and only the last key retries once', async () => {
   const calls: string[] = [];
   const { runner, store } = await setup(key => ({ async run() { calls.push(key); throw new AgentApiError('rate_limit', 'Limited'); } }));
-  await assert.rejects(runner.run({ prompt: 'Hi', cwd: '.' }, () => {}, new AbortController()), /Limited/);
-  assert.deepEqual(calls, ['sk-ant-primary', 'sk-ant-primary']); assert.deepEqual(store.data.disabledKeyIds, []);
+  await assert.rejects(runner.run({ prompt: 'Hi', cwd: '.' }, () => {}, new AbortController()), (e: AgentApiError) => e.kind === 'rate_limit' && /rate limit/.test(e.message));
+  assert.deepEqual(calls, ['sk-ant-primary', 'sk-ant-backup', 'sk-ant-backup']); assert.deepEqual(store.data.disabledKeyIds, []);
+  assert.ok(Object.values(store.data.keyRecords!).every(r => r.status === 'cooldown'));
+  calls.length = 0;
+  const next = await setup(key => ({ async run() { calls.push(key); if (key.endsWith('primary')) throw new AgentApiError('rate_limit', 'Limited'); return { session: 's', text: 'ok', cumulativeCost: 0 }; } }));
+  assert.equal((await next.runner.run({ prompt: 'Hi', cwd: '.' }, () => {}, new AbortController())).text, 'ok');
+  assert.deepEqual(calls, ['sk-ant-primary', 'sk-ant-backup']);
+  calls.length = 0; assert.equal((await next.runner.run({ prompt: 'Hi', cwd: '.' }, () => {}, new AbortController())).text, 'ok');
+  assert.deepEqual(calls, ['sk-ant-backup'], 'a later task skips the cooling key instead of failing as account_restricted');
 });
 test('account holds and unclassified failures are never bypassed with another account', async () => {
   let calls = 0;

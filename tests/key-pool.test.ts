@@ -53,14 +53,22 @@ test('failed keys recheck after 30 minutes, recover without changing active key,
   await pool.checkDue(); assert.equal(probes, 1);
 });
 
-test('rate limits and account holds cannot rotate on a later task; successful recheck clears them', async () => {
-  const { pool, advance } = await setup(); const first = pool.list()[0];
+test('account holds cannot rotate on a later task; successful recheck clears them; B2: a rate limit only cools that key', async () => {
+  let probes = 0;
+  const { pool, advance } = await setup(async () => { probes++; return { ok: true }; }); const first = pool.list()[0], second = pool.list()[1];
   await pool.begin(first.id); await pool.failure(first.id, 'account_on_hold');
   assert.throws(() => pool.available(), /account_on_hold/);
   advance(30 * 60_000); await pool.checkDue();
   assert.equal(pool.available()[0].id, first.id);
-  await pool.failure(first.id, 'rate_limit');
-  assert.throws(() => pool.available(), /rate_limit/);
+  const cooldown = () => Date.parse(pool.list()[0].nextCheckAt) - Date.parse(pool.list()[0].lastFailureAt!);
+  await pool.failure(first.id, 'rate_limit', 'task', 90_000);
+  assert.equal(pool.available()[0].id, second.id, 'another healthy key is used instead of throwing');
+  assert.equal(pool.list()[0].status, 'cooldown'); assert.equal(cooldown(), 90_000);
+  advance(90_000); assert.equal(pool.available()[0].id, first.id, 'the preferred key returns after its retry-after');
+  await pool.failure(first.id, 'rate_limit'); assert.equal(cooldown(), 60_000, 'unknown retry-after rests 60 s');
+  await pool.failure(first.id, 'rate_limit', 'check', 3_600_000); assert.equal(cooldown(), 5 * 60_000, 'retry-after is capped at 5 min');
+  advance(61_000); const before = probes; await pool.requestChecks(); await pool.checkDue();
+  assert.ok(probes > before, '/health recheck includes rate-limited keys'); assert.equal(pool.list()[0].status, 'healthy');
 });
 
 test('healthy checks are six-hourly, serialized and do not run during a user task', async () => {
@@ -103,10 +111,12 @@ test('a probe finishing after a task begins cannot overwrite its failure state',
 });
 
 test('provider checks classify authentication, billing, restrictions and non-JSON outages safely', async () => {
-  for (const [status, error, kind] of [[401, 'bad secret', 'authentication_failed'], [400, 'Your credit balance is too low', 'billing_error'], [403, 'Account on hold', 'account_on_hold'], [429, 'Limit', 'rate_limit'], [529, 'Overload', 'overloaded']] as const) {
+  for (const [status, error, kind] of [[401, 'bad secret', 'authentication_failed'], [400, 'Your credit balance is too low', 'billing_error'], [403, 'Account on hold', 'account_on_hold'], [529, 'Overload', 'overloaded']] as const) {
     const probe = messageProbe(undefined, (async () => new Response(JSON.stringify({ error: { message: error } }), { status })) as typeof fetch);
     assert.deepEqual(await probe('private', new AbortController().signal), { ok: false, kind });
   }
+  const limited = messageProbe(undefined, (async () => new Response(JSON.stringify({ error: { message: 'Limit' } }), { status: 429, headers: { 'retry-after': '30' } })) as typeof fetch);
+  assert.deepEqual(await limited('private', new AbortController().signal), { ok: false, kind: 'rate_limit', retryAfterMs: 30_000 });
   const probe = messageProbe(undefined, (async () => new Response('bad gateway', { status: 502 })) as typeof fetch);
   assert.equal((await probe('private', new AbortController().signal)).kind, 'server_error');
 });

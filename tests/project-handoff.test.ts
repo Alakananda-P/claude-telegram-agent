@@ -114,17 +114,21 @@ test('a switch without a continuation selects the target for the next owner mess
   await fixture.bot.handle(message('Now continue here')); await fixture.bot.idle(); assert.equal(calls, 2);
 });
 
-test('an expired inherited deadline cannot launch a continuation in another project', async () => {
-  let calls = 0;
+test('B4/H-03: a continuation after an exhausted parent deadline gets a fresh deadline of at least 5 minutes', async () => {
+  let calls = 0; let enqueuedAt = 0;
   const fixture = await setup(async request => {
-    calls++; const context = projects(request); await context.catalog.create({ id: 'target', name: 'Target' });
-    await context.requestSwitch('target', 'Remaining work');
-    fixture.store.data.tasks![0].deadlineAt = new Date(Date.now() - 1000).toISOString();
-    return { text: 'Time used', session: 'source-chat', cumulativeCost: 0 };
+    calls++;
+    if (calls === 1) {
+      const context = projects(request); await context.catalog.create({ id: 'target', name: 'Target' });
+      await context.requestSwitch('target', 'Remaining work');
+      fixture.store.data.tasks![0].deadlineAt = new Date(Date.now() - 1000).toISOString(); enqueuedAt = Date.now();
+      return { text: 'Time used', session: 'source-chat', cumulativeCost: 0 };
+    }
+    assert.ok(Date.parse(fixture.store.data.tasks![1].deadlineAt!) >= enqueuedAt + 5 * 60_000 - 1000);
+    return { text: 'Continued', session: 'target-chat', cumulativeCost: 0 };
   });
   await fixture.bot.handle(message('Switch and continue')); await fixture.bot.idle();
-  assert.equal(calls, 1); assert.equal(fixture.store.data.project, 'default');
-  assert.match(fixture.replies.join('\n'), /time limit/);
+  assert.equal(calls, 2); assert.equal(fixture.store.data.project, 'target'); assert.equal(fixture.store.data.tasks![1].status, 'completed');
 });
 
 for (const action of ['switch', 'archive', 'trash'] as const) test(`a new instruction after the SDK inbox closes cancels pending ${action} during final delivery`, async () => {

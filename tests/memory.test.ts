@@ -102,3 +102,21 @@ test('failed atomic write leaves existing committed memory unchanged and returns
  await chmod(memory.directory,0o500);
  try{await assert.rejects(memory.remember('New fact'),/permission|storage/i);assert.equal(await memory.read(),before);}finally{await chmod(memory.directory,0o700);}
 });
+
+test('a write checks only the new text, so an older secret-like line does not block later facts', async () => {
+  const { memory } = await setup(); await memory.remember('Core'); await writeFile(memory.file, '- legacy line with private-secret inside\n');
+  await memory.remember('Fresh durable fact'); assert.match(await readFile(memory.file, 'utf8'), /Fresh durable fact/);
+  await memory.replace('Fresh durable fact', 'Edited fact'); assert.match(await readFile(memory.file, 'utf8'), /Edited fact/);
+  await assert.rejects(memory.remember('new private-secret'), /credentials/); assert.doesNotMatch(await memory.read(), /private-secret/);
+});
+
+test('E4: prompt memory excerpts skip fillers and rank lines by distinct matched words', async () => {
+  const { memory } = await setup();
+  await memory.remember('- kya hai aur the and to me\n' + '- Office rent is paid on the 5th\n'.repeat(20) + '- Office rent for Simnax ledger goes to HDFC account');
+  await memory.remember('- Simnax ledger is kept in the bills topic', 'bills');
+  const ranked = await memory.relevant('Simnax office rent ka ledger kya hai h me se');
+  assert.ok(ranked.length <= 8); assert.match(ranked[0].preview, /Simnax ledger goes to HDFC/); assert.equal(ranked[0].score, 4);
+  assert.ok(ranked.every(r => !/kya hai aur/.test(r.preview)));
+  assert.deepEqual(await memory.relevant('kya hai h me se aur the and'), []);
+  const context = await memory.context('Simnax office rent'); assert.match(context, /HDFC/); assert.ok(!context.includes('"score"'));
+});

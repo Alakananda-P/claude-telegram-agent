@@ -15,14 +15,15 @@ export const backgroundJobSchema = z.object({
   status: z.enum(['starting', 'running', 'completed', 'failed', 'cancelled', 'timed_out', 'interrupted']),
   createdAt: z.string().datetime(), startedAt: z.string().datetime().optional(), finishedAt: z.string().datetime().optional(),
   timeoutMs: z.number().int().min(1000).max(7_200_000), exitCode: z.number().int().optional(), truncated: z.boolean().optional(),
-  notifiedAt: z.string().datetime().optional(), notificationAttempts: z.number().int().nonnegative().optional(), notifyAfter: z.string().datetime().optional(),
+  notifiedAt: z.string().datetime().optional(), notificationAttempts: z.number().int().nonnegative().optional(), notifyAfter: z.string().datetime().optional(), notifyFailures: z.number().int().nonnegative().optional(), notifyGaveUpAt: z.string().datetime().optional(),
 });
 export type BackgroundJob = z.infer<typeof backgroundJobSchema>;
 export interface BackgroundInput { name: string; project: string; chatKey: string; root: string; script: string; runtime: BackgroundJob['runtime']; args?: string[]; timeoutMs?: number }
 export class BackgroundError extends Error {}
-type LiveJob = { child: ChildProcess; stdoutRaw: string; stderrRaw: string; out: StringDecoder; err: StringDecoder; done: Promise<void>; resolve: () => void; reason?: BackgroundJob['status']; finishing?: boolean; timeout?: ReturnType<typeof setTimeout>; killTimer?: ReturnType<typeof setTimeout>; flushTimer?: ReturnType<typeof setTimeout>; writing: Promise<void> };
+type LiveJob = { child: ChildProcess; stdoutRaw: string; stderrRaw: string; out: StringDecoder; err: StringDecoder; done: Promise<void>; resolve: () => void; reason?: BackgroundJob['status']; finishing?: boolean; timeout?: ReturnType<typeof setTimeout>; killTimer?: ReturnType<typeof setTimeout>; flushTimer?: ReturnType<typeof setTimeout>; writing: Promise<void>; lastOutputAt?: number };
 const terminal = (job: BackgroundJob) => !['starting', 'running'].includes(job.status);
 const OUTPUT_LIMIT = 262_144;
+const MAX_NOTIFY_ATTEMPTS = 10;
 
 /** Processes belong to the bot worker, never to an individual SDK query. */
 export class BackgroundJobs {
@@ -64,6 +65,7 @@ export class BackgroundJobs {
   }
   private append(job: BackgroundJob, live: LiveJob, text: string, stream: 'stdoutRaw' | 'stderrRaw' = 'stdoutRaw') {
     const remaining = Math.max(0, OUTPUT_LIMIT - Buffer.byteLength(live.stdoutRaw) - Buffer.byteLength(live.stderrRaw));
+    if (text) live.lastOutputAt = Date.now();
     const bytes = Buffer.from(text); live[stream] += bytes.subarray(0, remaining).toString('utf8'); if (bytes.length > remaining) job.truncated = true;
     if (!live.flushTimer && !live.finishing) live.flushTimer = setTimeout(() => {
       live.flushTimer = undefined; void this.flush(job, live).catch(() => { this.storageFailed = true; console.error('Background log storage failed; new background jobs disabled.'); });
@@ -134,6 +136,8 @@ export class BackgroundJobs {
     this.live.delete(job.id); live.resolve();
     if (!this.closing) await this.tick();
   }
+  /** D4: time of the latest process output, for the live status line. */
+  activity(id: string): number | undefined { return this.live.get(id)?.lastOutputAt; }
   async wait(id: string): Promise<void> { this.job(id); await this.live.get(id)?.done; }
   async readTail(id: string, limit = 900) { return this.read(id, 0, limit, true); }
   async read(id: string, offset = 0, limit = 6000, tail = false) {
@@ -153,10 +157,15 @@ export class BackgroundJobs {
   private async notifyDue(now: number) {
     if (this.closing || this.storageFailed) return;
     for (const job of this.store.data.backgroundJobs!) {
-      if (!terminal(job) || job.notifiedAt || !projectVisible(this.store.data, job.project) || (job.notifyAfter && Date.parse(job.notifyAfter) > now)) continue;
+      if (!terminal(job) || job.notifiedAt || job.notifyGaveUpAt || !projectVisible(this.store.data, job.project) || (job.notifyAfter && Date.parse(job.notifyAfter) > now)) continue;
       job.notificationAttempts = (job.notificationAttempts ?? 0) + 1;
-      try { await this.notify({ ...job, args: [...job.args] }); job.notifiedAt = new Date(Math.max(Date.now(), Date.parse(job.finishedAt ?? job.createdAt))).toISOString(); delete job.notifyAfter; }
-      catch { job.notifyAfter = new Date(Math.max(now, Date.now()) + 30_000).toISOString(); console.warn('Background completion delivery deferred; saved output is available.'); }
+      try { await this.notify({ ...job, args: [...job.args] }); job.notifiedAt = new Date(Math.max(Date.now(), Date.parse(job.finishedAt ?? job.createdAt))).toISOString(); delete job.notifyAfter; delete job.notifyFailures; }
+      catch {
+        // B6: growing delay (30 s, 60 s, ... capped at 30 min); after 10 failed tries give up so the job is not retried forever.
+        const failures = job.notifyFailures = (job.notifyFailures ?? 0) + 1;
+        if (failures >= MAX_NOTIFY_ATTEMPTS) { job.notifyGaveUpAt = new Date(Math.max(now, Date.now())).toISOString(); delete job.notifyAfter; console.warn(`Background completion delivery gave up after ${failures} tries; saved output is available.`); }
+        else { job.notifyAfter = new Date(Math.max(now, Date.now()) + Math.min(1_800_000, 30_000 * 2 ** (failures - 1))).toISOString(); console.warn('Background completion delivery deferred; saved output is available.'); }
+      }
       await this.store.save();
     }
   }

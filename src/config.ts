@@ -8,6 +8,8 @@ export interface Config {
   oauthToken?: string;
   upgradeGithubToken?: string; upgradeRenderToken?: string; upgradeRenderServiceId?: string;
   model: string; effort: Effort; fast: boolean; permissionMode: 'auto';
+  /** D3: answer mid-task owner messages with a quick tool-less reply (LIVE_STEER, default true). */
+  liveSteer?: boolean;
   maxTurns: number; timeoutMs: number;
   /** Model families offered in /model (ALLOWED_MODEL_FAMILIES); the newest model of each comes from the Models API. */
   modelFamilies: string[];
@@ -17,10 +19,12 @@ export interface Config {
   updateKeys?: string[];
   backupKeys?: string[]; backupEncryptionKey?: string;
   keyLabels?: string[]; elevenLabsKey?: string;
+  /** W48-01: ELEVENLABS_API_KEY then ELEVENLABS_API_KEYS (comma-separated), tried in order. */
+  elevenLabsKeys?: string[];
   providers: ProviderConfig;
 }
 
-export function configSecrets(c: Config): string[] { return [c.token, c.apiKey, ...(c.oauthToken ? [c.oauthToken] : []), ...(c.upgradeGithubToken ? [c.upgradeGithubToken] : []), ...(c.upgradeRenderToken ? [c.upgradeRenderToken] : []), ...(Object.values(c.providers.keys).flat()), ...(c.backupKeys ?? []), ...(c.backupEncryptionKey ? [c.backupEncryptionKey] : []), ...(c.elevenLabsKey ? [c.elevenLabsKey] : []), ...(c.updateKeys ?? [])].filter(Boolean); }
+export function configSecrets(c: Config): string[] { return [c.token, c.apiKey, ...(c.oauthToken ? [c.oauthToken] : []), ...(c.upgradeGithubToken ? [c.upgradeGithubToken] : []), ...(c.upgradeRenderToken ? [c.upgradeRenderToken] : []), ...(Object.values(c.providers.keys).flat()), ...(c.backupKeys ?? []), ...(c.backupEncryptionKey ? [c.backupEncryptionKey] : []), ...(c.elevenLabsKey ? [c.elevenLabsKey] : []), ...(c.elevenLabsKeys ?? []), ...(c.updateKeys ?? [])].filter(Boolean); }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const required = (key: string) => {
@@ -42,6 +46,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const effort = (env.CLAUDE_EFFORT ?? 'high') as Effort;
   if (!EFFORTS.includes(effort)) throw new Error('CLAUDE_EFFORT must be low, medium, high, xhigh or max.');
   if (!['true', 'false'].includes(env.CLAUDE_FAST_MODE ?? 'true')) throw new Error('CLAUDE_FAST_MODE must be true or false.');
+  if (!['true', 'false'].includes(env.LIVE_STEER ?? 'true')) throw new Error('LIVE_STEER must be true or false.');
   const families = (env.ALLOWED_MODEL_FAMILIES ?? 'fable,opus,sonnet').split(',').map(f => f.trim());
   if (!families.length || families.length > 8 || families.some(f => !/^[a-z]{1,32}$/.test(f))) throw new Error('ALLOWED_MODEL_FAMILIES must be a comma-separated list of model families, e.g. fable,opus,sonnet.');
   const modelFamilies = [...new Set(families)];
@@ -68,8 +73,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   if (backupEncryptionKey && !/^[a-f0-9]{64}$/i.test(backupEncryptionKey)) throw new Error('Set BACKUP_ENCRYPTION_KEY to 32 random bytes encoded as hex.');
   const split = (name: string) => (env[name] ?? '').split(',').map(x => x.trim()).filter(Boolean);
   const providers: ProviderConfig = { keys: { gemini: split('GEMINI_API_KEYS'), xai: split('XAI_API_KEYS'), minimax: split('MINIMAX_API_KEYS'), openrouter: split('OPENROUTER_API_KEYS') } };
-  return { token, owner, apiKey, oauthToken: oauthToken || undefined, upgradeGithubToken: env.BOT_UPGRADE_GITHUB_TOKEN?.trim() || undefined, upgradeRenderToken: env.BOT_UPGRADE_RENDER_API_KEY?.trim() || undefined, upgradeRenderServiceId: env.BOT_UPGRADE_RENDER_SERVICE_ID?.trim() || undefined, model, backupKeys, backupEncryptionKey, keyLabels, elevenLabsKey: env.ELEVENLABS_API_KEY?.trim() || undefined, providers,
-    effort, fast: (env.CLAUDE_FAST_MODE ?? 'true') === 'true', permissionMode: 'auto', maxTurns, modelFamilies, ...(modelFamily ? { modelFamily } : {}), updateKeys: [env.RENDER_API_KEY, env.GITHUB_TOKEN].map(v => v?.trim()).filter((v): v is string => !!v),
-    timeoutMs: positive('JOB_TIMEOUT_MINUTES', 20) * 60_000,
+  const elevenLabsKeys = [...new Set([env.ELEVENLABS_API_KEY ?? '', ...(env.ELEVENLABS_API_KEYS ?? '').split(',')].map(k => k.trim()).filter(Boolean))];
+  return { token, owner, apiKey, oauthToken: oauthToken || undefined, upgradeGithubToken: env.BOT_UPGRADE_GITHUB_TOKEN?.trim() || undefined, upgradeRenderToken: env.BOT_UPGRADE_RENDER_API_KEY?.trim() || undefined, upgradeRenderServiceId: env.BOT_UPGRADE_RENDER_SERVICE_ID?.trim() || undefined, model, backupKeys, backupEncryptionKey, keyLabels, elevenLabsKey: elevenLabsKeys[0], elevenLabsKeys, providers,
+    effort, fast: (env.CLAUDE_FAST_MODE ?? 'true') === 'true', liveSteer: (env.LIVE_STEER ?? 'true') === 'true', permissionMode: 'auto', maxTurns, modelFamilies, ...(modelFamily ? { modelFamily } : {}), updateKeys: [env.RENDER_API_KEY, env.GITHUB_TOKEN].map(v => v?.trim()).filter((v): v is string => !!v),
+    // B4: idle budget per task; clamped so setTimeout cannot overflow.
+    timeoutMs: Math.min(positive('JOB_TIMEOUT_MINUTES', 20), 240) * 60_000,
     dataDir: path.resolve(env.DATA_DIR ?? './data') };
 }

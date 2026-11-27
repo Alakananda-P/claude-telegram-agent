@@ -4,7 +4,7 @@ import { mkdtemp, readFile, readdir, mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { ChatArchive } from '../src/chats.js';
-import { Controller, extendedDeadline } from '../src/controller.js';
+import { Controller, extendedDeadline, timeLimitNotice, resumeSession } from '../src/controller.js';
 import { AgentSafetyError, AgentApiError, type Runner, type AgentRequest } from '../src/agent.js';
 import { loadConfig } from '../src/config.js';
 import { StateStore } from '../src/state.js';
@@ -12,6 +12,7 @@ import type { Message } from '../src/safety.js';
 import type { Buttons } from '../src/ui.js';
 import { parseModels } from '../src/models.js';
 import { UpdateError } from '../src/updater.js';
+import { TelegramError } from '../src/telegram.js';
 import { TranscriptionError, type TranscriptionService } from '../src/transcription.js';
 
 const message = (text: string): Message => ({ from: { id: 123 }, chat: { id: 123, type: 'private' }, text });
@@ -141,11 +142,11 @@ test('Stop aborts transcription and never starts Claude', async () => {
   assert.equal(calls.length, 0); assert.equal(store.data.tasks![0].status, 'cancelled'); assert.ok(deleted.length);
 });
 
-test('explicitly paused processing retains voice uploads without queueing new messages', async () => {
-  const { bot, store } = await setup(); await bot.automation.setPaused(true);
+test('B1: explicitly paused processing queues voice instructions with a notice instead of refusing them', async () => {
+  const { bot, store, replies } = await setup(); await bot.automation.setPaused(true);
   await bot.handle(voice()); const saved = await StateStore.open(store.file);
-  assert.equal(saved.data.uploads![0].mediaType, 'voice'); assert.equal(saved.data.tasks!.length, 0);
-  assert.equal(saved.data.batches![0].status, 'collecting');
+  assert.equal(saved.data.uploads![0].mediaType, 'voice'); assert.equal(saved.data.tasks!.length, 1); assert.equal(saved.data.tasks![0].status, 'queued');
+  assert.equal(saved.data.queuePauseReason, 'owner'); assert.ok(replies.some(r => /queue is paused.*queued.*\/queue/i.test(r)));
 });
 
 test('unauthorized messages do not produce replies, uploads or jobs', async () => {
@@ -285,7 +286,8 @@ test('voice and pending photos join the running task; final text is sent and arc
   try {
     await bot.handle(message('Read bills')); await ready; assert.ok(replies.includes('I found the bill; checking totals.'));
     await bot.handle(photo('bill')); await bot.handle(voice()); await current.steering!.settled(new AbortController().signal);
-    assert.equal(store.data.tasks!.length, 1); assert.match(current.steering!.messages[0].text, /Please make one CSV/); assert.match(current.steering!.messages[0].text, /photo.jpg/);
+    // D5: the captionless photo steers the running task at once; the voice follows as its own steer.
+    assert.equal(store.data.tasks!.length, 1); assert.match(current.steering!.messages[0].text, /photo.jpg/); assert.match(current.steering!.messages[1].text, /Please make one CSV/);
   } finally { release(); await bot.idle(); }
   assert.equal(replies.filter(t => t === 'Done with your correction.').length, 1);
   const archive = await new ChatArchive(path.join(dataDir, 'bot/chats'), []).read('steer-chat');
@@ -373,7 +375,7 @@ test('busy task accepts steering, blocks project changes, /status stays responsi
   await bot.handle(message('/stop')); await bot.idle();
   assert.equal(store.data.lastJob?.status, 'cancelled');
   assert.equal(store.data.active, null);
-  assert.equal(store.data.queuePaused, true);
+  assert.ok(!store.data.queuePaused, 'B3: /stop ends only the running task');
   assert.equal(store.data.tasks!.filter(t => t.status === 'queued').length, 0);
 });
 
@@ -543,23 +545,35 @@ test('an image Telegram refuses as a photo is sent as a document instead of bein
     return { text: 'Chart ready', session: 'png-chat', cumulativeCost: 0 };
   } });
   const photos: string[] = [];
-  (sender as { sendPhoto?: (c: number, name: string) => Promise<void> }).sendPhoto = async (_c, name) => { photos.push(name); throw new Error('Bad Request: PHOTO_INVALID_DIMENSIONS'); };
+  (sender as { sendPhoto?: (c: number, name: string) => Promise<void> }).sendPhoto = async (_c, name) => { photos.push(name); throw new TelegramError(400); };
   await bot.handle(message('draw the chart')); await bot.idle();
   assert.deepEqual(photos, ['chart.png']); assert.deepEqual(files, ['chart.png']);
   assert.ok(!replies.some(r => /automatic delivery failed/.test(r)));
 });
 
-test('/files shows a short list, output first, and never names private-looking documents', async () => {
+test('/files lists only output/ (sorted, capped) and never names private-looking documents', async () => {
   const { bot, replies, dataDir } = await setup();
   const root = path.join(dataDir, 'workspaces', 'default'); await mkdir(path.join(root, 'output'), { recursive: true }); await mkdir(path.join(root, 'data'), { recursive: true });
-  for (let i = 0; i < 60; i++) await writeFile(path.join(root, 'data', `row-${String(i).padStart(2, '0')}.csv`), 'x');
-  await writeFile(path.join(root, 'output', 'report.xlsx'), 'x'); await writeFile(path.join(root, 'output', 'aadhaar_front.jpg'), 'x');
+  for (let i = 0; i < 60; i++) await writeFile(path.join(root, 'output', `row-${String(i).padStart(2, '0')}.csv`), 'x');
+  await writeFile(path.join(root, 'data', 'notes.txt'), 'x'); await writeFile(path.join(root, 'secret-plan.txt'), 'x');
+  await writeFile(path.join(root, 'output', 'a-report.xlsx'), 'x'); await writeFile(path.join(root, 'output', 'aadhaar_front.jpg'), 'x'); await writeFile(path.join(root, 'output', 'Client_SIGNATURE.png'), 'x');
   await bot.handle(message('/files'));
-  const text = replies.at(-1)!;
-  assert.ok(text.split('\n').filter(l => /\.(csv|xlsx|jpg)$/.test(l)).length <= 25, 'capped');
-  assert.match(text, /^output\/report\.xlsx/m); assert.ok(text.indexOf('output/report.xlsx') < text.indexOf('data/'), 'output first');
-  assert.doesNotMatch(text, /aadhaar/i); assert.match(text, /1 private-looking file/);
-  assert.match(text, /more file/);
+  const text = replies.at(-1)!, lines = text.split('\n').filter(l => /\.(csv|xlsx|jpg|png|txt)$/.test(l));
+  assert.ok(lines.length <= 25, 'capped'); assert.equal(lines[0], 'output/a-report.xlsx'); assert.deepEqual(lines, [...lines].sort());
+  assert.doesNotMatch(text, /data\/|notes|secret-plan/); assert.doesNotMatch(text, /aadhaar|signature/i); assert.match(text, /2 private-looking file/); assert.match(text, /more file/);
+  const empty = await setup(); await empty.bot.handle(message('/files')); assert.match(empty.replies.at(-1)!, /No files in output/);
+});
+
+test('/get applies the deliver_file checks: key files, credential content and unreadable files give clear reasons', async () => {
+  const { bot, replies, files, dataDir } = await setup();
+  const root = path.join(dataDir, 'workspaces', 'default'); await mkdir(path.join(root, '.secrets'), { recursive: true });
+  await writeFile(path.join(root, '.secrets', 'keys.txt'), 'x'); await writeFile(path.join(root, 'kaggle.json'), '{}'); await writeFile(path.join(root, '.netrc'), 'x');
+  await writeFile(path.join(root, 'notes.txt'), 'hf token hf_' + 'a1B2'.repeat(9)); await writeFile(path.join(root, 'ok.txt'), 'plain'); await writeFile(path.join(root, 'locked.txt'), 'x');
+  const { chmod } = await import('node:fs/promises'); await chmod(path.join(root, 'locked.txt'), 0o000);
+  for (const f of ['.secrets/keys.txt', 'kaggle.json', '.netrc']) { await bot.handle(message('/get ' + f)); assert.match(replies.at(-1)!, /not allowed/); }
+  await bot.handle(message('/get notes.txt')); assert.match(replies.at(-1)!, /API key or token/);
+  if (process.getuid?.() !== 0) { await bot.handle(message('/get locked.txt')); assert.match(replies.at(-1)!, /permission/); }
+  await bot.handle(message('/get ok.txt')); assert.deepEqual(files, ['ok.txt']);
 });
 
 test('a progress indicator that cannot be deleted is neutralised, so no helper text stays behind as a message', async () => {
@@ -647,7 +661,7 @@ test('project names matching Object prototype properties start without a phantom
   assert.equal(calls[0].session, undefined);
 });
 
-test('each owner steer moves the task deadline forward, capped at three time limits from the start', async () => {
+test('each owner steer moves the task deadline forward, capped at 90 minutes (B4) from the start', async () => {
   let abortedAt = 0; let began!: () => void; const started = new Promise<void>(resolve => { began = resolve; });
   const runner: Runner = { async run(_request, _emit, abort) {
     began();
@@ -665,8 +679,29 @@ test('each owner steer moves the task deadline forward, capped at three time lim
   assert.equal(store.data.tasks![0].failureKind, 'timeout');
   const start = '2026-11-24T10:00:00.000Z', limit = 20 * 60_000;
   assert.equal(extendedDeadline(start, '2026-11-24T10:20:00.000Z', limit, Date.parse('2026-11-24T10:15:00.000Z')), '2026-11-24T10:35:00.000Z');
-  assert.equal(extendedDeadline(start, '2026-11-24T10:50:00.000Z', limit, Date.parse('2026-11-24T10:55:00.000Z')), '2026-11-24T11:00:00.000Z');
+  assert.equal(extendedDeadline(start, '2026-11-24T10:50:00.000Z', limit, Date.parse('2026-11-24T10:55:00.000Z')), '2026-11-24T11:15:00.000Z');
+  assert.equal(extendedDeadline(start, '2026-11-24T11:20:00.000Z', limit, Date.parse('2026-11-24T11:25:00.000Z')), '2026-11-24T11:30:00.000Z', 'hard cap 90 minutes');
+  assert.equal(extendedDeadline(start, '2026-11-24T14:00:00.000Z', 240 * 60_000, Date.parse('2026-11-24T13:59:00.000Z')), '2026-11-24T14:00:00.000Z', 'a longer configured limit is its own cap');
   assert.equal(extendedDeadline(start, '2026-11-24T10:20:00.000Z', limit, Date.parse('2026-11-24T10:01:00.000Z')), '2026-11-24T10:21:00.000Z');
+});
+
+test('B4: effect/progress/step activity keeps a task alive past its idle limit; it stops once idle', async () => {
+  let abortedAt = 0, lastActivity = 0;
+  const runner: Runner = { async run(_request, emit, abort) {
+    const start = Date.now();
+    while (Date.now() - start < 400) { abort.signal.throwIfAborted(); await emit({ type: 'progress', text: 'Working' }); lastActivity = Date.now(); await new Promise(r => setTimeout(r, 30)); }
+    abort.signal.throwIfAborted();
+    await new Promise<void>((_resolve, reject) => abort.signal.addEventListener('abort', () => { abortedAt = Date.now(); reject(new Error('aborted')); }, { once: true }));
+    throw new Error('unreachable');
+  } };
+  const { bot, config, store } = await setup(runner); config.timeoutMs = 150;
+  await bot.handle(message('work')); await bot.idle();
+  const task = store.data.tasks![0]; assert.equal(task.failureKind, 'timeout');
+  assert.ok(abortedAt - Date.parse(task.startedAt!) >= 400, 'activity extended the deadline'); assert.ok(abortedAt - lastActivity >= 100, 'stops after the idle budget');
+});
+test('B4: JOB_TIMEOUT_MINUTES is clamped so timers cannot overflow', () => {
+  const env = { TELEGRAM_BOT_TOKEN: '123456:abcdefghijklmnopqrstuvw', TELEGRAM_OWNER_ID: '123', ANTHROPIC_API_KEY: 'test-only', DATA_DIR: '/tmp/x' };
+  assert.equal(loadConfig({ ...env, JOB_TIMEOUT_MINUTES: '100000' }).timeoutMs, 240 * 60_000); assert.equal(loadConfig(env).timeoutMs, 20 * 60_000);
 });
 
 test('timeout still aborts bounded work without a spending cap', async () => {
@@ -679,7 +714,7 @@ test('timeout still aborts bounded work without a spending cap', async () => {
   config.timeoutMs = 20;
   await bot.handle(message('work')); await bot.idle();
   assert.equal(store.data.lastJob?.status, 'cancelled');
-  assert.ok(replies.some(r => r.includes('time limit')));
+  assert.ok(replies.some(r => r.includes('time limit') && !r.includes('20 minutes') && /after \d+ seconds/.test(r)));
   assert.equal(store.data.tasks![0].failureKind, 'timeout');
   assert.equal((await StateStore.open(store.file)).data.tasks![0].failureKind, 'timeout');
 });
@@ -980,6 +1015,19 @@ test('M2: billing failures still pause the queue', async () => {
   await bot.handle(message('make the sheet')); await bot.idle();
   assert.equal(store.data.queuePaused, true); assert.equal(store.data.tasks!.length, 1);
 });
+test('B1: an API pause records why, queues new messages and resumes when a key works again; owner pauses stay', async () => {
+  let runs = 0;
+  const { bot, store, replies } = await setup({ async run(_r, emit) { runs++; await emit({ type: 'session', id: 'bill-' + runs }); if (runs === 1) throw new AgentApiError('billing_error', 'Billing'); return { text: 'done', session: 'bill-' + runs, cumulativeCost: 0 }; } });
+  bot.autoRetryDelayMs = 0;
+  await bot.handle(message('make the sheet')); await bot.idle();
+  assert.equal(store.data.queuePaused, true); assert.equal(store.data.queuePauseReason, 'api:billing_error');
+  await bot.handle(message('second job')); await bot.idle();
+  assert.equal(runs, 1); assert.equal(store.data.tasks!.at(-1)!.status, 'queued'); assert.ok(replies.some(r => /paused after a Claude API problem \(billing error\).*queued/i.test(r)));
+  const keys = bot['keys']; await keys.success(keys.list()[0].id, 'check'); await bot.idle();
+  assert.ok(!store.data.queuePaused); assert.equal(store.data.queuePauseReason, undefined); assert.equal(runs, 2); assert.equal(store.data.tasks!.at(-1)!.status, 'completed');
+  assert.ok(replies.some(r => /key works again.*resumed/i.test(r)));
+  await bot.automation.setPaused(true); await keys.success(keys.list()[0].id, 'check'); assert.equal(store.data.queuePaused, true, 'an owner pause is never lifted automatically');
+});
 
 test('N-a: a scheduled run keeps its in-between commentary out of Telegram and sends only the final answer', async () => {
   const { bot, replies, store } = await setup({ async run(_r, emit) {
@@ -994,4 +1042,121 @@ test('N-a: a scheduled run keeps its in-between commentary out of Telegram and s
   assert.ok(!replies.some(r => /2d done|Mutation check/.test(r)), replies.join(' | '));
   const archive = await new ChatArchive(path.join((bot as unknown as { config: { dataDir: string } }).config.dataDir, 'bot/chats'), []).read('sched-chat');
   assert.ok(archive.some(t => t.text === 'Mutation check passed'), 'commentary stays in the saved chat');
+});
+
+const waitFor = async (check: () => boolean) => { for (let i = 0; i < 400 && !check(); i++) await new Promise(r => setTimeout(r, 5)); return check(); };
+
+test('A2: the final answer retries a failed send, and an answer Telegram keeps refusing is resent at the next task', async () => {
+  let failures = 2; let n = 0;
+  const { bot, sender, replies, store } = await setup({ async run(_request, emit) { n++; await emit({ type: 'session', id: 'retry-chat' }); return { text: 'Answer ' + n, session: 'retry-chat', cumulativeCost: 0 }; } });
+  bot.answerRetryMs = [1, 1];
+  const send = sender.send.bind(sender);
+  sender.send = async (chat: number, text: string) => { if (/^Answer/.test(text) && failures-- > 0) throw new TelegramError(0); return send(chat, text); };
+  await bot.handle(message('first')); await bot.idle();
+  assert.equal(replies.filter(r => r === 'Answer 1').length, 1);
+  failures = 3; await bot.handle(message('second')); await bot.idle();
+  assert.ok(!replies.includes('Answer 2')); assert.deepEqual(store.data.unsentAnswers, ['Answer 2']);
+  failures = 0; await bot.handle(message('third')); await bot.idle();
+  assert.ok(replies.some(r => /Earlier answer[\s\S]*Answer 2/.test(r))); assert.ok(replies.includes('Answer 3'));
+  assert.equal(store.data.unsentAnswers, undefined);
+});
+
+test('A3: files go out once the answer is final, deliver_file never sends them twice, and a photo timeout is not re-sent as a document', async () => {
+  let release!: () => void; const hold = new Promise<void>(resolve => { release = resolve; });
+  const { bot, sender, files } = await setup({ async run(request, emit) {
+    await emit({ type: 'session', id: 'ship-chat' }); await mkdir(path.join(request.cwd, 'output'), { recursive: true });
+    await writeFile(path.join(request.cwd, 'output', 'report.csv'), 'a,b'); await writeFile(path.join(request.cwd, 'output', 'chart.png'), 'png');
+    await emit({ type: 'commentary', id: 'r1', text: 'Report ready' }); await emit({ type: 'answered' });
+    await hold; // held open for helpers
+    await request.workspace!.deliver('output/report.csv');
+    return { text: 'Report ready', session: 'ship-chat', cumulativeCost: 0 };
+  } });
+  const photos: string[] = [];
+  (sender as { sendPhoto?: (c: number, name: string) => Promise<void> }).sendPhoto = async (_c, name) => { photos.push(name); throw new TelegramError(0); };
+  await bot.handle(message('make it'));
+  assert.ok(await waitFor(() => files.includes('report.csv')), 'sent while the turn is still open');
+  release(); await bot.idle();
+  assert.deepEqual(files, ['report.csv']); assert.deepEqual(photos, ['chart.png']);
+});
+
+test('A3/A5: a failed task still sends its changed files, and a multi-part answer is not sent again', async () => {
+  let n = 0;
+  const { bot, files, replies } = await setup({ async run(request, emit) {
+    n++; await emit({ type: 'session', id: 'multi-chat' });
+    if (n === 1) { await mkdir(path.join(request.cwd, 'output'), { recursive: true }); await writeFile(path.join(request.cwd, 'output', 'partial.csv'), 'x'); throw new Error('boom'); }
+    await emit({ type: 'commentary', id: 'm1', text: 'Part one.' }); await emit({ type: 'commentary', id: 'm2', text: 'Part two.' });
+    return { text: 'Part one.\n\nPart two.', session: 'multi-chat', cumulativeCost: 0 };
+  } });
+  await bot.handle(message('fail')); await bot.idle();
+  assert.ok(await waitFor(() => files.includes('partial.csv')));
+  await bot.handle(message('multi')); await bot.idle();
+  assert.equal(replies.filter(r => /Part one/.test(r)).length, 1); assert.ok(!replies.some(r => /Use \/files/.test(r)));
+});
+
+test('D1: owner work gets a fire-and-forget eyes reaction; slash commands do not, and a failing reaction never blocks', async () => {
+  const { bot, sender, calls } = await setup(); const reactions: [number, string | undefined][] = [];
+  Object.assign(sender, { async react(_chat: number, id: number, emoji?: string) { reactions.push([id, emoji]); if (id === 3) throw new Error('reaction refused'); } });
+  await bot.handle({ ...message('First'), message_id: 1 }); await bot.idle();
+  await bot.handle({ ...message('/status'), message_id: 2 }); await new Promise(r => setTimeout(r, 5));
+  assert.deepEqual(reactions, [[1, '👀']]);
+  await bot.handle({ ...message('Second'), message_id: 3 }); await bot.idle();
+  assert.deepEqual(reactions.map(r => r[0]), [1, 3]); assert.equal(calls.length, 2, 'a refused reaction does not stop the task');
+});
+
+test('D2: a reply carries who sent the target, its redacted text or the selected quote, and saves replied-to media', async () => {
+  const { bot, calls, config, downloads } = await setup();
+  await bot.handle({ ...message('fix this line'), reply_to_message: { ...message('line one ' + config.token + ' line two'), message_id: 7 } }); await bot.idle();
+  assert.match(calls[0].prompt, /replied to your own earlier message \(owner\)/); assert.match(calls[0].prompt, /Its text:[\s\S]*line one \[REDACTED\] line two/);
+  assert.ok(!calls[0].prompt.includes(config.token));
+  await bot.handle({ ...message('only this part'), quote: { text: 'line two' }, reply_to_message: { ...message('line one, line two'), message_id: 8 } }); await bot.idle();
+  assert.match(calls[1].prompt, /Selected part the owner quoted:\n<<<\nline two\n>>>/); assert.ok(!calls[1].prompt.includes('line one'));
+  const botPhoto = { ...photo('chart'), from: { id: 123456, is_bot: true }, message_id: 9, date: 1, caption: 'Sales chart' } as Message;
+  await bot.handle({ ...message('make it blue'), reply_to_message: botPhoto }); await bot.idle();
+  assert.deepEqual(downloads, ['chart-large']);
+  assert.match(calls[2].prompt, /replied to a bot message \(ID 9\)/); assert.match(calls[2].prompt, /Its caption:[\s\S]*Sales chart/); assert.match(calls[2].prompt, /saved at project path: uploads\/[\w-]+-photo\.jpg/);
+});
+
+test('D5: captionless files while a task runs steer it with their paths; an album timer is reset before a slow download', async () => {
+  let release!: () => void; let began!: () => void;
+  const ready = new Promise<void>(resolve => { began = resolve; }); const wait = new Promise<void>(resolve => { release = resolve; }); const calls: AgentRequest[] = [];
+  const { bot, store, sender } = await setup({ async run(r, emit) { calls.push(r); if (calls.length === 1) { began(); await wait; } await emit({ type: 'session', id: 'same-chat' }); return { session: 'same-chat', text: 'Done', cumulativeCost: 0 }; } });
+  bot.albumDelayMs = 20;
+  await bot.handle(message('First')); await ready;
+  await bot.handle(photo('loose')); await calls[0].steering!.settled(new AbortController().signal);
+  assert.match(calls[0].steering!.messages[0].text, /without a caption while you work[\s\S]*uploads\/[\w-]+-photo\.jpg/);
+  await bot.handle(photo('a', 'album-run')); await bot.handle(photo('b', 'album-run'));
+  for (let i = 0; i < 200 && calls[0].steering!.messages.length < 2; i++) await new Promise(r => setTimeout(r, 5));
+  await calls[0].steering!.settled(new AbortController().signal);
+  assert.equal(calls[0].steering!.messages.length, 2); assert.equal((calls[0].steering!.messages[1].text.match(/uploads\//g) ?? []).length, 2, 'both album items in one steer');
+  assert.ok(!store.data.batches!.some(b => b.status === 'collecting'), 'nothing parked');
+  release(); await bot.idle();
+  const download = sender.download; let slow = 0;
+  sender.download = async (id: string) => { if (id.startsWith('s2')) await new Promise(r => setTimeout(r, 80)); slow++; return download(id); };
+  await bot.handle({ ...photo('s1', 'album-slow'), caption: 'SLOW ALBUM' }); await bot.handle(photo('s2', 'album-slow'));
+  for (let i = 0; i < 200 && calls.length < 2; i++) await new Promise(r => setTimeout(r, 5));
+  await bot.idle(); assert.equal(slow, 2);
+  assert.equal(calls.length, 2, 'one task for the slow album'); assert.equal((calls[1].prompt.match(/uploads\//g) ?? []).length, 2, 'slow item not left behind');
+});
+
+test('time-limit notice states the real elapsed time', () => {
+  assert.equal(timeLimitNotice(47 * 60_000 + 10_000, 20 * 60_000), 'This task reached its time limit after 47 minutes (no activity for 20 minutes) and was stopped.');
+  assert.match(timeLimitNotice(61_000, 60_000), /after 1 minute \(no activity for 1 minute\)/);
+});
+
+test('typing stops after the answer and resumes when an owner steer restarts work', async () => {
+  let release!: () => void; let answered!: () => void;
+  const ready = new Promise<void>(resolve => { answered = resolve; }); const wait = new Promise<void>(resolve => { release = resolve; });
+  const { bot, sender } = await setup({ async run(_r, emit) { await emit({ type: 'session', id: 'typing-chat' }); await emit({ type: 'commentary', id: 'a', text: 'First answer' }); await emit({ type: 'answered' }); answered(); await wait; return { session: 'typing-chat', text: 'Done', cumulativeCost: 0 }; } });
+  const typing: string[] = []; (sender as { typing: (chat: number, action?: string) => Promise<void> }).typing = async (_chat, action) => { typing.push(action ?? 'typing'); };
+  await bot.handle(message('First')); await ready; typing.length = 0;
+  await bot.handle(message('One more thing')); assert.ok(typing.includes('typing'), 'typing resumes for the steer');
+  release(); await bot.idle();
+});
+
+test('E3: the Claude runner never resumes a provider-* session id', () => {
+  const latest = (id: string) => id === 'provider-1' ? 'claude-session' : undefined;
+  assert.equal(resumeSession('claude-a', 'claude-opus-4-1', latest), 'claude-a');
+  assert.equal(resumeSession('provider-1', 'claude-opus-4-1', latest), 'claude-session');
+  assert.equal(resumeSession('provider-2', 'claude-opus-4-1', latest), undefined);
+  assert.equal(resumeSession(undefined, 'claude-opus-4-1', latest), undefined);
 });

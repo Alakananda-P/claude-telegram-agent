@@ -85,3 +85,15 @@ test('M1: a handler that throws does not stop polling; only 401/403/409 from a h
   const fatal = { async call<T>(): Promise<T> { return [{ update_id: 4, message: { chat: { id: 123, type: 'private' }, text: 'x' } }] as T; } };
   await assert.rejects(poll(fatal, store, async () => { throw new TelegramError(409); }, stop.signal), (e: unknown) => e instanceof TelegramError && e.code === 409);
 });
+
+test('B6: polling honours retry_after on 429 and keeps going when saves fail', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'tg-retry-')); const store = await StateStore.open(path.join(root, 'state.json'));
+  let attempts = 0, handled = 0, saveCalls = 0; const waits: number[] = []; const abort = new AbortController();
+  store.save = async () => { saveCalls++; throw new Error('ENOSPC'); };
+  const errors: string[] = []; const original = console.error; console.error = (m: string) => { errors.push(m); };
+  try {
+    const client = { async call<T>(): Promise<T> { if (++attempts === 1) throw new TelegramError(429, 17); return [{ update_id: attempts, message: { text: 'hi' } }] as T; } };
+    await poll(client, store, async () => { if (++handled === 2) abort.abort(); }, abort.signal, undefined, undefined, { wait: async ms => { waits.push(ms); } });
+  } finally { console.error = original; }
+  assert.deepEqual(waits, [17_000]); assert.equal(handled, 2); assert.ok(saveCalls >= 3); assert.equal(errors.length, 1);
+});

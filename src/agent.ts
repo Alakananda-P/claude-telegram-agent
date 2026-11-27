@@ -14,6 +14,10 @@ import { PROJECT_TOOL_NAMES, projectServer, projectToolAllowedDuringChange, type
 export type AgentEvent = { type: 'session'; id: string } | { type: 'progress'; text: string }
   | { type: 'helpers'; count: number }
   | { type: 'commentary'; id: string; text: string } | { type: 'steered'; ids: string[] }
+  /** A bot status line for the owner, never part of Claude's answer (it must not count as the published answer). */
+  | { type: 'notice'; text: string }
+  /** A3: the owner's answer is out while the turn stays open (helpers/steers); the host may start file delivery. */
+  | { type: 'answered' }
   | { type: 'usage'; session: string; id: string; models: Record<string, unknown>; cost: number }
   | { type: 'step'; session: string; id: string; model: string; usage: Record<string, unknown>; complete: boolean }
   | { type: 'speed'; state: string } | { type: 'effect'; tool?: string }
@@ -194,7 +198,7 @@ export class ClaudeRunner implements Runner {
     const background = new NativeBackground();
     try {
       stream = this.makeQuery({ prompt: input.stream(request.prompt, signal), options });
-      let initialAnswered = false, correctionSent = false;
+      let initialAnswered = false, correctionSent = false, answeredSent = false;
       const corrections = new Map<string, string[]>();
       const heldOpen = (answeredIds: string[], origin?: string): AgentEvent => ({ type: 'held_open', initialAnswered, helpers: background.count,
         unanswered: input.messages.filter(m => !m.answered).length, preparing: input.pendingPreparations,
@@ -217,7 +221,7 @@ export class ClaudeRunner implements Runner {
           if (prompting || input.pendingPreparations || input.messages.some(m => !m.answered)) continue;
           const helpers = background.count;
           await emit({ type: 'idle_closed', helpers });
-          if (helpers) await emit({ type: 'commentary', id: 'idle-closed', text: `${helpers} helper(s) did not report back within ${Math.round(this.idle.helperMs / 60_000)} minutes after the answer, so this task was closed. Their work may be unfinished.` });
+          if (helpers) await emit({ type: 'notice', text: `${helpers} helper(s) did not report back within ${Math.round(this.idle.helperMs / 60_000)} minutes after the answer, so this task was closed. Their work may be unfinished.` });
           input.close(); idleClosed = true; break;
         }
         pull = undefined;
@@ -346,6 +350,7 @@ export class ClaudeRunner implements Runner {
             await emit({ type: 'commentary', id: event.uuid, text: event.result });
             lastPublished = event.result;
           }
+          if (initialAnswered && !answeredSent) { answeredSent = true; await emit({ type: 'answered' }); }
         }
       }
       if (safetyError) throw safetyError;

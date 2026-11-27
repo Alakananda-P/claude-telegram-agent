@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { lstat, realpath } from 'node:fs/promises';
+import { lstat, realpath, readFile } from 'node:fs/promises';
 
 interface TelegramFile { file_id: string; file_name?: string; file_size?: number; mime_type?: string }
 interface TelegramVideo extends TelegramFile { width?: number; height?: number; duration?: number; thumbnail?: { file_id: string } }
@@ -19,6 +19,8 @@ export interface Message {
   video_note?: TelegramFile & { length?: number; duration?: number };
   photo?: { file_id: string; file_unique_id?: string; width: number; height: number; file_size?: number }[];
   media_group_id?: string;
+  /** Telegram partial quote: the part of reply_to_message the owner selected. */
+  quote?: { text: string };
 }
 export interface Callback { id: string; from: { id: number }; data?: string; message?: Message }
 
@@ -26,14 +28,34 @@ export function authorized(message: Message, owner: number): boolean {
   return message.from?.id === owner && message.chat.type === 'private' && message.chat.id === owner;
 }
 
+/** H-11 / C1: one table of well-known token shapes for redact(), detectTokens() and maskTokens(). */
+const TOKEN_PATTERNS: [string, RegExp][] = [
+  ['Anthropic API key', /\bsk-ant-[A-Za-z0-9_-]{8,}/g],
+  ['GitHub token', /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})/g],
+  ['Kaggle token', /\bKGAT_[A-Za-z0-9_-]{16,}/g],
+  ['Telegram bot token', /\b\d{8,10}:[A-Za-z0-9_-]{35}\b/g],
+  ['OpenAI key', /\bsk-(?!ant-)(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}/g],
+  ['ElevenLabs key', /\bsk_[a-f0-9]{32,}\b/g],
+  ['Hugging Face token', /\bhf_[A-Za-z0-9]{30,}\b/g],
+  ['Google API key', /\bAIza[0-9A-Za-z_-]{25,}/g],
+  ['AWS access key', /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g],
+  ['Render API key', /\brnd_[A-Za-z0-9]{20,}/g],
+  ['Slack token', /\bxox[abposre]-[A-Za-z0-9-]{10,}/g],
+  ['Modal token', /\ba[ks]-[A-Za-z0-9]{20,}\b/g],
+];
+// Verhoeff tables: a bare 12-digit number is masked as Aadhaar only when its check digit is valid.
+const VD = ['0123456789', '1234067895', '2340178956', '3401289567', '4012395678', '5987604321', '6598710432', '7659821043', '8765932104', '9876543210'].map(r => [...r].map(Number));
+const VP = ['0123456789', '1576283094', '5803796142', '8916043527', '9453126870', '4286573901', '2793806415', '7046913258'].map(r => [...r].map(Number));
+export function verhoeffValid(digits: string): boolean { if (!/^\d+$/.test(digits)) return false; let c = 0; [...digits].reverse().forEach((d, i) => { c = VD[c][VP[i % 8][Number(d)]]; }); return c === 0; }
+
 export function redact(text: string, secrets: string[] = []): string {
   let result = text;
   for (const secret of secrets.filter(Boolean).sort((a, b) => b.length - a.length)) result = result.split(secret).join('[REDACTED]');
   result = result.replace(/sk-ant-[A-Za-z0-9_-]+/g, '[REDACTED]')
     .replace(/\bbot\d+:[A-Za-z0-9_-]+/g, 'bot[REDACTED]')
-    .replace(/\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|KGAT_[A-Za-z0-9_-]{16,}|AIza[A-Za-z0-9_-]{25,}|sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,})\b/g, '[REDACTED]')
-    .replace(/\b(bot)?\d{6,14}:[A-Za-z0-9_-]{20,}/g, (_all, bot) => (bot ?? '') + '[REDACTED]')
-    .replace(/(\bBearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi, '$1[REDACTED]')
+    .replace(/\b(bot)?\d{6,14}:[A-Za-z0-9_-]{20,}/g, (_all, bot) => (bot ?? '') + '[REDACTED]');
+  for (const [, re] of TOKEN_PATTERNS) result = result.replace(re, '[REDACTED]');
+  result = result.replace(/(\bBearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi, '$1[REDACTED]')
     .replace(/(\b[a-z][a-z0-9+.-]{0,31}:\/\/[^\s/:@]+:)[^\s/@]+(@)/gi, '$1[REDACTED]$2');
   result = result.replace(/(\b(?:[a-z][a-z0-9_]*_)?(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|authorization|password|passwd|secret|token|kaggle[_ -]?key)\b["']?\s*[:=]\s*)("(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|[^\s&;,<>{}"']+)/gi, (all, label, value) => {
     if (/^(?:["']?(?:process\.env\.|os\.environ|your_|replace_|<[^>]+>|\[REDACTED\]))/i.test(value)) return all;
@@ -41,6 +63,8 @@ export function redact(text: string, secrets: string[] = []): string {
     return label + quote + '[REDACTED]' + quote;
   });
   return result.replace(/(\b(?:aadhaar|aadhar|adhaar|uidai)(?:\s*(?:number|no\.?))?\s*[:=]\s*)(?:\d[ -]?){11}\d\b/gi, '$1[REDACTED]')
+    // C1: a bare Aadhaar (2-9 first, 12 digits or 4-4-4) only when the Verhoeff check digit holds; amounts and most invoice numbers stay.
+    .replace(/(?<![\w.,/-])([2-9]\d{3})([ -]?)(\d{4})\2(\d{4})(?![\w]|[.,/-]\d)/g, (all, a, _sep, b, c) => verhoeffValid(a + b + c) ? '[REDACTED]' : all)
     .replace(/(\bpan(?:\s*(?:card|number|no\.?))?\s*[:=]\s*)[A-Z]{5}\d{4}[A-Z]\b/gi, '$1[REDACTED]');
 }
 
@@ -72,9 +96,14 @@ export function projectName(name: string): string {
   return name;
 }
 
+// C2: key files and secret folders never leave through /get, deliver_file, /files, auto-send or project backups.
 export function secretPath(relative: string): boolean {
-  return relative.split(/[\\/]/).some(part => /^(\.env(?:\..*)?|\.git|\.ssh|\.aws|\.claude|credentials(?:\..*)?|id_rsa|id_ed25519)$/i.test(part)
-    || /\.(pem|key|p12|pfx)$/i.test(part));
+  return relative.split(/[\\/]/).some(part => /^(\.env(?:\..*)?|\.git|\.ssh|\.aws|\.claude|\.kaggle|\.docker|\.gnupg|\.secrets?|secrets?(?:\.[a-z0-9]+)?|kaggle\.json|\.netrc|_netrc|\.pgpass|\.git-credentials|\.npmrc|\.pypirc|credentials(?:\..*)?|id_(?:rsa|dsa|ecdsa|ed25519)(?:\.pub)?)$/i.test(part)
+    || /\.(pem|key|p12|pfx|jks|keystore|ppk)$/i.test(part));
+}
+/** C3: configured credentials or a recognizable token shape inside file bytes. */
+export function credentialContent(bytes: Buffer, secrets: string[] = []): boolean {
+  return secrets.some(s => s.length > 5 && bytes.includes(Buffer.from(s))) || detectTokens(bytes.toString('latin1')).length > 0;
 }
 
 export class PathAccessError extends Error { constructor(message: string, readonly code?: string) { super(message); } }
@@ -102,17 +131,15 @@ export async function safeFile(root: string, relative: string): Promise<string> 
   }
 }
 
-/** H-11 / R-05: well-known token shapes an owner might paste by mistake. */
-const TOKEN_PATTERNS: [string, RegExp][] = [
-  ['Anthropic API key', /\bsk-ant-[A-Za-z0-9_-]{20,}/g],
-  ['GitHub token', /\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})/g],
-  ['Telegram bot token', /\b\d{8,10}:[A-Za-z0-9_-]{35}\b/g],
-  ['OpenAI key', /\bsk-(?:proj-)?[A-Za-z0-9_-]{32,}/g],
-  ['Google API key', /\bAIza[0-9A-Za-z_-]{35}\b/g],
-  ['AWS access key', /\bAKIA[0-9A-Z]{16}\b/g],
-  ['Render API key', /\brnd_[A-Za-z0-9]{20,}/g],
-  ['Slack token', /\bxox[abposr]-[A-Za-z0-9-]{10,}/g],
-];
+/** C3 / H-25: one gate for owner-bound transfers (/get, deliver_file): safe path, 49 MB, readable, no credentials; reasons are owner-readable. */
+export async function sendableFile(root: string, relative: string, secrets: string[] = []): Promise<{ file: string; bytes: Buffer }> {
+  const file = await safeFile(root, relative);
+  if ((await lstat(file)).size > 49_000_000) throw new PathAccessError('File exceeds the 49 MB download limit.');
+  const bytes = await readFile(file).catch((error: NodeJS.ErrnoException) => { throw new PathAccessError(error.code === 'EACCES' || error.code === 'EPERM' ? 'File cannot be read: storage permission was denied. Fix its permissions (for example chmod u+r) and try again.'
+    : error.code === 'ENOENT' ? 'File was removed before it could be sent.' : 'File could not be read from project storage. Check storage and try again.', error.code); });
+  if (credentialContent(bytes, secrets)) throw new PathAccessError('This file appears to contain an API key or token, so it was not sent. Remove the credential from the file first.');
+  return { file, bytes };
+}
 /** Names of the token kinds found in a text (no values). */
 export function detectTokens(text: string): string[] { return TOKEN_PATTERNS.filter(([, re]) => { re.lastIndex = 0; return re.test(text); }).map(([name]) => name); }
 /** The text with every recognizable token replaced by a label, for archives and previews. */

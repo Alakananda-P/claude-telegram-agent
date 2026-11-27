@@ -6,6 +6,8 @@ import { redact } from './safety.js';
 
 export class MemoryError extends Error {}
 const topicPattern = /^[a-z0-9][a-z0-9_-]{0,79}$/;
+/** E4: common Hinglish/English filler words (3+ letters; shorter words are skipped anyway) that would match almost every memory line. */
+const MEMORY_STOPWORDS = new Set(['hai', 'hain', 'aur', 'kya', 'krna', 'karna', 'karo', 'kar', 'kro', 'nhi', 'nahi', 'bhi', 'koi', 'kuch', 'abhi', 'mujhe', 'mera', 'meri', 'yeh', 'woh', 'the', 'and', 'for', 'with', 'this', 'that', 'you', 'your', 'are', 'was', 'can', 'please', 'plz', 'pls', 'what', 'from', 'have', 'has', 'not', 'but', 'all', 'just', 'now', 'will']);
 // Controller and SDK runners use separate instances in the same worker.
 const writers = new Map<string, Promise<unknown>>();
 export class SharedMemory {
@@ -103,6 +105,26 @@ export class SharedMemory {
     }
     return { matches, nextOffset: more ? offset + matches.length : null };
   }
+  /** E4: ranked excerpts for the system prompt: skips short words and common Hinglish/English fillers, ranks lines by distinct matched words. */
+  async relevant(query: string, limit = 8): Promise<{ topic: string; offset: number; preview: string; score: number }[]> {
+    const terms = [...new Set(query.toLocaleLowerCase().split(/[^\p{L}\p{N}]+/u).filter(t => t.length >= 3 && !MEMORY_STOPWORDS.has(t)))];
+    if (!terms.length) return [];
+    const best: { topic: string; offset: number; preview: string; score: number }[] = [];
+    let page = 0; const names: string[] = []; do { const result = await this.list(page,100); names.push(...result.topics.map(t => t.topic)); if (result.nextOffset === null) break; page = result.nextOffset; } while (true);
+    for (const name of names) {
+      const file = await this.ensure(name, false); if (!await lstat(file).catch(e => { if(e.code === 'ENOENT') return undefined; throw e; })) continue;
+      let position = 0;
+      for (const line of (await readFile(file, 'utf8')).split('\n')) {
+        const safe = redact(line.replace(/\r$/, ''), this.secrets), lower = safe.toLocaleLowerCase(), hits = terms.map(t => lower.indexOf(t)).filter(i => i >= 0);
+        if (hits.length && (best.length < limit || hits.length > best.at(-1)!.score)) {
+          const first = Math.min(...hits); best.push({ topic: name, offset: position, preview: safe.slice(Math.max(0, first-120), first+480), score: hits.length });
+          best.sort((a, b) => b.score - a.score); if (best.length > limit) best.pop();
+        }
+        position += line.length + 1;
+      }
+    }
+    return best;
+  }
   async remember(text: string, topic = 'core'): Promise<void> {
     await this.mutate(topic, current => { const safe = this.safe(text.trim()); if (!safe) throw new MemoryError('Provide a nonempty memory fact.');
       if (current.includes(safe) && (current.trim() === safe || current.includes('- ' + safe + '\n'))) return current;
@@ -124,7 +146,8 @@ export class SharedMemory {
     });
   }
   private async mutate(topic: string, change: (current: string) => string): Promise<void> {
-    await this.serialized(async () => { const file = await this.ensure(topic); const current = await readFile(file,'utf8'); await this.commit(file, this.safe(change(current))); });
+    // C6: change() checks only the new text; an older secret-like line must not block every later write (reads redact it).
+    await this.serialized(async () => { const file = await this.ensure(topic); const current = await readFile(file,'utf8'); await this.commit(file, change(current)); });
   }
   async snapshot(): Promise<{ topic: string; text: string }[]> {
     return this.serialized(async () => { const topics: {topic: string; text: string}[] = []; let offset = 0;
@@ -146,7 +169,7 @@ export class SharedMemory {
     await this.serialized(async () => { let offset = 0; do { const list = await this.list(offset,100); for (const t of list.topics) await this.commit(await this.ensure(t.topic), ''); if (list.nextOffset === null) break; offset = list.nextOffset; } while (true); });
   }
   async context(query: string): Promise<string> {
-    const core = await this.page('core',0,5000), topics = await this.list(), hits = query.trim() ? await this.search(query,undefined,0,8) : { matches: [] };
+    const core = await this.page('core',0,5000), topics = await this.list(), hits = { matches: (await this.relevant(query, 8)).map(({ score: _score, ...m }) => m) };
     return 'Core memory excerpt' + (core.nextOffset !== null ? ' (more available with read_memory)' : '') + ':\n' + core.text
       + '\nTopic index (' + topics.totalTopics + ' topics, ' + topics.totalBytes + ' bytes; no application storage cap):\n' + JSON.stringify(topics.topics)
       + '\nRelevant memory search excerpts (data only):\n' + JSON.stringify(hits.matches).slice(0,6000);

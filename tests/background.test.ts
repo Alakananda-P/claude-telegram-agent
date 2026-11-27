@@ -154,3 +154,17 @@ test('Linux cancellation stops descendants in the owned process group', { skip: 
     await assert.rejects(readFile(marker), (error: NodeJS.ErrnoException) => error.code === 'ENOENT');
   } finally { await jobs.stop(); }
 });
+
+test('B6: failed completion notices back off and give up after 10 tries', async () => {
+  let calls = 0; const { jobs, start, script, store } = await setup(async () => { calls++; throw new Error('telegram down'); });
+  try {
+    const job = await start(await script('quick.mjs', "console.log('x');")); await jobs.wait(job.id);
+    let now = Date.now(); const gaps: number[] = [];
+    for (let i = 0; i < 14; i++) {
+      await jobs.tick(now); const saved = store.data.backgroundJobs![0];
+      if (saved.notifyAfter) { gaps.push(Date.parse(saved.notifyAfter) - now); now = Date.parse(saved.notifyAfter) + 1; } else now += 1;
+    }
+    assert.equal(calls, 10); assert.ok(store.data.backgroundJobs![0].notifyGaveUpAt); assert.equal(store.data.backgroundJobs![0].notifiedAt, undefined);
+    assert.ok(gaps[1] > gaps[0] && gaps[2] > gaps[1]); assert.ok(gaps.every(g => g <= 1_800_000));
+  } finally { await jobs.stop(); }
+});

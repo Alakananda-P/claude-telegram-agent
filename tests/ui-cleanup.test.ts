@@ -181,15 +181,15 @@ test('cleanup survives restart and retries failed deletion without dropping its 
   assert.equal(requests.filter(r => r.method === 'deleteMessage').length, 2);
 });
 
-test('paused chat input is not queued; transient controls expire and final answers remain', async t => {
+test('B1: paused chat input is queued and runs on resume; transient controls expire and final answers remain', async t => {
   const { tg, store, requests } = await setup(t);
   const config = loadConfig({ TELEGRAM_BOT_TOKEN: '123456:abcdefghijklmnopqrstuvw', TELEGRAM_OWNER_ID: '123', ANTHROPIC_API_KEY: 'test-only', DATA_DIR: path.dirname(store.file) });
   const bot = new Controller(config, store, tg, { async run(_r, emit) { await emit({ type: 'session', id: 'test-session' }); return { text: 'Permanent completed report', session: 'test-session', cumulativeCost: 0 }; } });
   const handle = (text: string) => bot.handle({ chat: { id: 123, type: 'private' }, from: { id: 123 }, text });
   await handle('/menu'); store.data.queuePaused = true;
   await handle('Prepare the report');
-  assert.equal(store.data.tasks!.length, 0);
-  await handle('/queue resume'); await handle('Prepare the report'); await bot.idle();
+  assert.equal(store.data.tasks!.length, 1); assert.equal(store.data.tasks![0].status, 'queued');
+  await handle('/queue resume'); await bot.idle();
   assert.ok(requests.some(r => r.method === 'sendMessage' && r.body.text === 'Permanent completed report'));
   await handle('/delete test-session'); await handle('/trashmove test-session');
   const trash = store.data.uiMessages!.find(m => m.scope === 'controls')!;

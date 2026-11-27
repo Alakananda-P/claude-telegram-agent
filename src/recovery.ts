@@ -41,13 +41,14 @@ export class ResilientRunner implements Runner {
           d.health.apiError = error.kind; await this.pool.failure(credential.id, error.kind);
           if (effects) throw new AgentApiError(error.kind, error.message + ' Work may already have changed files or external systems. Review it before explicitly retrying from Queue; no automatic replay was performed.');
           lastError = error;
-          // M2: a rate limit, or a busy API on the last key left, gets one more try on the same key after a short wait.
+          // M2/B2: a busy API or a rate limit on the last key left gets one more try on the same key after a short wait;
+          // otherwise a rate-limited key rests (key-pool cooldown) and the next healthy key takes over.
           const lastKey = credential.id === available[available.length - 1].id;
-          if (((BUSY_API_KINDS.includes(error.kind) && lastKey) || error.kind === 'rate_limit') && transient++ < 1) {
+          if ((BUSY_API_KINDS.includes(error.kind) || error.kind === 'rate_limit') && lastKey && transient++ < 1) {
             await delay(this.backoffMs, undefined, { signal: abort.signal }); continue;
           }
-          if (['authentication_failed', 'billing_error', ...BUSY_API_KINDS].includes(error.kind)) {
-            if (!BUSY_API_KINDS.includes(error.kind)) onlyBusy = false;
+          if (['authentication_failed', 'billing_error', 'rate_limit', ...BUSY_API_KINDS].includes(error.kind)) {
+            if (!BUSY_API_KINDS.includes(error.kind) && error.kind !== 'rate_limit') onlyBusy = false;
             switched = true; break;
           }
           throw error;

@@ -16,7 +16,8 @@ test('image crop/rotation preserves originals and rejects traversal', async () =
   const meta = await sharp(await readFile(path.join(root, out.path))).metadata();
   assert.equal(meta.width, 40); assert.equal(meta.height, 60);
   assert.deepEqual(await readFile(path.join(root, 'uploads/bill.png')), original);
-  assert.ok((await changedArtifacts(root, before)).includes(out.path));
+  // C5: crops land in tmp/edits/, outside output/, so they are never auto-sent.
+  assert.match(out.path, /^tmp\/edits\/image-[a-z0-9-]+\.jpg$/); assert.deepEqual(await changedArtifacts(root, before), []);
   await assert.rejects(editImage(root, '../outside.png', {}), /path|allowed/i);
 });
 test('bill validation flags inconsistent totals and unresolved fields instead of guessing', () => {
@@ -35,4 +36,10 @@ test('deskew detects a tilted bill grid and keeps the source intact', async () =
   const out = await editImage(root, 'bill.png', { deskew: true, contrast: true });
   assert.ok(Math.abs(out.deskewAngle + 6) <= 1, `Detected ${out.deskewAngle}`);
   assert.deepEqual(await readFile(path.join(root, 'bill.png')), tilted);
+});
+
+test('private-name filter covers passport photo, signature, KYC, passport, PAN and Aadhaar names in any case', async () => {
+  const { privateDocument } = await import('../src/artifacts.js');
+  for (const name of ['output/Client_passport_PHOTO.jpg', 'output/signature.png', 'output/KYC-docs.pdf', 'output/passport_scan.jpg', 'output/PAN_card.pdf', 'output/e-Aadhaar.pdf']) assert.ok(privateDocument(name), name);
+  for (const name of ['output/report.xlsx', 'output/design.png', 'output/panel.csv', 'output/photosynthesis.md', 'output/photo_collage.jpg', 'output/photos/a.jpg']) assert.ok(!privateDocument(name), name);
 });

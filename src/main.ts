@@ -9,6 +9,7 @@ import { poll } from './polling.js';
 import { UsageLedger } from './usage.js';
 import { settingsLabel } from './settings.js';
 import { ChatArchive } from './chats.js';
+import { LiveSteerResponder } from './live-steer.js';
 import { HaikuTitles } from './titles.js';
 import { ResilientRunner } from './recovery.js';
 import { acceptance } from './acceptance.js';
@@ -69,7 +70,7 @@ async function main(): Promise<void> {
     const probe = await messageProbe(ledger)(selected.apiKey, AbortSignal.timeout(15_000));
     return probe.ok;
   });
-  const controller = new Controller(config, store, telegram, routedRunner, ledger, new HaikuTitles(config, ledger, undefined, () => keys.selectedConfig()), keys);
+  const controller = new Controller(config, store, telegram, routedRunner, ledger, new HaikuTitles(config, ledger, undefined, () => keys.selectedConfig()), keys, undefined, new LiveSteerResponder(config, ledger, undefined, () => keys.selectedConfig()));
   controller.models = models;
   const updates = updateConfig(process.env); if (updates) controller.updates = new UpdateClient(updates);
   announce = () => controller.announceModelChanges().catch(() => {});

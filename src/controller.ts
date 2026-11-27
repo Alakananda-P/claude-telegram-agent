@@ -3,11 +3,12 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, lstat, readdir, readFile, writeFile, statfs, chmod, unlink } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { setTimeout as delay } from 'node:timers/promises';
 import { configSecrets, type Config } from './config.js';
 import { AgentError, AgentApiError, AgentSafetyError, type Runner, type PlanDecision } from './agent.js';
 import { BUSY_API_KINDS, PAUSE_API_KINDS } from './recovery.js';
 import { StateStore, StateSaveError } from './state.js';
-import { authorized, projectName, redact, privatePreview, safeFile, secretPath, detectTokens, maskTokens, PathAccessError, type Message, type Callback } from './safety.js';
+import { authorized, projectName, redact, privatePreview, safeFile, sendableFile, secretPath, detectTokens, maskTokens, PathAccessError, type Message, type Callback } from './safety.js';
 import { EFFORTS, effectiveSettings, settingsLabel, modelLabel, familyOf, familySettings, settingsFamily, type AgentSettings, type Effort } from './settings.js';
 import { ModelCatalog, type CatalogModel } from './models.js';
 import { PriceBook } from './pricing.js';
@@ -18,9 +19,11 @@ import { button, BACK, HOME, type Buttons } from './ui.js';
 import { ChatArchive } from './chats.js';
 import { SessionCatalog, sessionTitle } from './sessions.js';
 import { TitleAccountingError, type TitleGenerator } from './titles.js';
+import type { QuickResponder } from './live-steer.js';
 import { Automation, clockInfo, type Task, type Batch, type SteerRecord, type TelegramMessageContext } from './automation.js';
-import type { MessageListOptions, MessageDeletion } from './telegram.js';
-import { TelegramError } from './telegram.js';
+import type { MessageListOptions, MessageDeletion, BotProfile, ProfileChange } from './telegram.js';
+import { TelegramError, profilePhotoKind } from './telegram.js';
+import { LiveStatus } from './live-status.js';
 import { SteeringInput } from './steering.js';
 import { artifactSnapshot, changedArtifactReport, privateDocument } from './artifacts.js';
 import { Backups } from './backup.js';
@@ -35,6 +38,7 @@ import type { ProjectToolContext } from './project-tools.js';
 import { ProjectUI, type ProjectTab } from './project-ui.js';
 
 interface ProjectChange { action: 'switch' | 'archive' | 'trash'; project: string; continueTask?: string }
+interface ProfileRequest { id: string; change: ProfileChange; summary: string; expires: number }
 interface UpgradeRequest { id: string; repo: string; commit: string; summary: string; files: string[]; expires: number }
 const run = promisify(execFile);
 
@@ -49,7 +53,8 @@ export interface Messenger {
   temporary(chat: number, text: string): Promise<number>;
   edit(chat: number, id: number, text: string): Promise<void>;
   remove(chat: number, id: number): Promise<void>;
-  typing(chat: number): Promise<void>;
+  typing(chat: number, action?: 'typing' | 'upload_document' | 'upload_photo'): Promise<void>;
+  react?(chat: number, id: number, emoji?: string): Promise<void>;
   panel?(chat: number, text: string, buttons: Buttons, editId?: number, scope?: string): Promise<void>;
   notice?(chat: number, text: string, scope?: string, ttlMs?: number): Promise<void>;
   dismiss?(chat: number, scope?: string, graceMs?: number): Promise<void>;
@@ -57,6 +62,8 @@ export interface Messenger {
   acknowledge?(id: string): Promise<void>;
   clear?(chat: number, includeLegacy?: boolean): Promise<boolean>;
   queueClear?(chat: number): Promise<void>;
+  botProfile?(): Promise<BotProfile>;
+  applyProfile?(change: ProfileChange): Promise<string[]>;
 }
 
 const HELP = `Your Claude assistant
@@ -97,17 +104,33 @@ Claude can use tools without slash commands, including removing its obsolete mes
 /health — Telegram, Claude, queue, storage and API recovery
 /keys — API key status, automatic checks and saved history`;
 
+const FILES_STEER_NOTE = 'The owner sent these files without a caption while you work. Use them for the current task if relevant; otherwise say briefly that they arrived.';
+
 function withMessageContext(text: string, context?: TelegramMessageContext): string {
   return context?.replyToMessageId ? text + '\n\n[Telegram reply target: bot message ID ' + context.replyToMessageId + '. Inspect list_telegram_messages for its preview before acting.]' : text;
 }
 
-/** A new owner message restarts the time limit from now, capped at three limits from the task start. Never shortens it. */
+/** B4: hard cap on one task's total run time, however active it stays (a longer configured limit wins). */
+export const TASK_HARD_CAP_MS = 90 * 60_000;
+/** E3: the Claude runner never resumes a provider-* session id; it uses the newest Claude version of the chat, else starts fresh (history goes in resumeContext). */
+export function resumeSession(id: string | undefined, model: string, claudeVersion: (id: string) => string | undefined): string | undefined {
+  if (!id || !id.startsWith('provider-') || providerModel(model)) return id;
+  return claudeVersion(id);
+}
+/** States the real elapsed time; the deadline is activity-based, so a fixed limit would be wrong. */
+export function timeLimitNotice(elapsedMs: number, idleMs: number): string {
+  const span = (ms: number) => ms < 60_000 ? `${Math.max(1, Math.round(ms / 1000))} seconds` : `${Math.round(ms / 60_000)} minute${Math.round(ms / 60_000) === 1 ? '' : 's'}`;
+  return `This task reached its time limit after ${span(elapsedMs)} (no activity for ${span(idleMs)}) and was stopped.`;
+}
+/** B4: one warning this long before a time-limit stop; a project-switch continuation gets at least CONTINUATION_MIN_MS. */
+export const DEADLINE_WARNING_MS = 2 * 60_000, CONTINUATION_MIN_MS = 5 * 60_000;
+/** A new owner message or task activity restarts the idle time limit from now, capped at TASK_HARD_CAP_MS from the task start. Never shortens it. */
 export function extendedDeadline(startedAt: string, current: string, timeoutMs: number, now = Date.now()): string {
-  return new Date(Math.max(Date.parse(current), Math.min(now + timeoutMs, Date.parse(startedAt) + 3 * timeoutMs))).toISOString();
+  return new Date(Math.max(Date.parse(current), Math.min(now + timeoutMs, Date.parse(startedAt) + Math.max(TASK_HARD_CAP_MS, timeoutMs)))).toISOString();
 }
 
 export class Controller {
-  private conversation?: { messageContext?: TelegramMessageContext; task: Task; input: SteeringInput; abort: AbortController; cwd: string; ready: Promise<void>; serial: Promise<void>; projectChange?: ProjectChange; changeCancelledByOwner?: boolean; extendDeadline?: () => void; planWait?: { token: string; resolve: (decision: PlanDecision) => void } };
+  private conversation?: { messageContext?: TelegramMessageContext; task: Task; input: SteeringInput; abort: AbortController; cwd: string; ready: Promise<void>; serial: Promise<void>; projectChange?: ProjectChange; changeCancelledByOwner?: boolean; extendDeadline?: () => void; sessionId?: string; model?: string; quick?: Set<AbortController>; resumeTyping?: () => void; planWait?: { token: string; resolve: (decision: PlanDecision) => void } };
   private running?: { abort: AbortController; done: Promise<void>; task: Task };
   private projectTransition?: Promise<void>;
   private shuttingDown = false;
@@ -161,24 +184,32 @@ export class Controller {
   private pendingUpdate?: { token: string; live: Deploy; target: string; expires: number };
   private pendingRollback?: { token: string; expires: number };
   private upgradeRequests = new Map<string, UpgradeRequest>();
+  private profileRequests = new Map<string, ProfileRequest>();
+  /** D4: one live status message per running background job (outlives its task). */
+  private jobStatus = new Map<string, LiveStatus>();
+  statusIntervalMs = 50_000;
 
-  constructor(private config: Config, private store: StateStore, private messenger: Messenger, private runner: Runner, private ledger?: UsageLedger, private titles?: TitleGenerator, private keys = new KeyPool(config, store), private transcriber: TranscriptionService = new Transcriber(config, store)) {
+  constructor(private config: Config, private store: StateStore, private messenger: Messenger, private runner: Runner, private ledger?: UsageLedger, private titles?: TitleGenerator, private keys = new KeyPool(config, store), private transcriber: TranscriptionService = new Transcriber(config, store), private live?: QuickResponder) {
     this.memory = new SharedMemory(config.dataDir, configSecrets(config));
     this.models = new ModelCatalog(store, config.modelFamilies, async () => { throw new Error('No model list source configured.'); });
     this.chats = new ChatArchive(path.join(config.dataDir, 'bot', 'chats'), configSecrets(config));
     this.sessions = new SessionCatalog(store, this.chats, configSecrets(config), path.join(config.dataDir, 'claude', 'projects'));
     this.sessions.onDeleteRequest = async (id, title) => this.panel(`Move “${title}” to Trash? Restore within 48 hours; then the chat archive is permanently deleted. Shared memory, project files and lifetime usage stay.`, [[button('Move to Trash', 'trashmove ' + id)], ...BACK], 'session-delete-' + id);
     this.automation = new Automation(store);
+    this.automation.onSkip = s => this.say(`Schedule "${s.name}" skipped its run at ${s.lastSkipped ?? 'this time'} because the previous run is still queued or running.`);
     this.projects = new ProjectCatalog(config.dataDir, store, configSecrets(config));
     this.background = new BackgroundJobs(config, store, async job => {
       const source = this.resolveChat(job.chatKey);
       const record = store.data.conversations?.find(c => c.id === source && !c.trashedAt);
       const output = await this.background.readTail(job.id, 900);
+      const live = this.jobStatus.get(job.id); this.jobStatus.delete(job.id);
+      await live?.finish(job.status === 'completed', job.status.replaceAll('_', ' '));
       const text = redact(`${job.status === 'completed' ? '✅' : 'ℹ️'} ${job.name}: ${job.status.replaceAll('_', ' ')}.\n${record ? 'Chat: ' + sessionTitle(record) : 'Project: ' + job.project}${output.text ? '\n\n' + output.text : ''}\n\nFull output is in /background.`, configSecrets(config));
       if (record && !store.data.purgedSessions?.includes(source)) await this.chats.append(source, { role: 'assistant', text, eventId: 'background-' + job.id });
       await messenger.send(config.owner, text);
     });
     this.backups = new Backups(config.dataDir, config.backupEncryptionKey, store, this.chats, this.memory, configSecrets(config));
+    this.keys.onHealthy = () => this.resumeAfterApiPause();
   }
 
   async prepareSessions(signal: AbortSignal): Promise<void> {
@@ -272,6 +303,32 @@ export class Controller {
     } catch { throw new ProjectError('Bot upgrade could not be published. Verify the official clone, permitted changed files, tests and GitHub access. No Render deployment was started.'); }
   }
 
+  /** E1: the change is staged (photo bytes read now) and applied only after the owner taps Approve. */
+  async requestProfileChange(root: string, a: { name?: string; description?: string; short_description?: string; photo_file?: string; remove_photo?: boolean }): Promise<{ approvalRequested: true; id: string }> {
+    if (!this.messenger.applyProfile) throw new ProjectError('Bot profile changes are unavailable.');
+    const change: ProfileChange = { name: a.name, description: a.description, shortDescription: a.short_description, removePhoto: a.remove_photo || undefined };
+    if (a.photo_file) {
+      try { profilePhotoKind(a.photo_file); } catch (error) { throw new ProjectError((error as Error).message); }
+      const { bytes } = await sendableFile(root, a.photo_file, configSecrets(this.config));
+      if (bytes.byteLength > 10_000_000) throw new ProjectError('Profile photo exceeds 10 MB.');
+      change.photo = { name: path.basename(a.photo_file), bytes };
+    }
+    const lines = [change.name !== undefined && `Name: ${change.name || '(empty)'}`, change.shortDescription !== undefined && `Short description: ${change.shortDescription || '(empty)'}`, change.description !== undefined && `Description: ${change.description || '(empty)'}`, change.removePhoto && 'Remove current profile photo', change.photo && `New profile photo: ${a.photo_file}`].filter(Boolean) as string[];
+    if (!lines.length) throw new ProjectError('Choose at least one profile field to change.');
+    const request: ProfileRequest = { id: randomUUID().replaceAll('-', '').slice(0, 8), change, summary: lines.join('\n'), expires: Date.now() + 30 * 60_000 };
+    this.profileRequests.set(request.id, request);
+    await this.panel(`Change the bot profile?\n\n${request.summary}\n\nNothing changes until you tap Approve.`, [[button('Approve', 'profileok ' + request.id), button('Cancel', 'profileno ' + request.id)]], 'profile-' + request.id);
+    return { approvalRequested: true, id: request.id };
+  }
+
+  private async decideProfile(id: string, approved: boolean): Promise<void> {
+    const request = this.profileRequests.get(id); this.profileRequests.delete(id); await this.dismiss('profile-' + id);
+    if (!approved) return this.say('Bot profile change cancelled. Nothing was changed.');
+    if (!request || request.expires < Date.now()) return this.say('This profile confirmation expired. Ask for the change again.');
+    try { const done = await this.messenger.applyProfile!(request.change); await this.say(`Bot profile updated: ${done.join(', ')}.`); }
+    catch (error) { await this.say(`Bot profile change failed${error instanceof TelegramError ? ` (Telegram status ${error.code})` : error instanceof Error ? `: ${error.message}` : ''}. Some fields may already be applied.`); }
+  }
+
   private async deployBotUpgrade(id: string): Promise<void> {
     const request = this.upgradeRequests.get(id);
     if (!request || request.expires < Date.now()) throw new ProjectError('This upgrade confirmation expired. Publish the tested upgrade again.');
@@ -291,12 +348,12 @@ export class Controller {
     await this.messenger.acknowledge?.(callback.id).catch(() => {});
     const data = callback.data ?? '';
     const projectCallback = /^(pnew|ppage (?:active|archived|trashed) \d+|(?:pinfo|pedit|parchive|parchok|ptrash|ptrashok|prestore|ppurge) [a-zA-Z0-9][a-zA-Z0-9_-]{0,47}|pfiles [a-zA-Z0-9][a-zA-Z0-9_-]{0,47} \d+|ppurgeok [a-f0-9]{8})$/.test(data);
-    if (!/^(menu|help|status|stop|rename|new chat|fresh|model(?: [a-zA-Z0-9._:/-]{1,96})?|efforts(?: (?:low|medium|high|xhigh|max))?|fast(?: (?:on|off))?|token count|cost|memory(?: (?:on|off|confirm-clear|clear))?|session(?: [a-zA-Z0-9_-]+)?|sessionpage \d+|history [a-zA-Z0-9_-]+ \d+|projects|project [a-zA-Z0-9_-]+|files|batch|process(?: [a-zA-Z0-9_-]+)?|discard [a-zA-Z0-9_-]+|queue(?: (?:pause|resume))?|task(?:cancel|first|retry|confirm) [a-zA-Z0-9_-]+|schedules|schedule(?:pause|resume|delete) [a-zA-Z0-9_-]+|trash|(?:delete|trashmove|restore|purge|purgeconfirm) [a-zA-Z0-9_-]+|backup(?: (?:export|files|daily|off))?|restorebackup confirm|health(?: retry)?|keys(?: retired)?|keyhistory [a-f0-9]{16} \d+|keyremove [a-f0-9]{16}|background(?: \d+)?|backgroundlog [a-f0-9]{16} \d+|backgroundcancel [a-f0-9]{16}|plan(?:ok|no) [a-f0-9]{8}|update(?:ok|no) [a-f0-9]{8}|deupdate(?:ok|no) [a-f0-9]{8}|upgrade(?:confirm|cancel) [a-f0-9]{8}|clock)$/.test(data) && !projectCallback) return;
+    if (!/^(menu|help|status|stop|rename|new chat|fresh|model(?: [a-zA-Z0-9._:/-]{1,96})?|efforts(?: (?:low|medium|high|xhigh|max))?|fast(?: (?:on|off))?|token count|cost|memory(?: (?:on|off|confirm-clear|clear))?|session(?: [a-zA-Z0-9_-]+)?|sessionpage \d+|history [a-zA-Z0-9_-]+ \d+|projects|project [a-zA-Z0-9_-]+|files|batch|process(?: [a-zA-Z0-9_-]+)?|discard [a-zA-Z0-9_-]+|queue(?: (?:pause|resume))?|task(?:cancel|first|retry|confirm) [a-zA-Z0-9_-]+|schedules|schedule(?:pause|resume|delete) [a-zA-Z0-9_-]+|trash|(?:delete|trashmove|restore|purge|purgeconfirm) [a-zA-Z0-9_-]+|backup(?: (?:export|files|daily|off))?|restorebackup confirm|health(?: retry)?|keys(?: retired)?|keyhistory [a-f0-9]{16} \d+|keyremove [a-f0-9]{16}|background(?: \d+)?|backgroundlog [a-f0-9]{16} \d+|backgroundcancel [a-f0-9]{16}|plan(?:ok|no) [a-f0-9]{8}|update(?:ok|no) [a-f0-9]{8}|deupdate(?:ok|no) [a-f0-9]{8}|upgrade(?:confirm|cancel) [a-f0-9]{8}|profile(?:ok|no) [a-f0-9]{8}|clock)$/.test(data) && !projectCallback) return;
     this.panelId = callback.message.message_id;
     try {
       if (data === 'memory confirm-clear') {
         await this.panel('Clear shared memory? Saved conversations and files will stay.', [[button('Clear memory', 'memory clear')], ...BACK]);
-      } else await this.handle({ ...callback.message, from: callback.from, text: '/' + data, reply_to_message: undefined, document: undefined, photo: undefined, video: undefined, video_note: undefined, animation: undefined, voice: undefined, audio: undefined, media_group_id: undefined, caption: undefined });
+      } else await this.handle({ ...callback.message, from: callback.from, text: '/' + data, reply_to_message: undefined, document: undefined, photo: undefined, video: undefined, video_note: undefined, animation: undefined, voice: undefined, audio: undefined, media_group_id: undefined, caption: undefined, quote: undefined });
     } catch (error) {
       if (error instanceof TelegramError && [401, 403, 409].includes(error.code)) throw error;
       console.warn(`Button could not be handled (${error instanceof Error ? error.name : 'unknown'}); the bot keeps running.`);
@@ -396,7 +453,41 @@ export class Controller {
       if (!persistent && this.messenger.notice) await this.messenger.notice(this.config.owner, safe, scope);
       else await this.messenger.send(this.config.owner, safe);
     }
-    catch { console.warn('Owner message delivery failed; job state was preserved.'); }
+    catch { console.warn('Owner message delivery failed; job state was preserved.'); return; }
+    await this.resendUnsent();
+  }
+  /** Waits between final-answer send attempts when Telegram gives no retry_after (A2). */
+  answerRetryMs = [2000, 5000];
+  /** A2: the final answer retries (Telegram retry_after, capped at 60 s) and, if still refused, is kept in state and resent later. */
+  private async sayFinal(text: string): Promise<boolean> {
+    const safe = redact(text, configSecrets(this.config));
+    for (let attempt = 0; ; attempt++) {
+      try { await this.messenger.send(this.config.owner, safe); break; }
+      catch (error) {
+        const code = error instanceof TelegramError ? error.code : 'unknown';
+        if (attempt >= this.answerRetryMs.length || this.shuttingDown) {
+          console.warn(JSON.stringify({ event: 'final_answer_unsent', code, attempts: attempt + 1 }));
+          this.store.data.unsentAnswers = [...(this.store.data.unsentAnswers ?? []), safe].slice(-3);
+          await this.store.save().catch(() => {}); return false;
+        }
+        await delay(error instanceof TelegramError && error.retryAfter > 0 ? Math.min(error.retryAfter, 60) * 1000 : this.answerRetryMs[attempt]);
+      }
+    }
+    await this.resendUnsent(); return true;
+  }
+  private resending = false;
+  /** A2: answers Telegram refused earlier go out after the next good send or at the next task start. */
+  private async resendUnsent(): Promise<void> {
+    if (this.resending || !this.store.data.unsentAnswers?.length) return;
+    this.resending = true;
+    try {
+      while (this.store.data.unsentAnswers?.length) {
+        await this.messenger.send(this.config.owner, 'Earlier answer (Telegram did not accept it then):\n\n' + this.store.data.unsentAnswers[0]);
+        this.store.data.unsentAnswers.shift(); if (!this.store.data.unsentAnswers.length) delete this.store.data.unsentAnswers;
+        await this.store.save().catch(() => {});
+      }
+    } catch { console.warn('Unsent answer resend failed; it stays saved for the next try.'); }
+    finally { this.resending = false; }
   }
   private async dismiss(scope: string, graceMs = 0): Promise<void> { await this.messenger.dismiss?.(this.config.owner, scope, graceMs).catch(() => {}); }
 
@@ -476,10 +567,13 @@ export class Controller {
     // Switching chats or projects is allowed while a task runs; like new work, it cancels the task's pending project change.
     const switching = ['new', 'fresh'].includes(command ?? '') || (['session', 'project'].includes(command ?? '') && !!argument);
     const ownerWork = (!command && !!text) || incomingMedia || command === 'run' || command === 'stop' || switching;
+    // D1: a fire-and-forget 👀 receipt on owner work (never on slash commands or buttons); it can never block or fail handling.
+    if (!command && (text || incomingMedia) && message.message_id !== undefined && !this.persistenceFailed) void Promise.resolve().then(() => this.messenger.react?.(this.config.owner, message.message_id!, '👀')).catch(() => {});
     if (ownerWork && this.conversation?.projectChange) {
       delete this.conversation.projectChange; this.conversation.changeCancelledByOwner = true;
     }
-    if (stopping) { this.store.data.queuePaused = true; this.running!.abort.abort(); }
+    // B3: Stop ends only the running task; queued work keeps going (/queue pause stops the queue).
+    if (stopping) this.running!.abort.abort();
     // A newer instruction invalidates pending work immediately, including after
     // the SDK inbox closes. Read its workspace only after any selection rollback.
     if (ownerWork && this.projectTransition) await this.projectTransition;
@@ -515,16 +609,16 @@ export class Controller {
       return this.panel(`Project: ${d.project}\n${settingsLabel(this.resolved(this.settings))} · Permissions: auto\n` +
         `State: ${this.running ? 'running' : 'idle'}\nMemory: ${d.memoryEnabled !== false ? 'ON' : 'OFF'}\nLast reported speed: ${d.lastSpeed ?? 'not observed yet'}\n` +
         `Last job: ${d.lastJob?.status ?? 'none'}${d.lastJob?.endReason ? ' · ' + d.lastJob.endReason.replace(/_/g, ' ') : ''}\nSpending cap: none (no bot-enforced billing limit).\n` +
-        `Execution limits: ${this.config.maxTurns} turns; ${this.config.timeoutMs / 60_000} minutes per task.`);
+        `Execution limits: ${this.config.maxTurns} turns; ${this.config.timeoutMs / 60_000} idle minutes per task, extended while it works (max ${Math.max(TASK_HARD_CAP_MS, this.config.timeoutMs) / 60_000} minutes).`);
     }
     if (['model', 'efforts', 'effort', 'fast', 'session', 'memory'].includes(command ?? '') && !argument) {
       return this.controls(command!);
     }
     if (command === 'stop') {
       if (!this.running && !stopping) return this.say('No task is running.');
-      await this.automation.setPaused(true);
       this.running?.abort.abort();
-      return this.say('Stop requested; queue paused. File edits already made are kept; external effects are not undone. Resume queued work from /queue.');
+      const waiting = this.store.data.tasks!.filter(t => t.status === 'queued').length;
+      return this.say(`Stop requested for the running task. File edits already made are kept; external effects are not undone.${waiting ? ` ${waiting} queued task(s) continue; pause them from /queue.` : ''}`);
     }
     if (this.pump && command && !['run', 'get', 'files', 'session', 'new', 'fresh', 'project', 'rename'].includes(command)) return this.say('Busy with your current task. New messages steer it; change settings after it finishes. You can switch chats now; messages in another chat are queued.');
     if (this.persistenceFailed) return this.say('State storage failed. Restart only after checking the persistent disk; new tasks are disabled.');
@@ -602,31 +696,32 @@ export class Controller {
         return this.panel(`Active project: ${selected.name}. Its saved conversation will resume.`, HOME);
       }
       if (command === 'files') {
-        // W47-03: a short list (output/ first), never naming private-looking documents.
+        // W47-03 / C4: only deliverables in output/ (sorted), never the whole workspace or private-looking documents.
         const all = await this.listFiles(root); const hidden = all.filter(f => privateDocument(f)).length;
-        const shown = all.filter(f => !privateDocument(f)).sort((a, b) => Number(!a.startsWith('output/')) - Number(!b.startsWith('output/')) || a.localeCompare(b));
+        const shown = all.filter(f => !privateDocument(f)).sort((a, b) => a.localeCompare(b));
         const more = shown.length - 25;
-        return this.say(!all.length ? 'No files yet.' : shown.slice(0, 25).join('\n')
-          + (more > 0 ? `\n…and ${more}${all.length >= 100 ? '+' : ''} more file(s). Ask Claude to find a file, or use /projects > Files to browse.` : '')
+        return this.say((!shown.length ? 'No files in output/ yet.' : shown.slice(0, 25).join('\n'))
+          + (more > 0 ? `\n…and ${more}${all.length >= 100 ? '+' : ''} more file(s) in output/. Ask Claude to find a file, or use /projects > Files to browse.` : '')
           + (hidden ? `\n${hidden} private-looking file(s) are not listed; ask for them by name with /get.` : ''));
       }
       if (command === 'get') {
-        const file = await safeFile(root, argument);
-        if ((await lstat(file)).size > 49_000_000) return this.say('File exceeds the 49 MB download limit.');
-        await this.messenger.sendFile(this.config.owner, path.basename(file), await readFile(file));
+        // C3: the same path, size, readability and credential checks as deliver_file, with a clear reason on failure.
+        const { file, bytes } = await sendableFile(root, argument, configSecrets(this.config));
+        await this.messenger.sendFile(this.config.owner, path.basename(file), bytes);
         return;
       }
       if (command && command !== 'run' && command !== 'plan') return this.say('Unknown command. Send /help, or /run followed by your task.');
-      if (message.document || message.photo?.length || message.video || message.video_note || message.animation || message.voice || message.audio) return this.receive(message, root, messageContext);
+      const reply = message.reply_to_message ? await this.replyBlock(message, root) : '';
+      if (message.document || message.photo?.length || message.video || message.video_note || message.animation || message.voice || message.audio) return this.receive(message, root, messageContext, reply);
       const prompt = command === 'run' || command === 'plan' ? argument : text;
       if (!prompt) return this.say('Send a text task, photo, video or document. Use /help for commands.');
       const pending = this.pendingBatches();
-      if (pending.length) await this.processBatches(pending, prompt, undefined, messageContext);
+      if (pending.length) await this.processBatches(pending, prompt + reply, undefined, messageContext);
       else {
         // H-11: warn about a pasted token and keep it out of the chat archive and previews.
         const tokens = detectTokens(prompt);
         if (tokens.length) await this.say(`This message looks like a ${tokens.join(' and ')}. Delete it from Telegram (long-press > Delete) and rotate the key if it was not meant to be shared. It is hidden in the saved chat.`);
-        await this.launch(prompt, root, maskTokens(prompt), undefined, undefined, messageContext, command === 'plan');
+        await this.launch(prompt + reply, root, maskTokens(prompt), undefined, undefined, messageContext, command === 'plan');
       }
     } catch (error) {
       await this.say(error instanceof PathAccessError || error instanceof ProjectError ? error.message : 'Could not process this request. Check the command, file path/size and storage. No automatic retry was performed.');
@@ -654,14 +749,18 @@ export class Controller {
       (active.task.steers ??= []).push(record); active.extendDeadline?.();
       // A steer that was not saved must not stay in memory and run anyway.
       try { await this.store.save(); } catch (error) { active.task.steers = active.task.steers.filter(r => r !== record); release(); throw error; }
+      active.resumeTyping?.();
       this.prepareSteer(active, record, release);
+      if (!voiceInput) this.liveReply(active, record);
       return true;
     }
-    if (this.store.data.queuePaused) { await this.say('Processing is paused. Resume from /queue, then send your instruction. Your message was not queued.'); return false; }
+    const paused = this.store.data.queuePaused, apiPause = this.store.data.queuePauseReason?.startsWith('api:');
     await this.automation.enqueue({ kind: 'agent', messageContext, project: this.store.data.project, chatKey: this.chatKey(), prompt, displayPrompt, voiceInput, attachedFiles, settings: { ...this.settings }, interactive: true, ...(planMode ? { planMode: true } : {}) });
     this.kick();
     // The task is queued now; a failed notice must not hand the files back (M4).
     if (otherChat) await this.say('Another chat is running. This message is queued for this chat and starts when that task finishes. See /queue.').catch(() => {});
+    // B1: a paused queue keeps owner messages instead of refusing them.
+    else if (paused) await this.say(apiPause ? `The queue is paused after a Claude API problem (${this.store.data.queuePauseReason!.slice(4).replace(/_/g, ' ')}). Your message is queued and starts automatically once a key works again (/health → Check API keys checks now).` : 'The queue is paused. Your message is queued and starts when you resume it from /queue.').catch(() => {});
     return true;
   }
 
@@ -819,6 +918,32 @@ export class Controller {
     }).finally(release);
   }
 
+  /** D3: a tool-less fork of the running chat answers a text steer in seconds; the main task still gets the steer, then a note that the owner was answered. Failures send nothing. */
+  private liveReply(active: NonNullable<Controller['conversation']>, record: SteerRecord): void {
+    const { sessionId: session, model } = active;
+    if (!this.live || this.config.liveSteer === false || !active.task.interactive || !session || !model || providerModel(model)) return;
+    const abort = new AbortController(); (active.quick ??= new Set()).add(abort);
+    const stop = () => abort.abort(); active.abort.signal.addEventListener('abort', stop, { once: true });
+    void (async () => {
+      const reply = (await this.live!.reply({ session, cwd: active.cwd, model, text: record.text }, abort.signal).catch(() => null))?.trim();
+      if (!reply || abort.signal.aborted || this.conversation !== active || !active.input.accepting) return;
+      const text = redact(reply, configSecrets(this.config));
+      await this.say(text.length > 4000 ? text.slice(0, 4000) + '…' : text, true);
+      // The steer itself was queued first; the archive entry and note follow it so the main task does not answer twice.
+      await active.serial;
+      await this.chats.append(this.resolveChat(active.task.chatKey), { role: 'assistant', text }).catch(() => {});
+      if (active.input.accepting && !abort.signal.aborted) active.input.remind(`[Live reply already sent to the owner: ${text.slice(0, 400)}] Apply the owner's latest message to the running work if it changes it; do not repeat the reply.`);
+    })().catch(() => {}).finally(() => { active.quick?.delete(abort); active.abort.signal.removeEventListener('abort', stop); });
+  }
+
+  /** B1: a working key (task or check) lifts a pause caused by a key/account API error and restarts the queue. Owner pauses stay. */
+  private async resumeAfterApiPause(): Promise<void> {
+    const d = this.store.data;
+    if (!d.queuePaused || !d.queuePauseReason?.startsWith('api:')) return;
+    await this.automation.setPaused(false); this.kick();
+    const waiting = d.tasks!.filter(t => t.status === 'queued').length;
+    await this.say(`A Claude API key works again, so the paused queue resumed${waiting ? ` · ${waiting} waiting task(s) continue` : ''}.`).catch(() => {});
+  }
   private kick(): void {
     if (this.pump || this.shuttingDown || this.persistenceFailed || this.store.data.queuePaused) return;
     this.pump = this.runQueue().catch(() => { this.persistenceFailed = true; console.error('Queue state failed; new tasks paused.'); }).finally(() => {
@@ -857,7 +982,7 @@ export class Controller {
     const active: NonNullable<Controller['conversation']> = { messageContext: task.messageContext, task, input: new SteeringInput(), abort, cwd, ready: new Promise<void>(resolve => { ready = resolve; }), serial: Promise.resolve() };
     this.conversation = active;
     for (const record of task.steers ?? []) this.prepareSteer(active, record, active.input.reserve()!);
-    await this.dismiss('task-' + task.id);
+    await this.dismiss('task-' + task.id); await this.resendUnsent();
     let { prompt } = task; const { project } = task;
     const job = { id: task.id, project, startedAt: task.startedAt! };
     task.deadlineAt ??= new Date(Date.parse(task.startedAt!) + this.config.timeoutMs).toISOString();
@@ -865,8 +990,42 @@ export class Controller {
     let status: 'completed' | 'failed' | 'cancelled' = 'failed';
     let archiveKey = this.resolveChat(task.chatKey);
     const originalKey = archiveKey;
-    const delivered = new Set<string>();
+    /** A3: one registry of files sent or being sent in this task (path -> mtime + upload); deliver_file and auto-send both check it. */
+    const sent = new Map<string, { mtime: number; job: Promise<void> }>();
+    let uploads = 0; let uploadAction: 'upload_document' | 'upload_photo' = 'upload_document';
+    let answered = false;
+    const sendOnce = async (file: string, preview?: string): Promise<boolean> => {
+      const key = path.posix.normalize(file.replace(/\\/g, '/'));
+      const mtime = (await lstat(await safeFile(cwd, key))).mtimeMs;
+      const prior = sent.get(key);
+      if (prior?.mtime === mtime && await prior.job.then(() => true, () => false)) return false;
+      uploads++; uploadAction = /\.(png|jpe?g|webp)$/i.test(key) ? 'upload_photo' : 'upload_document';
+      await this.messenger.typing(this.config.owner, uploadAction).catch(() => {});
+      const job = this.deliver(cwd, key, preview).finally(() => { uploads--; });
+      sent.set(key, { mtime, job });
+      // A network/timeout failure may follow an upload Telegram accepted, so auto-send does not retry it.
+      try { await job; return true; } catch (error) { if (!(error instanceof TelegramError && error.code === 0) && sent.get(key)?.job === job) sent.delete(key); throw error; }
+    };
+    /** Sends changed output/ files not yet sent; safe to run more than once. Skipped files are named, not hidden. */
+    const shipArtifacts = async (final: boolean) => {
+      const report = await changedArtifactReport(cwd, before).catch(() => undefined);
+      if (!report) { if (final) await this.say('Files may have changed, but the output folder could not be read, so nothing was sent automatically.'); return; }
+      const fresh: string[] = [];
+      for (const file of report.files) { const prior = sent.get(file); if (!prior || prior.mtime !== (await lstat(path.join(cwd, file)).catch(() => undefined))?.mtimeMs) fresh.push(file); }
+      if (final && report.skippedPrivate) await this.say(`${report.skippedPrivate} changed file(s) in output/ look like private documents by name, so they were not sent automatically. Ask for them by name or use /get with the path.`);
+      if (final) for (const file of report.tooLarge.slice(0, 5)) await this.say(`${file} is larger than 49 MB, so Telegram cannot send it. It is saved in the project.`);
+      if (fresh.length) await this.say(`Sending ${fresh.length > 1 ? Math.min(fresh.length, 20) + ' files' : 'file'}…`, false, 'deliveries');
+      for (const file of fresh.slice(0, 20)) {
+        try { await sendOnce(file, 'Ready · ' + path.basename(file)); }
+        catch { await this.say(`File saved; automatic delivery failed. Retry: /get ${file}`); }
+      }
+      if (fresh.length > 20) await this.say(`${fresh.length - 20} more changed file(s) were not sent automatically: ${fresh.slice(20, 30).join(', ')}${fresh.length > 30 ? ', …' : ''}. They are saved in the project.`);
+    };
+    let shipping: Promise<void> = Promise.resolve();
+    const ship = (final: boolean) => { shipping = shipping.then(() => shipArtifacts(final)).catch(() => console.warn('Automatic file delivery failed; the task status is unchanged.')); return shipping; };
     const published = new Set<string>();
+    /** Every answer text already sent as commentary; the final answer is never sent twice (W48-06). */
+    const publishedTexts = new Set<string>();
     let lastPublished = '';
     const before = await artifactSnapshot(cwd);
     const bind = async (id: string) => {
@@ -883,15 +1042,27 @@ export class Controller {
     };
     let progress = task.voiceInput ? 'Transcribing voice…' : 'Thinking…';
     let timedOut = false;
-    let pendingHelpers = 0;
+    let pendingHelpers = 0; let helperStatus: LiveStatus | undefined;
     let usedTools = false; let autoRetry = false;
-    const expire = () => setTimeout(() => { timedOut = true; abort.abort(); }, Math.max(1, Date.parse(task.deadlineAt!) - Date.now()));
+    // B4: the time limit is an idle budget. Activity and owner messages push it forward (hard cap from extendedDeadline);
+    // one warning goes out DEADLINE_WARNING_MS before a stop, and again only if the deadline moved past that window.
+    let warned = false, warning: ReturnType<typeof setTimeout> | undefined, lastTouch = 0;
+    const expire = () => {
+      const left = Date.parse(task.deadlineAt!) - Date.now();
+      clearTimeout(warning); warning = undefined;
+      if (left > DEADLINE_WARNING_MS) { warned = false; warning = setTimeout(() => { if (warned || abort.signal.aborted) return; warned = true; console.warn(JSON.stringify({ event: 'task_deadline_warning', task: task.id, deadlineAt: task.deadlineAt })); void this.say('This task has shown no activity for a while and stops at its time limit in about 2 minutes. Send a message to give it more time.').catch(() => {}); }, left - DEADLINE_WARNING_MS); }
+      return setTimeout(() => { timedOut = true; console.warn(JSON.stringify({ event: 'task_deadline_abort', task: task.id, deadlineAt: task.deadlineAt, elapsedMs: Date.now() - Date.parse(task.startedAt!) })); abort.abort(); }, Math.max(1, left));
+    };
     let timeout = expire();
     active.extendDeadline = () => {
       if (timedOut || abort.signal.aborted) return;
       task.deadlineAt = extendedDeadline(task.startedAt!, task.deadlineAt!, this.config.timeoutMs);
       clearTimeout(timeout); timeout = expire();
     };
+    /** Typing stops after the final answer; an accepted owner steer restarts work, so typing resumes. */
+    active.resumeTyping = () => { if (!answered || abort.signal.aborted) return; answered = false; void this.messenger.typing(this.config.owner, 'typing').catch(() => {}); };
+    /** B4: effect/progress/step events count as activity; at most one timer reset per second (or per tenth of a tiny limit). */
+    const touch = () => { if (Date.now() - lastTouch < Math.min(1000, this.config.timeoutMs / 10)) return; lastTouch = Date.now(); active.extendDeadline!(); };
     const assertLive = () => {
       if (this.conversation !== active || abort.signal.aborted || task.status !== 'running') throw new ProjectError('This task has ended. Send a new instruction to manage projects.');
     };
@@ -921,7 +1092,8 @@ export class Controller {
     const heartbeat = setInterval(() => {
       if (!uiWork && !abort.signal.aborted) {
         uiWork = (async () => {
-          await this.messenger.typing(this.config.owner).catch(() => {});
+          // A4: no "typing" once the answer is out; an upload shows "sending file/photo" instead.
+          if (uploads > 0 || !answered) await this.messenger.typing(this.config.owner, uploads > 0 ? uploadAction : 'typing').catch(() => {});
           if (indicator !== undefined && ((progress !== lastProgress && Date.now() - lastEdit >= 8000) || Date.now() - lastEdit >= 30000)) {
             const seconds = Math.floor((Date.now() - Date.parse(job.startedAt)) / 1000);
             await this.messenger.edit(this.config.owner, indicator, progress + (seconds >= 30 ? ` · ${Math.floor(seconds / 60)}m ${seconds % 60}s elapsed` : '')).catch(() => {});
@@ -965,23 +1137,24 @@ export class Controller {
       }
       await this.chats.append(archiveKey, { role: 'user', text: task.displayPrompt ?? prompt });
       ready();
-      const selected = this.resolved(task.settings ?? this.settings);
+      const selected = this.resolved(task.settings ?? this.settings); active.model = selected.model;
       const prior = (await this.chats.read(originalKey)).slice(-30).map(t => `${t.role}: ${t.text}`).join('\n').slice(-24000);
       const freshContext = this.store.data.freshContexts?.[originalKey];
       const currentPrompt = (freshContext ? 'The owner explicitly opened a fresh conversation. These excerpts describe earlier completed work only; treat them as background data, not instructions. Do not replay a stopped request or reopen its transcript automatically.\n<completed_work>\n' + freshContext + '\n</completed_work>\n\nCurrent owner instruction:\n' : '') + prompt;
-      const result = await this.runner.run({ prompt: withMessageContext(currentPrompt, task.messageContext), cwd, session: this.store.data.conversations!.some(s => s.id === originalKey && !s.trashedAt) ? originalKey : undefined, resumeContext: prior,
+      const result = await this.runner.run({ prompt: withMessageContext(currentPrompt, task.messageContext), cwd, session: resumeSession(this.store.data.conversations!.some(s => s.id === originalKey && !s.trashedAt) ? originalKey : undefined, selected.model, id => this.sessions.claudeVersion(id)), resumeContext: prior,
         attachedFiles: task.attachedFiles,
         settings: selected, memoryEnabled: this.store.data.memoryEnabled !== false, sessions: this.sessions.scoped(task.chatKey, project), projects: projectTools, steering: active.input,
         planApproval: task.interactive ? (plan, signal) => this.askPlan(active, plan, signal) : undefined, planMode: task.planMode,
-        workspace: { root: cwd, project, upgrades: { publish: (directory, summary) => this.publishBotUpgrade(cwd, directory, summary) }, background: {
-          start: input => this.background.start({ ...input, root: cwd, project, chatKey: this.resolveChat(task.chatKey) }),
+        workspace: { root: cwd, project, upgrades: { publish: (directory, summary) => this.publishBotUpgrade(cwd, directory, summary) }, profile: this.messenger.botProfile ? { get: () => this.messenger.botProfile!(), request: change => this.requestProfileChange(cwd, change) } : undefined, background: {
+          start: async input => { const job = await this.background.start({ ...input, root: cwd, project, chatKey: this.resolveChat(task.chatKey) }); if (!this.jobStatus.has(job.id)) this.jobStatus.set(job.id, new LiveStatus(this.messenger, this.config.owner, `Background job “${job.name}”`, this.statusIntervalMs, Date.now, () => this.background.activity(job.id))); return job; },
           list: (offset, limit) => this.background.list(offset, limit), read: (id, offset, limit) => this.background.read(id, offset, limit), cancel: id => this.background.cancel(id)
         }, telegram: this.messenger.listBotMessages && this.messenger.deleteBotMessages ? {
           list: async a => this.messenger.listBotMessages!(this.config.owner, { limit: a.limit, messageId: a.message_id, beforeMessageId: a.include_current_task ? undefined : active.messageContext?.beforeMessageId, includeUi: a.include_ui }),
           delete: ids => this.messenger.deleteBotMessages!(this.config.owner, ids, abort.signal)
-        } : undefined, automation: this.automation, transcribe: async (file, language) => { progress = 'Transcribing audio…'; try { return await this.transcriber.transcribe(cwd, file, language, abort.signal); } finally { progress = 'Thinking…'; } }, deliver: async (file, preview) => { await this.deliver(cwd, file, preview); delivered.add(file.replace(/\\/g, '/')); }, backup: () => this.exportBackup() } }, async event => {
+        } : undefined, automation: this.automation, transcribe: async (file, language) => { progress = 'Transcribing audio…'; try { return await this.transcriber.transcribe(cwd, file, language, abort.signal); } finally { progress = 'Thinking…'; } }, deliver: async (file, preview) => { await sendOnce(file, preview); }, backup: () => this.exportBackup() } }, async event => {
+        if (event.type === 'effect' || event.type === 'progress' || event.type === 'step') { touch(); helperStatus?.touch(); }
         if (event.type === 'session') {
-          await bind(event.id);
+          active.sessionId = event.id; await bind(event.id);
         } else if (event.type === 'commentary') {
           const text = redact(event.text, configSecrets(this.config)).trim();
           const key = event.id + ':' + text;
@@ -989,7 +1162,7 @@ export class Controller {
             published.add(key); await this.chats.append(archiveKey, { role: 'assistant', text });
             // N-a: a scheduled run only sends its final answer; its commentary stays in the saved chat.
             if (task.interactive) {
-              lastPublished = text;
+              lastPublished = text; publishedTexts.add(text);
               await this.say(text.length > 12000 ? text.slice(0, 12000) + '\n\nFull text is saved in this chat history.' : text, true);
             }
           }
@@ -1004,13 +1177,23 @@ export class Controller {
         } else if (event.type === 'speed') this.store.data.lastSpeed = event.state;
         else if (event.type === 'effect') usedTools = true;
         else if (event.type === 'progress') progress = redact(event.text, configSecrets(this.config));
-        else if (event.type === 'helpers') pendingHelpers = event.count;
+        else if (event.type === 'answered') { answered = true; void ship(false); }
+        else if (event.type === 'notice') { if (task.interactive) await this.say(redact(event.text, configSecrets(this.config)), true); }
+        else if (event.type === 'helpers') {
+          pendingHelpers = event.count;
+          if (event.count > 0) { helperStatus ??= new LiveStatus(this.messenger, this.config.owner, '', this.statusIntervalMs); helperStatus.description = `${event.count} helper${event.count === 1 ? '' : 's'}`; helperStatus.touch(); }
+          else if (helperStatus) { const done = helperStatus; helperStatus = undefined; done.description = 'Helpers'; void done.finish(true); }
+        }
         else if (event.type === 'held_open') { const { type: _type, ...why } = event; console.warn(JSON.stringify({ event: 'turn_held_open', task: task.id, ...why })); }
         else if (event.type === 'idle_closed') console.warn(JSON.stringify({ event: 'turn_idle_closed', task: task.id, helpers: event.helpers }));
       }, abort);
       abort.signal.throwIfAborted();
       await bind(result.session);
-      const alreadyPublished = lastPublished !== '' && lastPublished === redact(result.text, configSecrets(this.config)).trim();
+      const finalText = redact(result.text, configSecrets(this.config)).trim();
+      // A5: a multi-block answer arrives as several commentary texts; the joined result counts as sent when every paragraph was.
+      const paragraphs = (text: string) => text.split(/\n\s*\n/).map(p => p.trim()).filter(Boolean);
+      const sentParagraphs = new Set([...publishedTexts].flatMap(paragraphs));
+      const alreadyPublished = finalText !== '' && (lastPublished === finalText || publishedTexts.has(finalText) || paragraphs(finalText).every(p => sentParagraphs.has(p)));
       if (!alreadyPublished) await this.chats.append(result.session, { role: 'assistant', text: result.text });
       // Store a redacted result in the project so a Telegram outage is recoverable.
       const outputName = `result-${job.id}.txt`;
@@ -1019,19 +1202,8 @@ export class Controller {
       (this.store.data.health ??= {}).claudeAt = new Date().toISOString(); delete this.store.data.health.apiError;
       const preview = result.text.length > 12000 ? result.text.slice(0, 12000) + `\n\nFull result: /get ${outputName}` : result.text;
       await finishIndicator();
-      if (!alreadyPublished) await this.say(preview, true);
-      // W47-02: the answer is out, so the queue moves on now. Changed files and the chat title
-      // follow in the background; their failures are reported but never change this task's status.
-      const report = await changedArtifactReport(cwd, before).catch(() => undefined);
-      const artifacts = report?.files.filter(file => !delivered.has(file));
-      this.afterAnswer(async () => {
-        if (!report || !artifacts) { await this.say('Files may have changed, but the output folder could not be read. Use /files to check.'); return; }
-        if (report.skippedPrivate) await this.say(`${report.skippedPrivate} changed file(s) in output/ look like private documents by name, so they were not sent automatically. Use /files and /get to download them.`);
-        for (const file of report.tooLarge.slice(0, 5)) await this.say(`${file} is larger than 49 MB, so Telegram cannot send it. It is saved in the project.`);
-        if (artifacts.length) await this.say(`Sending ${artifacts.length > 1 ? Math.min(artifacts.length, 20) + ' files' : 'file'}…`, false, 'deliveries');
-        for (const file of artifacts.slice(0, 20)) { try { await this.deliver(cwd, file, 'Ready · ' + path.basename(file)); } catch { await this.say(`File saved; automatic delivery failed. Retry: /get ${file}`); } }
-        if (artifacts.length > 20) await this.say('Additional files are saved. Use /files and /get to download them.');
-      });
+      if (!alreadyPublished) await this.sayFinal(preview);
+      answered = true;
       if (this.titles) this.afterAnswer(async () => { await this.sessions.autoName(result.session, turns => this.titles!.generate(turns, AbortSignal.timeout(60_000))); });
       console.log(`Claude task completed: ${selected.model}; effort=${selected.effort}; requestedFast=${selected.fast}; reportedSpeed=${this.store.data.lastSpeed ?? 'unknown'}.`);
     } catch (error) {
@@ -1046,14 +1218,14 @@ export class Controller {
         const providerLabel = error.provider ?? (providerModel(failedModel) ? modelLabel(failedModel) : 'Claude API');
         (this.store.data.health ??= {}).apiError = error.kind; console.warn(`${providerLabel} task failure: ${error.kind}.`);
         // M2: only key or account problems stop the queue; a busy API does not.
-        if (PAUSE_API_KINDS.includes(error.kind)) await this.automation.setPaused(true);
+        if (PAUSE_API_KINDS.includes(error.kind)) await this.automation.setPaused(true, 'api:' + error.kind);
         // W47-06: a busy API before any tool ran gets one automatic retry.
         autoRetry = BUSY_API_KINDS.includes(error.kind) && !usedTools && !task.autoRetry && !abort.signal.aborted && !this.shuttingDown;
       }
       status = abort.signal.aborted ? 'cancelled' : 'failed';
       await finishIndicator();
       console.warn(JSON.stringify({ event: 'task_ended', task: task.id, reason: task.failureKind, elapsedMs: Date.now() - Date.parse(task.startedAt!), pendingHelpers }));
-      const notice = timedOut ? `This task reached its time limit (${this.config.timeoutMs / 60000} minutes) and was stopped.`
+      const notice = timedOut ? timeLimitNotice(Date.now() - Date.parse(task.startedAt!), this.config.timeoutMs)
         : this.persistenceFailed ? 'Usage storage failed. New tasks are paused until storage is restored.'
         : abort.signal.aborted ? 'Task stopped.'
         : error instanceof AgentError || error instanceof TranscriptionError ? error.message : 'The task could not finish. Check API access and storage, or try a smaller task.';
@@ -1064,7 +1236,7 @@ export class Controller {
         const providerLabel = error.provider ?? (providerModel(failedModel) ? modelLabel(failedModel) : 'Claude API');
         const reason = `${providerLabel} problem: ${error.kind.replace(/_/g, ' ')}.`;
         if (autoRetry) await this.panel(`${reason} Nothing was changed, so I will retry this task once automatically in about a minute.`, [[button('Queue', 'queue'), button('Key status', 'keys')], ...BACK]);
-        else await this.panel(`${reason} Retry this task when it is fixed (for a busy or overloaded API, after a minute). ${this.store.data.queuePaused ? 'The queue is paused; /queue resumes it.' : 'The queue keeps running.'}`,
+        else await this.panel(`${reason} Retry this task when it is fixed (for a busy or overloaded API, after a minute). ${this.store.data.queuePaused ? 'The queue is paused; it resumes by itself when a key check succeeds, or from /queue. New messages are queued meanwhile.' : 'The queue keeps running.'}`,
           [[button('Retry task', 'taskretry ' + task.id)], [button('Queue', 'queue'), button('Key status', 'keys')], ...BACK]);
       }
       if (error instanceof AgentSafetyError) {
@@ -1079,9 +1251,12 @@ export class Controller {
           [...(fresh ? [] : [[button('Continue fresh with summary', 'fresh')]]), [button('Empty new chat', 'new chat')], ...BACK]);
       }
     } finally {
-      ready(); active.input.close(); await active.serial;
-      clearTimeout(timeout); clearInterval(heartbeat);
+      ready(); active.input.close(); for (const quick of active.quick ?? []) quick.abort(); await active.serial;
+      clearTimeout(timeout); clearTimeout(warning); clearInterval(heartbeat);
       await finishIndicator();
+      if (helperStatus) { helperStatus.description = 'Helpers'; void helperStatus.finish(status === 'completed', status === 'completed' ? '' : 'stopped with the task'); helperStatus = undefined; }
+      // W47-02/W47-07: changed files follow in the background for every outcome (also timeout and failure), so the queue moves on now.
+      if (!this.shuttingDown && !this.persistenceFailed) this.afterAnswer(() => ship(true));
       this.store.data.lastJob = { ...job, status, endReason: task.failureKind, finishedAt: new Date().toISOString() };
       this.store.data.active = null;
       try { await this.automation.finish(task.id, this.shuttingDown && status === 'cancelled' ? 'interrupted' : status); if (autoRetry) this.scheduleAutoRetry(task.id); }
@@ -1105,7 +1280,6 @@ export class Controller {
       if (change.action === 'switch') {
         await this.projects.workspace(change.project);
         assertPending();
-        if (change.continueTask && Date.now() >= Date.parse(task.deadlineAt)) throw new ProjectError('The original task time limit ended before project continuation. Send a new instruction when ready.');
         selectionAttempted = true;
         const target = await this.projects.select(change.project, assertPending);
         assertPending();
@@ -1114,7 +1288,7 @@ export class Controller {
           assertPending();
           continuation = await this.automation.enqueue({ kind: 'agent', project: target.id, chatKey: this.chatKey(),
             prompt: 'Continue the remaining owner-authorized work after a completed project switch. The earlier turn is finished; do not replay its completed actions. Work in the current project.\n\nRemaining work:\n' + change.continueTask,
-            displayPrompt: change.continueTask, settings: task.settings, interactive: task.interactive, deadlineAt: task.deadlineAt, handoffFrom: task.id });
+            displayPrompt: change.continueTask, settings: task.settings, interactive: task.interactive, deadlineAt: new Date(Math.max(Date.parse(task.deadlineAt!), Date.now() + CONTINUATION_MIN_MS)).toISOString(), handoffFrom: task.id });
           await this.automation.prioritize(continuation.id);
         }
         assertPending(); delete active.projectChange;
@@ -1161,7 +1335,40 @@ export class Controller {
     }
     await this.say(text, false, 'uploads');
   }
-  private async receive(message: Message, root: string, messageContext: TelegramMessageContext): Promise<void> {
+  /** D2: what the owner replied to (sender, redacted text or the selected quote, saved media path), for the prompt. */
+  private async replyBlock(message: Message, root: string): Promise<string> {
+    const target = message.reply_to_message!, secrets = configSecrets(this.config);
+    const sender = target.from?.id === this.config.owner ? 'your own earlier message (owner)' : target.from?.is_bot ? 'a bot message' + (target.message_id ? ' (ID ' + target.message_id + ')' : '') : 'another message';
+    const quoted = message.quote?.text?.trim(), body = quoted || target.text || target.caption || '';
+    const clip = (t: string) => { const r = maskTokens(redact(t, secrets)); return r.length > 1500 ? r.slice(0, 1500) + '…' : r; };
+    const lines = ['[Telegram reply context: the owner replied to ' + sender + '.'];
+    if (body.trim()) lines.push((quoted ? 'Selected part the owner quoted' : 'Its ' + (target.text ? 'text' : 'caption')) + ':\n<<<\n' + clip(body) + '\n>>>');
+    const photo = target.photo?.slice().sort((a, b) => b.width * b.height - a.width * a.height)[0];
+    const media = photo ?? target.document ?? target.video ?? target.voice ?? target.audio ?? target.video_note ?? target.animation;
+    if (media) {
+      const base = photo ? 'photo.jpg' : path.basename(((media as { file_name?: string }).file_name ?? (target.voice ? 'voice.ogg' : target.audio ? 'audio.bin' : target.document ? 'document.bin' : 'video.mp4')).replace(/\\/g, '/'));
+      if ((media.file_size ?? 0) > 20000000 || secretPath(base)) lines.push('Its attachment (' + clip(base) + ') was not downloaded (too large or credential-like).');
+      else try { lines.push('Its attachment was saved at project path: ' + (await this.storeUpload(root, media.file_id, base)).relative); }
+      catch { lines.push('Its attachment (' + clip(base) + ') could not be downloaded.'); }
+    }
+    return '\n\n' + lines.join('\n') + ']';
+  }
+  /** Saves one Telegram file into uploads/ and returns its project path. */
+  private async storeUpload(root: string, fileId: string, base: string): Promise<{ relative: string; bytes: Buffer }> {
+    const uploads = path.join(root, 'uploads'); await mkdir(uploads, { recursive: true, mode: 0o700 });
+    if ((await lstat(uploads)).isSymbolicLink()) throw new Error('Invalid uploads directory.');
+    const name = randomUUID() + '-' + (base.replace(/[^a-zA-Z0-9._-]/g, '_').slice(-100) || 'file.bin');
+    const bytes = await this.messenger.download(fileId);
+    if (bytes.length > 20000000) throw new Error('Oversized upload.');
+    await writeFile(path.join(uploads, name), bytes, { flag: 'wx', mode: 0o600 });
+    return { relative: 'uploads/' + name, bytes };
+  }
+  /** D5: a captionless file sent while a task runs in this chat joins that task as a steer note. */
+  private steerable(): boolean {
+    const active = this.conversation;
+    return !!active?.input.accepting && !active.abort.signal.aborted && !active.planWait && active.task.project === this.store.data.project && this.resolveChat(active.task.chatKey) === this.resolveChat(this.chatKey());
+  }
+  private async receive(message: Message, root: string, messageContext: TelegramMessageContext, reply = ''): Promise<void> {
     const photo = message.photo?.slice().sort((a, b) => b.width * b.height - a.width * a.height)[0];
     const media = message.video ?? message.animation ?? message.video_note ?? message.voice ?? message.audio ?? message.document;
     const attachment = photo ?? media!;
@@ -1173,14 +1380,11 @@ export class Controller {
     if (secretPath(base)) return this.say('Do not send credential files through Telegram. Configure secrets in Render.');
     const indicator = await this.messenger.temporary(this.config.owner, 'Receiving ' + (photo ? 'photo' : mediaType ?? 'file') + '…').catch(() => undefined);
     let success = false;
+    // H-18: reset the album timer BEFORE downloading the next item, so a slow download cannot start the album without it.
+    const album = message.media_group_id ? this.pendingBatches().find(b => b.groupId === message.media_group_id && !b.manual) : undefined;
+    if (album) { clearTimeout(this.albumTimers.get(album.id)); this.albumTimers.delete(album.id); }
     try {
-      const uploads = path.join(root, 'uploads'); await mkdir(uploads, { recursive: true, mode: 0o700 });
-      if ((await lstat(uploads)).isSymbolicLink()) throw new Error('Invalid uploads directory.');
-      const name = randomUUID() + '-' + (base.replace(/[^a-zA-Z0-9._-]/g, '_').slice(-100) || 'file.bin');
-      const bytes = await this.messenger.download(attachment.file_id);
-      if (bytes.length > 20000000) throw new Error('Oversized upload.');
-      await writeFile(path.join(uploads, name), bytes, { flag: 'wx', mode: 0o600 });
-      const relative = 'uploads/' + name;
+      const { relative, bytes } = await this.storeUpload(root, attachment.file_id, base);
       if (base.toLowerCase().endsWith('.ctab')) {
         const decoded = this.backups.decode(bytes);
         this.restorePending = { path: relative, project: this.store.data.project, expires: Date.now() + 600000 };
@@ -1195,15 +1399,18 @@ export class Controller {
       }
       const upload = { id: randomUUID().slice(0, 8), project: batch.project, chatKey: batch.chatKey, path: relative, name: base, photo: !!photo, mediaType, receivedAt: new Date().toISOString(), batchId: batch.id };
       this.store.data.uploads!.push(upload); batch.uploadIds.push(upload.id); batch.updatedAt = upload.receivedAt;
-      if (message.caption?.trim()) batch.prompt = (batch.prompt ? batch.prompt + '\n' : '') + message.caption.trim();
+      if (message.caption?.trim()) batch.prompt = (batch.prompt ? batch.prompt + '\n' : '') + message.caption.trim() + reply;
       await this.chats.append(this.resolveChat(batch.chatKey), { role: 'user', text: `Attachment: ${base}\nProject path: ${relative}`, file: { id: attachment.file_id, name: base } });
       await this.store.save(); success = true;
       await this.uploadReceipt();
-      if (message.voice) await this.processBatches(this.pendingBatches(), 'Voice instruction', relative, messageContext);
+      if (message.voice) await this.processBatches(this.pendingBatches(), 'Voice instruction' + reply, relative, messageContext);
       else if (message.caption?.trim() && !batch.manual && !batch.groupId) await this.processBatches([batch], batch.prompt!, undefined, messageContext);
-      // H-18: an album arrives as one message per item. Once it has a caption, start it shortly after its last item.
-      else if (batch.groupId && batch.prompt && !batch.manual) this.scheduleAlbum(batch.id, messageContext);
+      // H-18: an album arrives as one message per item. Once it has a caption (or a task runs here), start it shortly after its last item.
+      else if (batch.groupId && !batch.manual && (batch.prompt || this.steerable())) this.scheduleAlbum(batch.id, messageContext);
+      // D5: captionless files while a task runs here join that task instead of being parked.
+      else if (!batch.groupId && !batch.manual && this.steerable()) await this.processBatches([batch], FILES_STEER_NOTE + reply, undefined, messageContext);
     } catch {
+      if (album && (album.prompt || this.steerable())) this.scheduleAlbum(album.id, messageContext);
       await this.say('Upload could not be accepted. Check file size/format and send it again. No processing started.');
     } finally {
       if (indicator !== undefined) await this.messenger.remove(this.config.owner, indicator).catch(() => this.messenger.edit(this.config.owner, indicator, success ? 'Received.' : 'Upload failed.').catch(() => {}));
@@ -1214,13 +1421,13 @@ export class Controller {
     const timer = setTimeout(() => {
       this.albumTimers.delete(batchId);
       const batch = this.store.data.batches!.find(b => b.id === batchId && b.status === 'collecting');
-      if (batch && !this.shuttingDown) void this.processBatches([batch], batch.prompt, undefined, messageContext).catch(() => this.say('The album could not be started. Its files are saved; send your instruction again.'));
+      const instruction = batch?.prompt ?? (this.steerable() ? FILES_STEER_NOTE : undefined);
+      if (batch && instruction && !this.shuttingDown) void this.processBatches([batch], instruction, undefined, messageContext).catch(() => this.say('The album could not be started. Its files are saved; send your instruction again.'));
     }, this.albumDelayMs);
     timer.unref?.(); this.albumTimers.set(batchId, timer);
   }
   private async processBatches(batches: Batch[], instruction?: string, voiceInput?: string, messageContext?: TelegramMessageContext): Promise<void> {
     if (!batches.length || !batches.some(b => b.uploadIds.length)) return this.say('No files waiting in this chat. Send photos, videos or documents first.');
-    if (this.store.data.queuePaused && !this.conversation?.input.accepting) return this.say('Processing is paused. Files are saved; resume from /queue, then send your instruction.');
     const ids = new Set(batches.flatMap(b => b.uploadIds));
     const files = this.store.data.uploads!.filter(u => ids.has(u.id));
     // H-18: captions sent with the files stay part of the task when the instruction comes later.
@@ -1244,14 +1451,12 @@ export class Controller {
     await this.dismiss('controls');
   }
   private async deliver(root: string, relative: string, preview?: string): Promise<void> {
-    const file = await safeFile(root, relative);
-    if ((await lstat(file)).size > 49000000) throw new Error('File exceeds 49 MB.');
-    const bytes = await readFile(file);
-    if (configSecrets(this.config).some(s => s.length > 5 && bytes.includes(Buffer.from(s)))) throw new Error('Credential-bearing file cannot be sent.');
+    const { file, bytes } = await sendableFile(root, relative, configSecrets(this.config));
     if (/\.(png|jpe?g|webp)$/i.test(file) && this.messenger.sendPhoto) {
-      // W47-07: Telegram refuses some images as photos (dimensions, ratio, format). Send those as a document.
+      // W47-07: Telegram refuses some images as photos (dimensions, ratio, format). Send those as a document,
+      // but only on a real 400: a timeout may mean Telegram already showed the photo (A3, no double send).
       try { await this.messenger.sendPhoto(this.config.owner, path.basename(file), bytes, preview); return; }
-      catch { console.warn('Photo upload refused; sending the image as a document.'); }
+      catch (error) { if (!(error instanceof TelegramError && error.code === 400)) throw error; console.warn('Photo upload refused; sending the image as a document.'); }
     }
     if (preview) await this.say(preview, true);
     await this.messenger.sendFile(this.config.owner, path.basename(file), bytes);
@@ -1321,6 +1526,7 @@ export class Controller {
       this.upgradeRequests.delete(argument); await this.dismiss('upgrade-' + argument); await this.say('Upgrade deployment cancelled. The pushed commit is kept in GitHub.'); return true;
     }
     if (command === 'upgradeconfirm') { await this.deployBotUpgrade(argument); return true; }
+    if (command === 'profileok' || command === 'profileno') { await this.decideProfile(argument, command === 'profileok'); return true; }
     const d = this.store.data;
     if (command === 'clock') { const clock = clockInfo(); await this.panel(clock.local + '\n' + clock.timezone + '\nUTC: ' + clock.utc); }
     else if (command === 'batch') {
@@ -1377,27 +1583,29 @@ export class Controller {
       await this.panel(`Restore complete · ${result.chats} chats, ${result.schedules} paused schedules, ${result.files} files added. Existing data and lifetime usage preserved.`);
     } else if (command === 'health') {
       if (argument === 'retry') await this.keys.requestChecks();
-      const disk = await statfs(this.config.dataDir); const keys = this.keys.list().length;
+      const disk = await statfs(this.config.dataDir); const keys = this.keys.list().length, elevenLabsError = (this.transcriber as { lastError?: { kind: string; at: string } }).lastError;
       const outageHistory = (d.health?.telegramOutages ?? []).slice(-3).map(o => `${o.endedAt}: ${Math.ceil(o.durationMs / 1000)}s; ${o.reason}`).join('\n') || 'none recorded';
-      await this.panel(`Health\n\nTelegram last successful poll: ${d.health?.telegramAt ?? 'not recorded'}\nRecent Telegram outages:\n${outageHistory}\nClaude last success: ${d.health?.claudeAt ?? 'not recorded'}\nClaude error: ${d.health?.apiError ?? 'none recorded'}\nConfigured keys: ${keys}; disabled: ${this.keys.list().filter(k => d.disabledKeyIds?.includes(k.id)).length}\nCurrent task: ${d.active?.id ?? 'idle'}\nQueue: ${d.tasks!.filter(t => t.status === 'queued').length} waiting · ${d.queuePaused ? 'paused' : 'on'}\nSchedules: ${d.schedules!.filter(s => s.enabled).length} enabled\nFree disk: ${(Number(disk.bavail) * Number(disk.bsize) / 1073741824).toFixed(2)} GiB\nLast backup delivered: ${d.health?.lastBackupAt ?? 'none'}\n\nLast success is historical, not a live credit-balance check. No external outage monitor is configured.`, [[button('Check API keys', 'health retry'), button('Key status', 'keys'), button('Queue', 'queue')], ...BACK]);
+      await this.panel(`Health\n\nTelegram last successful poll: ${d.health?.telegramAt ?? 'not recorded'}\nRecent Telegram outages:\n${outageHistory}\nClaude last success: ${d.health?.claudeAt ?? 'not recorded'}\nClaude error: ${d.health?.apiError ?? 'none recorded'}\nElevenLabs keys: ${this.config.elevenLabsKeys?.length ?? (this.config.elevenLabsKey ? 1 : 0)}; last error: ${elevenLabsError ? `${elevenLabsError.kind} at ${elevenLabsError.at}` : 'none since start'}\nConfigured keys: ${keys}; disabled: ${this.keys.list().filter(k => d.disabledKeyIds?.includes(k.id)).length}\nCurrent task: ${d.active?.id ?? 'idle'}\nQueue: ${d.tasks!.filter(t => t.status === 'queued').length} waiting · ${d.queuePaused ? 'paused' : 'on'}\nSchedules: ${d.schedules!.filter(s => s.enabled).length} enabled\nFree disk: ${(Number(disk.bavail) * Number(disk.bsize) / 1073741824).toFixed(2)} GiB\nLast backup delivered: ${d.health?.lastBackupAt ?? 'none'}\n\nLast success is historical, not a live credit-balance check. No external outage monitor is configured.`, [[button('Check API keys', 'health retry'), button('Key status', 'keys'), button('Queue', 'queue')], ...BACK]);
     } else return false;
     return true;
   }
 
+  /** C4: deliverables under output/ only (3 levels, 100 files); secret paths and symlinks skipped. */
   private async listFiles(root: string): Promise<string[]> {
     const result: string[] = [];
     let scanned = 0;
     const walk = async (relative: string, depth: number) => {
       if (depth > 3 || result.length >= 100 || scanned > 500) return;
-      for (const entry of await readdir(path.join(root, relative), { withFileTypes: true })) {
+      for (const entry of await readdir(path.join(root, relative), { withFileTypes: true }).catch(e => { if (['ENOENT', 'ENOTDIR'].includes(e.code)) return []; throw e; })) {
         if (++scanned > 500 || result.length >= 100) break;
-        const rel = relative ? `${relative}/${entry.name}` : entry.name;
+        const rel = `${relative}/${entry.name}`;
         if (entry.isSymbolicLink() || secretPath(rel) || ['node_modules', '.venv', 'venv'].includes(entry.name)) continue;
         if (entry.isFile()) result.push(rel);
         else if (entry.isDirectory()) await walk(rel, depth + 1);
       }
     };
-    await walk('', 0);
+    const output = await lstat(path.join(root, 'output')).catch(() => undefined);
+    if (output?.isDirectory() && !output.isSymbolicLink()) await walk('output', 0);
     return result;
   }
 }

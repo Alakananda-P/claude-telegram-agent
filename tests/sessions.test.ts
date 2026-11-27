@@ -37,7 +37,7 @@ test('proven fallback bindings show one conversation, preserve titles and expose
   const current = catalog.list().sessions.find(s => s.id === 'replacement-2')!;
   assert.equal(current.title, 'Owner topic');
   assert.deepEqual(current.versions, ['active-id', 'replacement-1', 'replacement-2']);
-  assert.equal((await catalog.read('active-id')).turns.length, 1);
+  assert.equal((await catalog.read('active-id')).turns.length, 2); // E3: an old version id reads the latest version
   assert.equal((await catalog.read('replacement-2')).turns.length, 2);
   await catalog.rename('replacement-1', 'Renamed current conversation');
   assert.equal(catalog.list().sessions.find(s => s.id === 'replacement-2')!.title, 'Renamed current conversation');
@@ -222,4 +222,16 @@ test('M6: one chat that cannot be purged is skipped and retried later; the other
   busy = false;
   assert.equal(await catalog.purgeExpired(new Date(+later + 11 * 60_000)), 1);
   assert.ok(!store.data.conversations!.some(c => c.id === 'old-id'));
+});
+
+test('E3: read_session on an old version id reads the latest version; Claude resume skips provider-* versions', async () => {
+  const { catalog, archive } = await setup();
+  await archive.append('active-id', { role: 'user', text: 'Original instruction' });
+  await catalog.bind('active-id', 'claude-2', 'default');
+  await archive.append('claude-2', { role: 'assistant', text: 'Claude answer' });
+  await catalog.bind('claude-2', 'provider-abc', 'default');
+  await archive.append('provider-abc', { role: 'assistant', text: 'Provider answer' });
+  const page = await catalog.read('active-id');
+  assert.ok(page.turns.some(t => t.text === 'Provider answer')); assert.equal(page.conversationId, 'provider-abc');
+  assert.equal(catalog.claudeVersion('provider-abc'), 'claude-2'); assert.equal(catalog.claudeVersion('missing-id'), undefined);
 });

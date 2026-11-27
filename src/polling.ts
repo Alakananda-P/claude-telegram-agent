@@ -16,7 +16,12 @@ export async function poll(client: PollClient, store: StateStore, handle: (messa
   const now = options.now ?? Date.now;
   const wait = options.wait ?? ((ms, signal) => delay(ms, undefined, { signal }).catch(() => {}));
   let failures = store.data.health?.telegramOutage?.failures ?? 0;
-  let connected = false;
+  let connected = false; let saveWarned = false;
+  // B6: a full or failing disk must not stop polling; warn once per failure streak.
+  const save = async () => {
+    try { await store.save(); saveWarned = false; }
+    catch (error) { if (!saveWarned) console.error(`Polling state could not be saved (${error instanceof Error ? error.name : 'unknown'}); polling continues in memory.`); saveWarned = true; }
+  };
   while (!signal.aborted) {
     let updates: { update_id: number; message?: Message; callback_query?: Callback }[];
     try {
@@ -27,9 +32,11 @@ export async function poll(client: PollClient, store: StateStore, handle: (messa
       const health = store.data.health ??= {};
       const outage = health.telegramOutage ??= { startedAt: new Date(now()).toISOString(), failures, reason: safeReason(error) };
       outage.failures = failures; outage.reason = safeReason(error);
-      await store.save();
+      await save();
       if (error instanceof TelegramError && [401, 403, 409].includes(error.code)) throw error;
-      const retryMs = Math.min(30_000, 1000 * 2 ** Math.min(failures - 1, 5));
+      const backoff = Math.min(30_000, 1000 * 2 ** Math.min(failures - 1, 5));
+      // B6: honour Telegram's retry_after on 429 (capped at one hour).
+      const retryMs = error instanceof TelegramError && error.code === 429 && error.retryAfter > 0 ? Math.min(3_600_000, Math.max(backoff, error.retryAfter * 1000)) : backoff;
       console.warn(`Telegram polling unavailable (${outage.reason}); retrying with backoff.`);
       await wait(retryMs, signal);
       continue;
@@ -42,7 +49,7 @@ export async function poll(client: PollClient, store: StateStore, handle: (messa
       health.telegramOutages = [...(health.telegramOutages ?? []), recovered].slice(-50);
       delete health.telegramOutage;
     }
-    await store.save();
+    await save();
     if (!connected || failures) console.log(`Telegram polling connected; recoveredFailures=${failures}${recovered ? '; outageMs=' + recovered.durationMs + '; reason=' + recovered.reason : ''}.`);
     connected = true; failures = 0;
     // A best-effort recovery notice must never throw fetched owner updates away.
@@ -55,7 +62,7 @@ export async function poll(client: PollClient, store: StateStore, handle: (messa
       if (!Number.isSafeInteger(update.update_id) || update.update_id < store.data.offset) continue;
       store.data.offset = update.update_id + 1;
       // At-most-once dispatch: never blindly replay a destructive task after restart.
-      await store.save();
+      await save();
       // M1: one failing update must not end polling (and with it the running task).
       try {
         if (update.message) await handle(update.message);

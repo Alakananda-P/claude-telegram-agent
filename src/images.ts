@@ -2,7 +2,7 @@ import sharp from 'sharp';
 import path from 'node:path';
 import { mkdir, writeFile, lstat } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
-import { safeFile } from './safety.js';
+import { safeFile, PathAccessError } from './safety.js';
 
 export interface ImageEdit { crop?: { left: number; top: number; width: number; height: number }; rotate?: number; contrast?: boolean; deskew?: boolean }
 async function skewAngle(bytes: Buffer): Promise<number> {
@@ -38,9 +38,9 @@ export async function editImage(root: string, source: string, edit: ImageEdit) {
   if (deskewAngle) image = image.rotate(deskewAngle, { background: 'white' });
   if (edit.contrast) image = image.normalise();
   bytes = await image.jpeg({ quality: 95 }).toBuffer();
-  const output = path.join(root, 'output'); await mkdir(output, { recursive: true });
-  if ((await lstat(output)).isSymbolicLink()) throw new Error('Invalid output directory.');
-  const relative = 'output/image-' + randomUUID().slice(0, 8) + '.jpg';
+  // C5: edits go to tmp/edits/, outside output/, so ID or bill crops are never auto-sent; deliver_file sends one on purpose.
+  for (const dir of ['tmp', 'tmp/edits']) { await mkdir(path.join(root, dir), { recursive: true }); const info = await lstat(path.join(root, dir)); if (info.isSymbolicLink() || !info.isDirectory()) throw new PathAccessError('Invalid image edit directory.'); }
+  const relative = 'tmp/edits/image-' + randomUUID().slice(0, 8) + '.jpg';
   await writeFile(path.join(root, relative), bytes, { flag: 'wx', mode: 0o600 });
   const meta = await sharp(bytes).metadata();
   return { path: relative, width: meta.width, height: meta.height, deskewAngle, originalPreserved: true };

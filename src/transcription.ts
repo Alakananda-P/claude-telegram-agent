@@ -31,10 +31,16 @@ export interface Transcript {
   cached: boolean; hasSpeech: boolean; transcriptFile: string; metadataFile: string;
 }
 export type TranscriptionService = Pick<Transcriber, 'transcribe'>;
+/** Rejections that another key may not share: try the next configured key. */
+const FAILOVER_KINDS = ['access_rejected', 'rate_limited', 'quota_exhausted'];
+const keyStatus = (status: number, detail: string) => /quota|credit|insufficient/i.test(detail) || status === 402 ? 'quota_exhausted' : status === 401 || status === 403 ? 'access_rejected' : status === 429 ? 'rate_limited' : 'http_' + status;
 
 export class Transcriber {
   private pending = new Map<string, Promise<Cached>>();
+  /** W48-01: key values never leave this object; /health shows counts and the last error kind only. */
+  lastError?: { kind: string; at: string };
   constructor(private config: Config, private store: StateStore, private fetcher: typeof fetch = fetch, private probe: AudioProbe = probeAudio) {}
+  get keys(): string[] { return this.config.elevenLabsKeys?.length ? this.config.elevenLabsKeys : this.config.elevenLabsKey ? [this.config.elevenLabsKey] : []; }
 
   async transcribe(root: string, relative: string, language?: string, signal?: AbortSignal): Promise<Transcript> {
     signal?.throwIfAborted();
@@ -52,7 +58,7 @@ export class Transcriber {
     if (!data) {
       let work = this.pending.get(hash);
       if (!work) {
-        if (!this.config.elevenLabsKey) throw new TranscriptionError('ElevenLabs transcription is not configured. Set ELEVENLABS_API_KEY in the private service environment.');
+        if (!this.keys.length) throw new TranscriptionError('ElevenLabs transcription is not configured. Set ELEVENLABS_API_KEY or ELEVENLABS_API_KEYS in the private service environment.');
         cached = false;
         work = this.convert(file, bytes, language, signal).then(async result => {
           await mkdir(cacheDir, { recursive: true, mode: 0o700 });
@@ -85,20 +91,30 @@ export class Transcriber {
     const metadata = await this.probe(file, signal);
     if (!metadata.hasAudio) throw new TranscriptionError('This file has no audio stream to transcribe.');
     signal?.throwIfAborted();
-    const form = new FormData();
-    form.set('file', new Blob([new Uint8Array(bytes)]), path.basename(file));
-    for (const [key, value] of Object.entries({ model_id: 'scribe_v2', diarize: 'true', tag_audio_events: 'true', timestamps_granularity: 'character', no_verbatim: 'false' })) form.set(key, value);
-    if (language) form.set('language_code', language.toLowerCase());
-    let response: Response;
-    try { response = await this.fetcher('https://api.elevenlabs.io/v1/speech-to-text', { method: 'POST', headers: { 'xi-api-key': this.config.elevenLabsKey! }, body: form, signal: AbortSignal.any([AbortSignal.timeout(300000), ...(signal ? [signal] : [])]), redirect: 'error' }); }
-    catch { signal?.throwIfAborted(); throw new TranscriptionError('ElevenLabs connection failed or timed out. No automatic retry was performed; the provider may have received this request.'); }
-    let raw: unknown; try { raw = await response.json(); } catch { throw new TranscriptionError('ElevenLabs returned an unreadable response. No automatic retry was performed.'); }
-    if (!response.ok) {
-      const detail = (raw as { detail?: { status?: string } })?.detail?.status ?? '';
-      throw new TranscriptionError(/quota|credit|insufficient/i.test(detail) || response.status === 402 ? 'ElevenLabs credits/quota are exhausted. Audio is saved; retry from /queue after restoring credits.'
-        : response.status === 401 || response.status === 403 ? 'ElevenLabs access was rejected. Check the configured key and speech-to-text permission.'
-        : response.status === 429 ? 'ElevenLabs is rate limited. Audio is saved; retry later from /queue.'
-        : `ElevenLabs transcription failed (HTTP ${response.status}). Audio is saved; no automatic retry was performed.`);
+    const keys = this.keys; let raw: unknown; let failure: { status: number; kind: string; detail: string } | undefined;
+    for (let i = 0; i < keys.length; i++) {
+      const form = new FormData();
+      form.set('file', new Blob([new Uint8Array(bytes)]), path.basename(file));
+      for (const [key, value] of Object.entries({ model_id: 'scribe_v2', diarize: 'true', tag_audio_events: 'true', timestamps_granularity: 'character', no_verbatim: 'false' })) form.set(key, value);
+      if (language) form.set('language_code', language.toLowerCase());
+      let response: Response;
+      try { response = await this.fetcher('https://api.elevenlabs.io/v1/speech-to-text', { method: 'POST', headers: { 'xi-api-key': keys[i] }, body: form, signal: AbortSignal.any([AbortSignal.timeout(300000), ...(signal ? [signal] : [])]), redirect: 'error' }); }
+      catch { signal?.throwIfAborted(); this.lastError = { kind: 'network', at: new Date().toISOString() }; throw new TranscriptionError('ElevenLabs connection failed or timed out. No automatic retry was performed; the provider may have received this request.'); }
+      try { raw = await response.json(); } catch { this.lastError = { kind: 'unreadable', at: new Date().toISOString() }; throw new TranscriptionError('ElevenLabs returned an unreadable response. No automatic retry was performed.'); }
+      if (response.ok) { failure = undefined; break; }
+      // Only ElevenLabs' short machine status is kept, never its message prose.
+      const detail = String((raw as { detail?: { status?: unknown } })?.detail?.status ?? '').replace(/[^a-z0-9_.-]/gi, '').slice(0, 60);
+      failure = { status: response.status, kind: keyStatus(response.status, detail), detail };
+      this.lastError = { kind: failure.kind + (detail ? ':' + detail : ''), at: new Date().toISOString() };
+      console.warn(JSON.stringify({ event: 'elevenlabs_key_rejected', key: i + 1, of: keys.length, status: response.status, detail: detail || undefined }));
+      if (!FAILOVER_KINDS.includes(failure.kind)) break;
+    }
+    if (failure) {
+      const tried = keys.length > 1 ? ` (${keys.length} keys tried)` : '', why = ` [HTTP ${failure.status}${failure.detail ? ', ' + failure.detail : ''}]`;
+      throw new TranscriptionError(failure.kind === 'quota_exhausted' ? `ElevenLabs credits/quota are exhausted${tried}${why}. Audio is saved; retry from /queue after restoring credits.`
+        : failure.kind === 'access_rejected' ? `ElevenLabs access was rejected${tried}${why}. Check the configured key and speech-to-text permission.`
+        : failure.kind === 'rate_limited' ? `ElevenLabs is rate limited${tried}${why}. Audio is saved; retry later from /queue.`
+        : `ElevenLabs transcription failed${why}. Audio is saved; no automatic retry was performed.`);
     }
     const parsed = responseSchema.safeParse(raw);
     if (!parsed.success) throw new TranscriptionError('ElevenLabs returned an invalid transcript. No automatic retry was performed.');

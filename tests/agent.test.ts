@@ -242,7 +242,26 @@ test('idle watchdog closes a silent turn after the answer when a helper never re
   assert.equal(output.text, 'Main answer'); assert.equal(steering.accepting, false);
   assert.ok(Date.now() - started >= fastIdle.helperMs, 'pending helpers get the longer wait');
   assert.deepEqual(events.filter(e => e.type === 'idle_closed'), [{ type: 'idle_closed', helpers: 1 }]);
-  assert.ok(events.some(e => e.type === 'commentary' && /did not report back/.test(e.text)));
+  assert.ok(events.some(e => e.type === 'notice' && /did not report back/.test(e.text)));
+  assert.ok(!events.some(e => e.type === 'commentary' && /did not report back/.test(e.text)), 'the notice is not an answer bubble');
+});
+
+test('a foreground task (long Bash or MCP call) never holds the turn open after the answer (W48-06)', async () => {
+  const events: AgentEvent[] = []; const steering = new SteeringInput();
+  const make: QueryFactory = ({ prompt }) => ({ async *[Symbol.asyncIterator]() {
+    const incoming = (prompt as AsyncIterable<import('@anthropic-ai/claude-agent-sdk').SDKUserMessage>)[Symbol.asyncIterator]();
+    const first = (await incoming.next()).value!; yield init as SDKMessage;
+    yield { type: 'system', subtype: 'task_started', task_id: 'bash-1', run_id: 'run-1', task_type: 'local_bash', description: 'python make_payment.py', is_backgrounded: false } as unknown as SDKMessage;
+    yield { type: 'system', subtype: 'task_notification', task_id: 'bash-1', run_id: 'run-1', status: 'completed', summary: 'done' } as unknown as SDKMessage;
+    yield { ...result, result: 'Voucher ready', origin: { kind: 'human' }, user_message_uuids: [first.uuid] } as unknown as SDKMessage;
+    await forever(); // The SDK stays silent after the answer.
+  }, close() {} });
+  const started = Date.now();
+  const output = await new ClaudeRunner(config, make, fastIdle).run({ prompt: 'Make voucher', cwd: '/work', steering }, e => { events.push(e); }, new AbortController());
+  assert.equal(output.text, 'Voucher ready');
+  assert.ok(Date.now() - started < fastIdle.helperMs, 'no helper wait for a foreground task');
+  assert.ok(!events.some(e => e.type === 'notice'), 'no false helper notice');
+  assert.ok(!events.some(e => e.type === 'helpers' && e.count > 0));
 });
 
 test('idle watchdog never closes a task that is waiting for a plan approval', async () => {

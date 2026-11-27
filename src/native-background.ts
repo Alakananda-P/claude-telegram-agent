@@ -11,8 +11,13 @@ export class NativeBackground {
   /** Notified helpers that have already seen one result after their notification. */
   private waited = new Set<string>();
   private runs = new Map<string, string>();
+  /** Keys that really ran in the background. A foreground task (a long Bash or MCP call) also
+   * sends task_started/task_notification, but its result returns inside the running turn,
+   * so it must never hold the turn open (W48-06). */
+  private backgrounded = new Set<string>();
   get count() { return new Set([...this.live, ...this.draining, ...this.notified]).size; }
   private key(id: string, run?: string) { return id + ':' + (run ?? this.runs.get(id) ?? ''); }
+  private forget(key: string) { this.live.delete(key); this.draining.delete(key); this.notified.delete(key); this.waited.delete(key); this.consumed.add(key); }
   observe(event: SDKMessage) {
     if (event.type === 'result') {
       const origin = event.origin;
@@ -35,11 +40,14 @@ export class NativeBackground {
     if (event.type !== 'system') return;
     if (event.subtype === 'background_tasks_changed') {
       this.level = true;
-      const next = new Set<string>();
-      for (const task of event.tasks.filter(t => !t.ambient)) {
+      const next = new Set<string>(), ambient = new Set<string>();
+      for (const task of event.tasks) {
         if (task.run_id) this.runs.set(task.task_id, task.run_id);
-        next.add(this.key(task.task_id, task.run_id));
+        const key = this.key(task.task_id, task.run_id);
+        if (task.ambient) ambient.add(key); else { next.add(key); this.backgrounded.add(key); }
       }
+      // A task that turned ambient is housekeeping now; its notification is ambient too, so forget it.
+      for (const key of ambient) this.forget(key);
       for (const key of this.live) if (!next.has(key) && !this.consumed.has(key)) this.draining.add(key);
       this.live = next;
     } else if (event.subtype === 'task_started' && !event.ambient && !event.skip_transcript) {
@@ -48,12 +56,15 @@ export class NativeBackground {
         if (previous && event.run_id < previous) return;
         this.runs.set(event.task_id, event.run_id);
       }
-      if (!this.level && event.is_backgrounded) this.live.add(this.key(event.task_id, event.run_id));
-    } else if (event.subtype === 'task_updated' && !this.level && event.patch.is_backgrounded) {
-      this.live.add(this.key(event.task_id, event.run_id));
+      if (event.is_backgrounded) { const key = this.key(event.task_id, event.run_id); this.backgrounded.add(key); if (!this.level) this.live.add(key); }
+    } else if (event.subtype === 'task_updated' && event.patch.is_backgrounded) {
+      const key = this.key(event.task_id, event.run_id); this.backgrounded.add(key);
+      if (!this.level) this.live.add(key);
     } else if (event.subtype === 'task_notification' && !event.ambient && !event.skip_transcript) {
       if (event.run_id && this.runs.has(event.task_id) && event.run_id < this.runs.get(event.task_id)!) return;
       const key = this.key(event.task_id, event.run_id);
+      // Foreground tasks finish inside the turn: no later hand-back will consume them.
+      if (!this.backgrounded.has(key) && !this.live.has(key)) return;
       this.notified.add(key);
       if (!this.level) { this.live.delete(key); this.draining.add(key); }
     }

@@ -27,6 +27,16 @@ function networkCode(error: unknown): string {
   return e?.name === 'TimeoutError' ? 'TIMEOUT' : e?.name === 'AbortError' ? 'ABORTED' : 'NETWORK';
 }
 
+export interface BotProfile { id: number; username?: string; name: string; description: string; shortDescription: string; photoCount: number }
+export interface ProfileChange { name?: string; description?: string; shortDescription?: string; removePhoto?: boolean; photo?: { name: string; bytes: Uint8Array } }
+function profileText(text: string, max: number, label: string): string { if (text.length > max) throw new Error(`${label} must be at most ${max} characters.`); return text; }
+/** JPG -> InputProfilePhotoStatic, MP4 -> InputProfilePhotoAnimated. */
+export function profilePhotoKind(name: string): 'static' | 'animated' {
+  if (/\.jpe?g$/i.test(name)) return 'static';
+  if (/\.mp4$/i.test(name)) return 'animated';
+  throw new Error('Profile photo must be a .jpg/.jpeg image or an .mp4 animation.');
+}
+
 export class Telegram {
   timeline?: StateStore;
   private uiWork: Promise<unknown> = Promise.resolve();
@@ -141,7 +151,10 @@ export class Telegram {
     return result;
   }
 
-  async typing(chat: number): Promise<void> { await this.call('sendChatAction', { chat_id: chat, action: 'typing' }); }
+  /** D1: a quick receipt reaction on an owner message the bot handles. */
+  async react(chat: number, id: number, emoji = '👀'): Promise<void> { await this.call('setMessageReaction', { chat_id: chat, message_id: id, reaction: [{ type: 'emoji', emoji }] }); }
+
+  async typing(chat: number, action: 'typing' | 'upload_document' | 'upload_photo' = 'typing'): Promise<void> { await this.call('sendChatAction', { chat_id: chat, action }); }
 
   async panel(chat: number, text: string, buttons: Buttons, editId?: number, scope = 'controls'): Promise<void> {
     return this.serializeUi(async () => {
@@ -347,6 +360,40 @@ export class Telegram {
     form.set('photo', new Blob([new Uint8Array(bytes)]), name);
     if (caption) form.set('caption', redact(caption, [this.token, ...this.secrets]).slice(0, 1000));
     await this.call('sendPhoto', form);
+  }
+
+  // E1: bot profile (Bot API 10.5). Text fields are length-checked before any request.
+  async getMe(): Promise<{ id: number; username?: string; first_name: string }> { return this.call('getMe'); }
+  async getMyName(language_code?: string): Promise<string> { return (await this.call<{ name: string }>('getMyName', language_code ? { language_code } : {})).name; }
+  async setMyName(name: string, language_code?: string): Promise<void> { await this.call('setMyName', { name: profileText(name, 64, 'Name'), ...(language_code ? { language_code } : {}) }); }
+  async getMyDescription(language_code?: string): Promise<string> { return (await this.call<{ description: string }>('getMyDescription', language_code ? { language_code } : {})).description; }
+  async setMyDescription(description: string, language_code?: string): Promise<void> { await this.call('setMyDescription', { description: profileText(description, 512, 'Description'), ...(language_code ? { language_code } : {}) }); }
+  async getMyShortDescription(language_code?: string): Promise<string> { return (await this.call<{ short_description: string }>('getMyShortDescription', language_code ? { language_code } : {})).short_description; }
+  async setMyShortDescription(short_description: string, language_code?: string): Promise<void> { await this.call('setMyShortDescription', { short_description: profileText(short_description, 120, 'Short description'), ...(language_code ? { language_code } : {}) }); }
+  async getUserProfilePhotos(user_id: number, limit = 1): Promise<{ total_count: number }> { return this.call('getUserProfilePhotos', { user_id, limit }); }
+  async removeMyProfilePhoto(): Promise<void> { await this.call('removeMyProfilePhoto'); }
+  async setMyProfilePhoto(name: string, bytes: Uint8Array): Promise<void> {
+    const kind = profilePhotoKind(name);
+    if (bytes.byteLength > 10_000_000) throw new Error('Profile photo exceeds 10 MB.');
+    for (const secret of [this.token, ...this.secrets].filter(Boolean)) if (Buffer.from(bytes).includes(Buffer.from(secret))) throw new Error('Profile photo contains a configured secret.');
+    const form = new FormData();
+    form.set('photo', JSON.stringify(kind === 'static' ? { type: 'static', photo: 'attach://file' } : { type: 'animated', animation: 'attach://file' }));
+    form.set('file', new Blob([new Uint8Array(bytes)]), kind === 'static' ? 'profile.jpg' : 'profile.mp4');
+    await this.call('setMyProfilePhoto', form);
+  }
+  async botProfile(): Promise<BotProfile> {
+    const me = await this.getMe();
+    const [name, description, shortDescription, photos] = await Promise.all([this.getMyName(), this.getMyDescription(), this.getMyShortDescription(), this.getUserProfilePhotos(me.id)]);
+    return { id: me.id, username: me.username, name, description, shortDescription, photoCount: photos.total_count };
+  }
+  async applyProfile(change: ProfileChange): Promise<string[]> {
+    const done: string[] = [];
+    if (change.name !== undefined) { await this.setMyName(change.name); done.push('name'); }
+    if (change.description !== undefined) { await this.setMyDescription(change.description); done.push('description'); }
+    if (change.shortDescription !== undefined) { await this.setMyShortDescription(change.shortDescription); done.push('short description'); }
+    if (change.removePhoto) { await this.removeMyProfilePhoto(); done.push('photo removed'); }
+    if (change.photo) { await this.setMyProfilePhoto(change.photo.name, change.photo.bytes); done.push('photo'); }
+    return done;
   }
 
   async download(fileId: string): Promise<Buffer> {

@@ -124,3 +124,25 @@ test('legacy session title inspection and start context mask configured secrets'
   assert.ok(!JSON.stringify(catalog.context()).includes(secret));
   assert.equal(store.data.conversations[0].title, 'Work ' + secret);
 });
+
+test('one token table drives redact and detectTokens, with Verhoeff-checked bare Aadhaar masking', async () => {
+  const { detectTokens, maskTokens, verhoeffValid } = await import('../src/safety.js');
+  const samples: [string, string][] = [['ElevenLabs key', 'sk_' + 'ab12'.repeat(12)], ['Hugging Face token', 'hf_' + 'aB3d'.repeat(9)], ['AWS access key', 'AKIA' + 'ABCD2345EFGH6789'],
+    ['Slack token', 'xoxb-1234567890-abcdefghij'], ['Render API key', 'rnd_' + 'Ab1'.repeat(8)], ['Modal token', 'ak-' + 'Xy7'.repeat(8)], ['Modal token', 'as-' + 'Qz9'.repeat(8)]];
+  for (const [kind, value] of samples) {
+    assert.ok(detectTokens(`use ${value} now`).includes(kind), kind); assert.equal(redact(`use ${value} now`), 'use [REDACTED] now', kind);
+    assert.ok(!maskTokens(value).includes(value), kind);
+  }
+  assert.deepEqual(detectTokens('sk-ant-api03-' + 'x'.repeat(30)), ['Anthropic API key'], 'no duplicate OpenAI hit');
+  assert.ok(verhoeffValid('499118665246') && !verhoeffValid('234567890123') && !verhoeffValid('12a4'));
+  assert.equal(redact('id 4991 1866 5246 and 499118665246'), 'id [REDACTED] and [REDACTED]');
+  for (const plain of ['Invoice: 234567890123', 'Total 4991.18665246', 'GSTIN 07ABCDE1234F1Z5', 'Order 1499118665246', 'Ref 199118665246']) assert.equal(redact(plain), plain);
+});
+
+test('secretPath blocks key files and secret folders used by /get, deliver_file and backups', async () => {
+  const { secretPath, credentialContent } = await import('../src/safety.js');
+  for (const p of ['.secrets/keys.txt', 'secrets/api.txt', 'secrets.json', 'config/kaggle.json', '.netrc', '.env.local', 'certs/server.pem', '.ssh/id_rsa', 'id_ed25519', '.kaggle/kaggle.json', '.git-credentials', '.pypirc']) assert.ok(secretPath(p), p);
+  for (const p of ['output/report.xlsx', 'src/secret_santa.md', 'docs/secretary.txt', 'kaggle_notes.json']) assert.ok(!secretPath(p), p);
+  assert.ok(credentialContent(Buffer.from('KEY=' + 'AKIA' + 'ABCD2345EFGH6789'))); assert.ok(credentialContent(Buffer.from('x configured-key y'), ['configured-key']));
+  assert.ok(!credentialContent(Buffer.from('Total 1234.50, invoice 234567890123')));
+});

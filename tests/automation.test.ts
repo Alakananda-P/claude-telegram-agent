@@ -76,3 +76,24 @@ test('a task whose save failed is not left in memory to run later', async () => 
   assert.equal(store.data.tasks!.length, 0);
   assert.equal(await engine.claim(), undefined);
 });
+test('B5: overlapping schedule occurrences are recorded and announced once per skip', async () => {
+  const { store, engine } = await setup(); const notices: string[] = [];
+  engine.onSkip = (s, occurrence) => { notices.push(`${s.name}@${occurrence}`); };
+  const start = new Date('2026-11-01T00:00:00Z');
+  const s = await engine.createSchedule({ name: 'Every hour', kind: 'reminder', prompt: 'ping', project: 'default', intervalMinutes: 60 }, start);
+  assert.equal(await engine.tick(new Date('2026-11-01T01:00:01Z')), 1);
+  await engine.claim();
+  assert.equal(await engine.tick(new Date('2026-11-01T02:00:02Z')), 0);
+  assert.equal(await engine.tick(new Date('2026-11-01T02:00:03Z')), 0);
+  assert.equal(s.skippedRuns, 1); assert.equal(notices.length, 1); assert.equal(s.lastSkipped, '2026-11-01T02:00:01.000Z');
+  assert.equal(engine.scheduleView().schedules[0].skippedRuns, 1);
+  assert.equal(store.data.tasks!.length, 1);
+});
+test('B5: a one-time schedule that already ran is not re-run when resumed', async () => {
+  const { store, engine } = await setup(); const start = new Date('2026-11-01T00:00:00Z');
+  const s = await engine.createSchedule({ name: 'Once', kind: 'reminder', prompt: 'once', project: 'default', at: '2026-11-01T01:00:00Z' }, start);
+  assert.equal(await engine.tick(new Date('2026-11-01T01:00:01Z')), 1); assert.equal(s.enabled, false);
+  await assert.rejects(engine.changeSchedule(s.id, 'resume', new Date('2026-11-01T02:00:00Z')), /already ran/);
+  assert.equal(s.enabled, false);
+  assert.equal(await engine.tick(new Date('2026-11-01T02:00:01Z')), 0); assert.equal(store.data.tasks!.length, 1);
+});

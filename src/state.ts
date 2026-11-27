@@ -33,7 +33,7 @@ const automationState = z.object({
   batches: z.array(z.object({ id: identifier, project: projectId, chatKey: identifier, uploadIds: z.array(identifier), status: z.enum(['collecting', 'queued', 'discarded']), updatedAt: isoDate })).optional(),
   bindings: z.record(identifier, identifier).optional(), drafts: z.record(projectId, identifier).optional(), purgedSessions: z.array(identifier).optional(), resumeDisabled: z.array(identifier).optional(),
   freshContexts: z.record(identifier, z.string().max(3000)).optional(),
-  queuePaused: z.boolean().optional(), disabledKeyIds: z.array(z.string().regex(/^[a-f0-9]{16}$/)).optional(), sessionCredentials: z.record(identifier, z.string().regex(/^[a-f0-9]{16}$/)).optional(),
+  queuePaused: z.boolean().optional(), queuePauseReason: z.string().max(64).optional(), disabledKeyIds: z.array(z.string().regex(/^[a-f0-9]{16}$/)).optional(), sessionCredentials: z.record(identifier, z.string().regex(/^[a-f0-9]{16}$/)).optional(),
 });
 
 export interface JobRecord {
@@ -77,6 +77,8 @@ export interface State {
   /** One line per removed key record (label and reason, never the key; new optional field). */
   removedKeys?: { label: string; removedAt: string; reason: string }[];
   indicatorIds?: number[];
+  /** A2: redacted final answers Telegram refused after retries; resent on the next good send (new optional field). */
+  unsentAnswers?: string[];
   lastSpeed?: string;
   memoryEnabled?: boolean;
   conversations?: Conversation[];
@@ -84,7 +86,7 @@ export interface State {
   uiMessages?: { id: number; chat: number; kind: 'panel' | 'notice'; scope: string; createdAt: number; expiresAt: number; retryAt?: number; attempts?: number }[];
   chatUiResetDone?: boolean;
   upgradeCheck?: { attempted: boolean; passed: boolean; actualSpeed?: string; checkId?: string };
-  tasks?: Task[]; schedules?: Schedule[]; uploads?: Upload[]; batches?: Batch[]; queuePaused?: boolean;
+  tasks?: Task[]; schedules?: Schedule[]; uploads?: Upload[]; batches?: Batch[]; queuePaused?: boolean; /** B1: 'owner' or 'api:<kind>'; only API pauses resume automatically. */ queuePauseReason?: string;
   bindings?: Record<string, string>; drafts?: Record<string, string>; purgedSessions?: string[];
   resumeDisabled?: string[]; sessionCredentials?: Record<string, string>; disabledKeyIds?: string[]; activeKeyId?: string;
   freshContexts?: Record<string, string>;
@@ -134,6 +136,7 @@ export class StateStore {
           && (s.titleSource === undefined || ['fallback', 'auto', 'model', 'manual'].includes(s.titleSource))
           && (s.titleAttempted === undefined || typeof s.titleAttempted === 'boolean'))))
         || (data.indicatorIds !== undefined && (!Array.isArray(data.indicatorIds) || !data.indicatorIds.every(Number.isSafeInteger)))
+        || (data.unsentAnswers !== undefined && (!Array.isArray(data.unsentAnswers) || !data.unsentAnswers.every(t => typeof t === 'string')))
         || (data.visibleMessageIds !== undefined && (!Array.isArray(data.visibleMessageIds) || !data.visibleMessageIds.every(Number.isSafeInteger)))
         || (data.active !== null && (!data.active || typeof data.active.id !== 'string'))) {
         throw new Error('Invalid state');
