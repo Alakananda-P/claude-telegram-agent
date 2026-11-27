@@ -133,7 +133,7 @@ test('game API refuses anything that is not a game', () => {
 
 test('quiz sends a telegram poll, scores the answer and ends with a result', async () => {
   const { games, h, s } = make();
-  await games.play({ kind: 'quiz', title: 'GST quiz', questions: [Q, { question: 'PAN?', options: ['10', '12'], answer: 0 }], timer_seconds: 15 });
+  await games.play({ kind: 'quiz', style: 'poll', title: 'GST quiz', questions: [Q, { question: 'PAN?', options: ['10', '12'], answer: 0 }], timer_seconds: 15 });
   assert.equal(h.polls().length, 1);
   const poll = h.polls()[0]!.params;
   assert.equal(poll.type, 'quiz');
@@ -155,7 +155,7 @@ test('quiz sends a telegram poll, scores the answer and ends with a result', asy
 
 test('only the owner can answer and only the running poll counts', async () => {
   const { games, h, s } = make();
-  await games.play({ kind: 'quiz', questions: [Q, { question: '2+2?', options: ['3', '4'], answer: 1 }], timer_seconds: 10 });
+  await games.play({ kind: 'quiz', style: 'poll', questions: [Q, { question: '2+2?', options: ['3', '4'], answer: 1 }], timer_seconds: 10 });
   await games.onPollAnswer({ poll_id: 'poll-1', option_ids: [1], voter: { id: 999 } });
   assert.equal(s.data.games?.active?.score, 0, 'another user cannot score');
   await games.onPollAnswer({ poll_id: 'wrong-poll', option_ids: [1], voter: { id: OWNER } });
@@ -167,7 +167,7 @@ test('only the owner can answer and only the running poll counts', async () => {
 
 test('a wrong answer still advances the quiz', async () => {
   const { games, s } = make();
-  await games.play({ kind: 'rapid', questions: [Q, { question: '2+2?', options: ['3', '4'], answer: 1 }], timer_seconds: 10 });
+  await games.play({ kind: 'rapid', style: 'poll', questions: [Q, { question: '2+2?', options: ['3', '4'], answer: 1 }], timer_seconds: 10 });
   await games.onPollAnswer({ poll_id: 'poll-1', option_ids: [0], voter: { id: OWNER } });
   assert.equal(s.data.games?.active?.score, 0);
   assert.equal(s.data.games?.active?.index, 1);
@@ -175,7 +175,7 @@ test('a wrong answer still advances the quiz', async () => {
 
 test('timer that runs out moves to the next question without a score', async () => {
   const { games, h, s, timers } = make();
-  await games.play({ kind: 'quiz', questions: [Q, { question: '2+2?', options: ['3', '4'], answer: 1 }], timer_seconds: 10 });
+  await games.play({ kind: 'quiz', style: 'poll', questions: [Q, { question: '2+2?', options: ['3', '4'], answer: 1 }], timer_seconds: 10 });
   timers.at(-1)!.fn();
   await new Promise(r => setTimeout(r, 20));
   assert.equal(s.data.games?.active?.index, 1);
@@ -231,14 +231,14 @@ test('stopping a game records the stop and frees the board', async () => {
 
 test('an invalid timer and a bad level are refused', async () => {
   const { games } = make();
-  await assert.rejects(() => games.play({ kind: 'quiz', questions: [Q], timer_seconds: 2 }), GameError);
-  await assert.rejects(() => games.play({ kind: 'quiz', questions: [Q], timer_seconds: 700 }), GameError);
-  await assert.rejects(() => games.play({ kind: 'quiz', questions: Array(16).fill(Q) }), GameError);
+  await assert.rejects(() => games.play({ kind: 'quiz', style: 'poll', questions: [Q], timer_seconds: 2 }), GameError);
+  await assert.rejects(() => games.play({ kind: 'quiz', style: 'poll', questions: [Q], timer_seconds: 700 }), GameError);
+  await assert.rejects(() => games.play({ kind: 'quiz', style: 'poll', questions: Array(16).fill(Q) }), GameError);
 });
 
 test('a restarted bot closes an open quiz instead of pretending it still runs', async () => {
   const { games, h, s } = make();
-  await games.play({ kind: 'quiz', questions: [Q], timer_seconds: 10 });
+  await games.play({ kind: 'quiz', style: 'poll', questions: [Q], timer_seconds: 10 });
   games.restore();
   await new Promise(r => setTimeout(r, 20));
   assert.ok(h.calls.some(c => c.method === 'stopPoll'));
@@ -256,7 +256,7 @@ let id = 100, polls = 0;
 const host = { async call(method) { if (method === 'sendPoll') { polls++; return { message_id: ++id, poll: { id: 'p' + id } }; } return { message_id: ++id }; }, async panel() {}, async say() {} };
 const store = { data: {}, async save() {} };
 const games = new Games(host, 1, store);
-await games.play({ kind: 'rapid', questions: [{ question: 'A?', options: ['x', 'y'], answer: 0 }, { question: 'B?', options: ['x', 'y'], answer: 1 }], timer_seconds: 30 });
+await games.play({ kind: 'rapid', style: 'poll', questions: [{ question: 'A?', options: ['x', 'y'], answer: 0 }, { question: 'B?', options: ['x', 'y'], answer: 1 }], timer_seconds: 30 });
 await games.onPollAnswer({ poll_id: store.data.games.active.pollId, option_ids: [0], user: { id: 1 } });
 console.log('POLLS=' + polls);
 games.dispose();
@@ -278,7 +278,7 @@ function failingSecondPoll() {
 
 test('a quiz whose next poll fails is closed with its score instead of hanging', async () => {
   const { games, h, s } = failingSecondPoll();
-  await games.play({ kind: 'quiz', questions: [Q, { question: '2+2?', options: ['3', '4'], answer: 1 }], timer_seconds: 10 });
+  await games.play({ kind: 'quiz', style: 'poll', questions: [Q, { question: '2+2?', options: ['3', '4'], answer: 1 }], timer_seconds: 10 });
   await assert.rejects(games.onPollAnswer({ poll_id: 'poll-1', option_ids: [1], voter: { id: OWNER } }));
   assert.equal(s.data.games?.active, undefined);
   const result = games.results().results[0]!;
@@ -294,11 +294,92 @@ test('a failing timer step never becomes an unhandled rejection', async () => {
   process.on('unhandledRejection', listener);
   const warn = console.warn; console.warn = () => { };
   try {
-    await games.play({ kind: 'quiz', questions: [Q, { question: '2+2?', options: ['3', '4'], answer: 1 }], timer_seconds: 10 });
+    await games.play({ kind: 'quiz', style: 'poll', questions: [Q, { question: '2+2?', options: ['3', '4'], answer: 1 }], timer_seconds: 10 });
     timers.at(-1)!.fn();
     await new Promise(r => setTimeout(r, 30));
   } finally { process.off('unhandledRejection', listener); console.warn = warn; }
   assert.deepEqual(unhandled, []);
   assert.equal(s.data.games?.active, undefined);
   assert.equal(games.results().results[0]!.outcome, 'stopped');
+});
+
+const Q2: QuizQuestion = { question: '2+2?', options: ['3', '4'], answer: 1 };
+const tap = (games: Games, data: string, from = OWNER) => games.onCallback({ id: 'cb', from: { id: from }, data });
+
+test('button quiz runs in one message that is edited in place', async () => {
+  const { games, h, s } = make();
+  await games.play({ kind: 'quiz', title: 'GST quiz', questions: [Q, Q2], timer_seconds: 20 });
+  assert.equal(h.polls().length, 0, 'no telegram polls in button style');
+  assert.equal(h.sent().length, 1);
+  const first = h.sent()[0]!.params;
+  assert.match(first.text, /GST quiz · 1\/2 · score 0/);
+  assert.match(first.text, /A\) 2016\nB\) 2017/);
+  assert.match(first.text, /⏱ 20 sec/);
+  assert.deepEqual(first.reply_markup.inline_keyboard[0].map((b: any) => b.callback_data), ['g:a:abcd:0:0', 'g:a:abcd:0:1']);
+  const messageId = s.data.games!.active!.statusId;
+  await tap(games, 'g:a:abcd:0:1');
+  assert.ok(h.calls.some(c => c.method === 'answerCallbackQuery' && /Sahi/.test(c.params.text)));
+  const edits = h.calls.filter(c => c.method === 'editMessageText');
+  assert.ok(edits.every(e => e.params.message_id === messageId), 'every step edits the same message');
+  assert.ok(edits.some(e => /2017 ✅/.test(e.params.text) && /Sahi! 🎉/.test(e.params.text)), 'the right answer is marked');
+  assert.match(edits.at(-1)!.params.text, /2\/2 · score 1[\s\S]*2\+2\?/, 'the same message moves to the next question');
+  await tap(games, 'g:a:abcd:1:0');
+  assert.ok(h.calls.some(c => c.method === 'editMessageText' && /3 ❌/.test(c.params.text) && /Sahi: B\) 4/.test(c.params.text)), 'a wrong pick shows the right option');
+  assert.match(h.calls.filter(c => c.method === 'editMessageText').at(-1)!.params.text, /khatam 🏆\n1\/2 sahi/);
+  assert.equal(h.sent().length, 1, 'still only one message');
+  assert.equal(s.data.games?.active, undefined);
+  assert.equal(games.results().results[0]!.score, 1);
+});
+
+test('button quiz ignores double taps, old buttons and other users', async () => {
+  const { games, h, s } = make();
+  await games.play({ kind: 'rapid', questions: [Q, Q2] });
+  await tap(games, 'g:a:abcd:0:1', 999);
+  assert.equal(s.data.games?.active?.score, 0, 'another user cannot answer');
+  await tap(games, 'g:a:abcd:0:1');
+  await tap(games, 'g:a:abcd:0:1');
+  assert.equal(s.data.games?.active?.score, 1, 'a double tap scores once');
+  assert.ok(h.calls.some(c => c.method === 'answerCallbackQuery' && c.params.text === 'Ye sawal ho gaya'));
+  await tap(games, 'g:a:ffff:1:1');
+  assert.equal(s.data.games?.active?.score, 1, 'a button from an old game does nothing');
+});
+
+test('button quiz counts down in the message and moves on when time is up', async () => {
+  let t = 1_000_000;
+  const { games, h, s, timers } = make({ now: () => t });
+  await games.play({ kind: 'quiz', questions: [Q, Q2], timer_seconds: 10 });
+  assert.equal(timers.length, 2, 'one countdown tick and one deadline');
+  t += 5000; timers[0]!.fn();
+  await new Promise(r => setTimeout(r, 10));
+  assert.match(h.calls.filter(c => c.method === 'editMessageText').at(-1)!.params.text, /⏱ 5 sec/);
+  t += 5000; timers[1]!.fn();
+  await new Promise(r => setTimeout(r, 10));
+  assert.ok(h.calls.some(c => c.method === 'editMessageText' && /Time up ⏰ Sahi: B\) 2017/.test(c.params.text)));
+  assert.equal(s.data.games?.active?.index, 1);
+  assert.equal(s.data.games?.active?.score, 0);
+  assert.equal(h.polls().length, 0);
+});
+
+test('stop_game stops the running game and status never shows answers', async () => {
+  const { games, h, s } = make();
+  assert.deepEqual(games.status(), { active: null });
+  await games.play({ kind: 'quiz', questions: [Q, Q2], timer_seconds: 20 });
+  const status = games.status().active!;
+  assert.equal(status.question, 1); assert.equal(status.total, 2); assert.equal(status.score, 0); assert.equal(status.style, 'buttons');
+  assert.ok(!JSON.stringify(status).includes('2017') && !('questions' in status), 'no questions or answers in status');
+  const stopped = await games.stop();
+  assert.deepEqual(stopped, { stopped: true, kind: 'quiz', title: 'MCQ Quiz', score: 0, total: 2 });
+  assert.equal(s.data.games?.active, undefined);
+  assert.equal(games.results().results[0]!.outcome, 'stopped');
+  assert.ok(h.calls.some(c => c.method === 'editMessageText' && /Game band/.test(c.params.text)));
+  assert.deepEqual(await games.stop(), { stopped: false, note: 'No game is running.' });
+  await games.play({ kind: 'hangman', word: 'ledger', hint: 'kitab' });
+  assert.ok(!JSON.stringify(games.status()).includes('LEDGER'), 'the hangman word stays hidden');
+});
+
+test('answer callbacks are parsed strictly', () => {
+  assert.deepEqual(parseGameCallback('g:a:abcd:14:9'), { type: 'answer', id: 'abcd', index: 14, option: 9 });
+  assert.equal(parseGameCallback('g:a:abcd:15:0'), undefined);
+  assert.equal(parseGameCallback('g:a:abcd:1:x'), undefined);
+  assert.equal(parseGameCallback('g:a:ABCD:1:0'), undefined);
 });

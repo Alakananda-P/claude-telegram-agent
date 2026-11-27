@@ -8,6 +8,8 @@ export interface QuizQuestion { question: string; options: string[]; answer: num
 export type Level = 'easy' | 'medium' | 'hard';
 export type Cell = '' | 'X' | 'O';
 export type GameKind = 'quiz' | 'rapid' | 'ttt' | 'hangman';
+/** buttons: one message edited in place; poll: Telegram quiz polls, one message per question. */
+export type QuizStyle = 'buttons' | 'poll';
 
 export interface GameResult {
   at: string;
@@ -30,6 +32,7 @@ interface ActiveGame {
   index?: number;
   score?: number;
   timer?: number;
+  style?: QuizStyle;
   locked?: boolean;
   board?: Cell[];
   level?: Level;
@@ -42,6 +45,7 @@ export interface PlayInput {
   kind: GameKind;
   title?: string;
   timer_seconds?: number;
+  style?: QuizStyle;
   questions?: QuizQuestion[];
   level?: Level;
   word?: string;
@@ -159,7 +163,7 @@ export function hangmanView(word: string, guessed: readonly string[]): { shown: 
   return { shown: [...word].map(ch => known.has(ch) ? ch : '_').join(' '), won: [...word].every(ch => known.has(ch)), misses };
 }
 
-type Action = { type: 'menu' } | { type: 'quiz' } | { type: 'rapid' } | { type: 'ttt-pick' } | { type: 'ttt'; level: Level } | { type: 'hangman' } | { type: 'stop' } | { type: 'move'; id: string; cell: number } | { type: 'letter'; id: string; letter: string } | { type: 'end'; id: string };
+type Action = { type: 'menu' } | { type: 'quiz' } | { type: 'rapid' } | { type: 'ttt-pick' } | { type: 'ttt'; level: Level } | { type: 'hangman' } | { type: 'stop' } | { type: 'move'; id: string; cell: number } | { type: 'letter'; id: string; letter: string } | { type: 'end'; id: string } | { type: 'answer'; id: string; index: number; option: number };
 export function parseGameCallback(data: string): Action | undefined {
   if (data === 'g:menu') return { type: 'menu' };
   if (data === 'g:quiz') return { type: 'quiz' };
@@ -171,6 +175,7 @@ export function parseGameCallback(data: string): Action | undefined {
   let m = /^g:m:([a-f0-9]{4}):([0-8])$/.exec(data); if (m) return { type: 'move', id: m[1], cell: Number(m[2]) };
   m = /^g:l:([a-f0-9]{4}):([A-Z])$/.exec(data); if (m) return { type: 'letter', id: m[1], letter: m[2] };
   m = /^g:x:([a-f0-9]{4})$/.exec(data); if (m) return { type: 'end', id: m[1] };
+  m = /^g:a:([a-f0-9]{4}):(1[0-4]|[0-9]):([0-9])$/.exec(data); if (m) return { type: 'answer', id: m[1], index: Number(m[2]), option: Number(m[3]) };
   return undefined;
 }
 
@@ -213,6 +218,34 @@ function hangmanKeys(game: ActiveGame): Buttons {
   rows.push([{ text: '⏹ Band', callback_data: `g:x:${game.id}` }]);
   return rows;
 }
+function quizHead(game: ActiveGame): string {
+  return `${game.title} · ${(game.index ?? 0) + 1}/${game.questions!.length} · score ${game.score ?? 0}`;
+}
+/** Question text for the in-place quiz. With `picked` it shows the answer: ✅ on the right option, ❌ on a wrong pick. */
+function quizText(game: ActiveGame, secondsLeft: number, picked?: number | 'timeout'): string {
+  const q = game.questions![game.index ?? 0]!;
+  const options = q.options.map((o, k) => {
+    const mark = picked === undefined ? '' : k === q.answer ? ' ✅' : k === picked ? ' ❌' : '';
+    return `${LETTERS[k]}) ${o}${mark}`;
+  }).join('\n');
+  let foot = `⏱ ${secondsLeft} sec`;
+  if (picked !== undefined) {
+    foot = picked === q.answer ? 'Sahi! 🎉' : `${picked === 'timeout' ? 'Time up ⏰' : 'Galat 🙈'} Sahi: ${LETTERS[q.answer]}) ${q.options[q.answer]}`;
+    if (q.explanation) foot += `\n${q.explanation}`;
+  }
+  return `${quizHead(game)}\n\n${q.question}\n\n${options}\n\n${foot}`;
+}
+function quizKeys(game: ActiveGame, answered: boolean): Buttons {
+  const stop = [{ text: '⏹ Band', callback_data: `g:x:${game.id}` }];
+  if (answered) return [stop];
+  const q = game.questions![game.index ?? 0]!;
+  const keys = q.options.map((o, k) => ({ text: `${LETTERS[k]}) ${o.length > 28 ? o.slice(0, 27) + '…' : o}`, callback_data: `g:a:${game.id}:${game.index ?? 0}:${k}` }));
+  const perRow = q.options.every(o => o.length <= 14) ? 2 : 1;
+  const rows: Buttons = [];
+  for (let i = 0; i < keys.length; i += perRow) rows.push(keys.slice(i, i + perRow));
+  rows.push(stop);
+  return rows;
+}
 function againKey(kind: GameKind, level?: Level): string {
   if (kind === 'ttt') return level === 'easy' ? 'g:te' : level === 'hard' ? 'g:th' : 'g:tm';
   if (kind === 'hangman') return 'g:hm';
@@ -230,6 +263,7 @@ type Toast = (text?: string) => Promise<void>;
 export class Games {
   private chain: Promise<unknown> = Promise.resolve();
   private timer?: { cancel(): void };
+  private ticker?: { cancel(): void };
   constructor(private host: GameHost, private owner: number, private store: GameStore, private options: GameOptions = {}) {}
 
   private now(): number { return this.options.now?.() ?? Date.now(); }
@@ -249,7 +283,7 @@ export class Games {
     this.chain = run.then(() => undefined, () => undefined);
     return run;
   }
-  private cancelTimer(): void { this.timer?.cancel(); this.timer = undefined; }
+  private cancelTimer(): void { this.timer?.cancel(); this.timer = undefined; this.ticker?.cancel(); this.ticker = undefined; }
   dispose(): void { this.cancelTimer(); }
 
   /** A restarted quiz cannot safely resume its open poll, so it is closed. Button games keep their saved board. */
@@ -269,6 +303,28 @@ export class Games {
   results(limit = 10): { results: GameResult[] } {
     const n = Number.isInteger(limit) ? Math.min(30, Math.max(1, limit)) : 10;
     return { results: (this.data().results ?? []).slice(0, n) };
+  }
+  /** The running game for the agent: never the quiz answers or the hangman word. */
+  status(): { active: Record<string, unknown> | null } {
+    const g = this.data().active;
+    if (!g) return { active: null };
+    const base = { kind: g.kind, title: g.title || kindLabel(g.kind) };
+    if (g.kind === 'quiz' || g.kind === 'rapid') {
+      return { active: { ...base, style: g.style ?? 'poll', question: (g.index ?? 0) + 1, total: g.questions?.length ?? 0, score: g.score ?? 0, timer_seconds: g.timer, seconds_left: g.locked ? 0 : Math.max(0, Math.round(((g.deadline ?? 0) - this.now()) / 1000)) } };
+    }
+    if (g.kind === 'ttt') return { active: { ...base, level: g.level, board: [0, 3, 6].map(r => (g.board ?? []).slice(r, r + 3).map(c => c || '.').join('')) } };
+    const view = hangmanView(g.word ?? '', g.guessed ?? []);
+    return { active: { ...base, shown: view.shown, misses: view.misses.length, hint: g.hint } };
+  }
+  /** Stop the running game from the agent, exactly like the ⏹ Band button. */
+  async stop(): Promise<{ stopped: boolean; kind?: GameKind; title?: string; score?: number; total?: number; note?: string }> {
+    return this.enqueue(async () => {
+      const g = this.data().active;
+      if (!g) return { stopped: false, note: 'No game is running.' };
+      const info = { kind: g.kind, title: g.title || kindLabel(g.kind), ...(g.score !== undefined ? { score: g.score, total: g.questions?.length ?? 0 } : {}) };
+      await this.stopVisible();
+      return { stopped: true, ...info };
+    });
   }
   async menu(): Promise<void> {
     const last = this.data().results?.[0];
@@ -320,6 +376,7 @@ export class Games {
     if (action.type === 'end') { if (this.data().active?.id === action.id) await this.stopVisible(); else await toast('Ye game band ho chuka'); return; }
     if (action.type === 'move') return this.move(action.id, action.cell, toast);
     if (action.type === 'letter') return this.letter(action.id, action.letter, toast);
+    if (action.type === 'answer') return this.answer(action.id, action.index, action.option, toast);
     await this.guard(async () => {
       if (action.type === 'quiz') await this.beginQuiz({ kind: 'quiz' });
       else if (action.type === 'rapid') await this.beginQuiz({ kind: 'rapid' });
@@ -347,7 +404,8 @@ export class Games {
     const timer = clampTimer(input.timer_seconds, kind === 'rapid' ? 10 : 20);
     const title = cleanTitle(input.title, kindLabel(kind));
     await this.stopQuiet();
-    const game: ActiveGame = { id: this.newId(), kind, title, questions, index: 0, score: 0, timer };
+    if (input.style !== undefined && input.style !== 'buttons' && input.style !== 'poll') throw new GameError('Quiz style must be buttons or poll.');
+    const game: ActiveGame = { id: this.newId(), kind, title, questions, index: 0, score: 0, timer, style: input.style ?? 'buttons' };
     this.data().active = game;
     await this.save();
     try { await this.openQuiz(game); }
@@ -359,9 +417,38 @@ export class Games {
     return { started: true, kind, title, questions: questions.length, timer_seconds: timer, note: 'Game is running on Telegram. Do not repeat questions, options or answers.' };
   }
   private async openQuiz(game: ActiveGame): Promise<void> {
+    if (game.style === 'buttons') {
+      game.statusId = await this.send(quizText(game, game.timer!), quizKeys(game, false));
+      game.deadline = this.now() + game.timer! * 1000; game.locked = false;
+      await this.save();
+      this.arm(game);
+      return;
+    }
     game.statusId = await this.send(`${game.title}\nSawal 1/${game.questions!.length} · score 0\n${game.timer} sec`, [[{ text: '⏹ Band', callback_data: `g:x:${game.id}` }]]);
     await this.save();
     await this.sendPoll(game);
+  }
+  /** Next question: the in-place quiz edits its one message, the poll quiz sends a new poll. */
+  private async ask(game: ActiveGame): Promise<void> {
+    if (game.style !== 'buttons') { await this.sendPoll(game); await this.editStatus(game); return; }
+    game.deadline = this.now() + game.timer! * 1000; game.locked = false;
+    await this.edit(game.statusId!, quizText(game, game.timer!), quizKeys(game, false));
+    await this.save();
+    this.arm(game);
+  }
+  private async answer(id: string, index: number, option: number, toast: Toast): Promise<void> {
+    const game = this.data().active;
+    if (!game || game.id !== id || game.style !== 'buttons' || !game.statusId) { await toast('Ye game band ho chuka'); return; }
+    if (game.index !== index || game.locked) { await toast('Ye sawal ho gaya'); return; }
+    const q = game.questions?.[index];
+    if (!q || option >= q.options.length) { await toast('Ye button purana hai'); return; }
+    game.locked = true; this.cancelTimer();
+    const right = option === q.answer;
+    if (right) game.score = (game.score ?? 0) + 1;
+    await this.save();
+    await toast(right ? 'Sahi! ✅' : 'Galat ❌');
+    await this.edit(game.statusId, quizText(game, 0, option), quizKeys(game, true)).catch(() => {});
+    await this.afterQuestion(game);
   }
   private async sendPoll(game: ActiveGame): Promise<void> {
     const q = game.questions![game.index!]!;
@@ -377,37 +464,55 @@ export class Games {
   }
   private arm(game: ActiveGame): void {
     this.cancelTimer();
-    const wait = Math.max(0, (game.deadline ?? this.now()) - this.now()) + 800;
+    const wait = Math.max(0, (game.deadline ?? this.now()) - this.now()) + (game.style === 'buttons' ? 0 : 800);
     const id = game.id, index = game.index ?? 0;
+    if (game.style === 'buttons') this.tick(id, index);
     this.timer = (this.options.schedule ?? defaultSchedule)(wait, () => {
       void this.enqueue(() => this.expire(id, index)).catch(error => console.warn(`Quiz timer step failed (${errorName(error)}).`));
+    });
+  }
+  /** The in-place quiz shows its countdown, edited every 5 seconds (well inside Telegram's edit limits). */
+  private tick(id: string, index: number): void {
+    const game = this.data().active;
+    const left = Math.ceil(((game?.deadline ?? 0) - this.now()) / 1000);
+    if (left <= 5) return;
+    const step = left % 5 || 5;
+    this.ticker = (this.options.schedule ?? defaultSchedule)(step * 1000, () => {
+      void this.enqueue(async () => {
+        const now = this.data().active;
+        if (!now || now.id !== id || now.index !== index || now.locked || !now.statusId) return;
+        const remaining = Math.max(0, Math.round(((now.deadline ?? 0) - this.now()) / 1000));
+        await this.edit(now.statusId, quizText(now, remaining), quizKeys(now, false)).catch(() => {});
+        this.tick(id, index);
+      }).catch(() => {});
     });
   }
   private async expire(id: string, index: number): Promise<void> {
     const game = this.data().active;
     if (!game || game.id !== id || game.index !== index || game.locked) return;
-    game.locked = true;
+    game.locked = true; this.cancelTimer();
     if (game.pollMessageId) await this.host.call('stopPoll', { message_id: game.pollMessageId }).catch(() => {});
+    if (game.style === 'buttons' && game.statusId) await this.edit(game.statusId, quizText(game, 0, 'timeout'), quizKeys(game, true)).catch(() => {});
     await this.afterQuestion(game);
   }
   private async afterQuestion(game: ActiveGame): Promise<void> {
     if (this.data().active?.id !== game.id) return;
-    await this.sleep(game.kind === 'rapid' ? 400 : 1500);
+    const q = game.questions?.[game.index ?? 0];
+    await this.sleep(game.style !== 'buttons' ? (game.kind === 'rapid' ? 400 : 1500) : game.kind === 'rapid' ? 900 : q?.explanation ? 2800 : 1800);
     if (this.data().active?.id !== game.id) return;
     game.index = (game.index ?? 0) + 1;
     if (game.index >= (game.questions?.length ?? 0)) return this.finishQuiz(game);
     game.locked = false;
     await this.save();
-    try { await this.sendPoll(game); }
+    try { await this.ask(game); }
     catch (error) {
-      // A quiz that cannot send its next poll is closed, never left half-open.
+      // A quiz that cannot show its next question is closed, never left half-open.
       if (this.data().active?.id === game.id) await this.record({ at: new Date().toISOString(), kind: game.kind, title: game.title || kindLabel(game.kind), outcome: 'stopped', score: game.score, total: game.questions?.length }).catch(() => {});
       const text = `Agla sawal nahi ja paya, quiz band.\nScore ${game.score ?? 0}/${game.questions?.length ?? 0}\n\n/games se phir shuru karo.`;
       if (game.statusId) await this.edit(game.statusId, text, endKeys(game.kind)).catch(() => this.host.say(text).catch(() => {}));
       else await this.host.say(text).catch(() => {});
       throw error;
     }
-    await this.editStatus(game);
   }
   private async editStatus(game: ActiveGame): Promise<void> {
     if (!game.statusId) return;
